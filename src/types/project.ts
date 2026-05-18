@@ -20,7 +20,7 @@ export interface Segment {
 
 export type SegmentContent =
   | { type: "notes"; notes: Note[] }
-  | { type: "audioClip"; sourcePath: string; offsetMs: number };
+  | { type: "audioClip"; sourcePath: string; offsetMs: number; totalDurationMs: number };
 
 export interface Note {
   id: string;

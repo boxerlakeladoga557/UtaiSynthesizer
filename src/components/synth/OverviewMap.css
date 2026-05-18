@@ -1,0 +1,8 @@
+.overview-map {
+  width: 200px;
+  height: 28px;
+  min-height: 28px;
+  flex-shrink: 0;
+  cursor: pointer;
+  display: block;
+}

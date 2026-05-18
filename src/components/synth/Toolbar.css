@@ -52,6 +52,20 @@
   box-shadow: 0 0 8px rgba(74, 222, 128, 0.2);
 }
 
+.transport-btn.play.playing {
+  background: rgba(74, 222, 128, 0.2);
+  box-shadow: 0 0 8px rgba(74, 222, 128, 0.3);
+}
+
+.transport-btn.rec {
+  color: var(--color-error);
+  border-color: var(--color-error);
+}
+
+.transport-btn.rec:hover {
+  background: rgba(248, 113, 113, 0.1);
+}
+
 .tempo-input {
   width: 56px;
   text-align: center;
@@ -77,4 +91,38 @@
 .toolbar-btn {
   font-size: var(--font-size-xs);
   padding: var(--space-sm) var(--space-md);
+}
+
+.add-track-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 2px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  z-index: var(--z-overlay);
+  min-width: 160px;
+  box-shadow: var(--shadow-md);
+}
+
+.add-track-option {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: var(--space-md) var(--space-lg);
+  font-size: var(--font-size-sm);
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.add-track-option:last-child {
+  border-bottom: none;
+}
+
+.add-track-option:hover {
+  background: var(--bg-hover);
+  color: var(--accent-primary);
 }

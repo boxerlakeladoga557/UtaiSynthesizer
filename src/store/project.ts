@@ -82,7 +82,24 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       dirty: true,
     })),
 
-  setTempo: (bpm) => set({ tempo: bpm, dirty: true }),
+  setTempo: (bpm) => {
+    const TICKS_PER_BEAT = 480;
+    set((s) => ({
+      tempo: bpm,
+      dirty: true,
+      tracks: s.tracks.map((t) => ({
+        ...t,
+        segments: t.segments.map((seg) => {
+          if (seg.content.type === "audioClip") {
+            const ms = seg.content.totalDurationMs;
+            const newTicks = Math.round((ms / 1000) * (bpm / 60) * TICKS_PER_BEAT);
+            return { ...seg, durationTicks: newTicks };
+          }
+          return seg;
+        }),
+      })),
+    }));
+  },
   setPlayhead: (tick) => set({ playheadTick: tick }),
   selectNotes: (ids) => set({ selectedNotes: ids }),
 }));

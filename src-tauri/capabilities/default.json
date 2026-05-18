@@ -10,6 +10,11 @@
     "core:window:allow-show",
     "core:window:allow-set-title",
     "dialog:default",
+    "dialog:allow-open",
+    {
+      "identifier": "fs:allow-read-file",
+      "allow": [{ "path": "**" }]
+    },
     "fs:default",
     "shell:default",
     "window-state:default"

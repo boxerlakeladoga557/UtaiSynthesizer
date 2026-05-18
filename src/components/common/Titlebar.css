@@ -6,14 +6,12 @@
   padding: 0 var(--space-lg);
   background: linear-gradient(180deg, var(--bg-panel) 0%, var(--bg-surface) 100%);
   border-bottom: 1px solid var(--border-subtle);
-  -webkit-app-region: drag;
 }
 
 .titlebar-left {
   display: flex;
   align-items: center;
   gap: var(--space-lg);
-  -webkit-app-region: no-drag;
 }
 
 .titlebar-brand {
@@ -69,7 +67,6 @@
   display: flex;
   align-items: center;
   gap: var(--space-md);
-  -webkit-app-region: no-drag;
 }
 
 .training-indicator {

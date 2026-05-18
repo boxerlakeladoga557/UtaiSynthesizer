@@ -1,0 +1,30 @@
+.hscrollbar-track {
+  grid-row: 3;
+  grid-column: 2;
+  position: relative;
+  background: var(--bg-base);
+  border-top: 1px solid var(--border-subtle);
+  min-height: 16px;
+  cursor: pointer;
+}
+
+.hscrollbar-thumb {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  background: var(--border-strong);
+  border: 1px solid var(--border-default);
+  cursor: grab;
+  transition: background 0.1s;
+}
+
+.hscrollbar-thumb:hover {
+  background: var(--accent-primary-dim);
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 6px var(--accent-primary-glow);
+}
+
+.hscrollbar-thumb:active {
+  background: var(--accent-primary);
+  cursor: grabbing;
+}

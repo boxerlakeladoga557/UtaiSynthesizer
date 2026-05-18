@@ -21,10 +21,6 @@
         "resizable": true
       }
     ],
-    "trayIcon": {
-      "iconPath": "icons/icon.png",
-      "iconAsTemplate": false
-    },
     "security": {
       "csp": null
     }
@@ -39,17 +35,8 @@
   },
   "plugins": {
     "shell": {
-      "open": true,
-      "scope": [
-        {
-          "name": "python-training",
-          "cmd": "./python/python.exe",
-          "args": true
-        }
-      ]
+      "open": true
     },
-    "fs": {
-      "scope": ["$APPDATA/**", "$RESOURCE/**", "$HOME/.utai/**"]
-    }
+    "fs": {}
   }
 }

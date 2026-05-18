@@ -3,7 +3,7 @@ import { NodeShell } from "./NodeShell";
 
 export function MsstNode(_props: NodeProps) {
   return (
-    <NodeShell label="MSST Separate" icon="🔀" color="#ec4899" inputs={1} outputs={4}>
+    <NodeShell label="MSST" icon="[M]" color="#ec4899" inputs={1} outputs={4}>
       <label>Model</label>
       <select>
         <option value="htdemucs">HTDemucs (4-stem)</option>

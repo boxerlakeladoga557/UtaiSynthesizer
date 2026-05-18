@@ -16,7 +16,10 @@
 }
 
 .wf-node-icon {
-  font-size: 12px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--node-color, var(--accent-primary));
+  opacity: 0.8;
 }
 
 .wf-node-label {

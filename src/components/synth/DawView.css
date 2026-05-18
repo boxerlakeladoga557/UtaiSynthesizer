@@ -5,13 +5,39 @@
   overflow: hidden;
 }
 
-.daw-workspace {
+.daw-grid {
   flex: 1;
-  display: flex;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: 24px 1fr 20px;
   overflow: hidden;
 }
 
-.daw-separator {
-  width: 1px;
-  background: var(--border-subtle);
+.daw-corner {
+  grid-row: 1; grid-column: 1;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
 }
+
+.timeline-ruler {
+  grid-row: 1; grid-column: 2;
+}
+
+.track-list {
+  grid-row: 2; grid-column: 1;
+}
+
+.daw-canvas-container {
+  grid-row: 2; grid-column: 2;
+  position: relative;
+  overflow: hidden;
+}
+
+.daw-scrollbar-corner {
+  grid-row: 3; grid-column: 1;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border-subtle);
+  border-top: 1px solid var(--border-subtle);
+}
+

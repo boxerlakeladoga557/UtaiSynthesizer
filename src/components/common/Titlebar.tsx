@@ -16,7 +16,7 @@ export function Titlebar() {
     status.state === "Preparing";
 
   return (
-    <header className="titlebar" data-tauri-drag-region>
+    <header className="titlebar">
       <div className="titlebar-left">
         <span className="titlebar-brand">UTAI</span>
         <nav className="titlebar-menu">
@@ -27,7 +27,7 @@ export function Titlebar() {
         </nav>
       </div>
 
-      <div className="titlebar-center" data-tauri-drag-region>
+      <div className="titlebar-center">
         <span className="project-name">
           {name || t("untitled")}
           {dirty && <span className="dirty-dot" />}
@@ -46,7 +46,7 @@ export function Titlebar() {
           onClick={toggleTrainingPanel}
           data-tooltip={t("training.panel")}
         >
-          ⚡
+          TRN
         </button>
       </div>
     </header>

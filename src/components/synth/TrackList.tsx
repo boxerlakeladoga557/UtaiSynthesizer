@@ -4,21 +4,21 @@ import { useTranslation } from "react-i18next";
 import type { Track } from "../../types/project";
 import "./TrackList.css";
 
+const TRACK_HEIGHT = 48;
+
 interface Props {
   width: number;
+  scrollY: number;
 }
 
-export function TrackList({ width }: Props) {
+export function TrackList({ width, scrollY }: Props) {
   const { t } = useTranslation();
   const { tracks, updateTrack } = useProjectStore();
   const { activeTrackId, setActiveTrack } = useAppStore();
 
   return (
     <div className="track-list" style={{ width }}>
-      <div className="track-list-header">
-        <span>{t("tracks.title")}</span>
-      </div>
-      <div className="track-list-body">
+      <div className="track-list-scroll" style={{ transform: `translateY(${-scrollY}px)` }}>
         {tracks.length === 0 && (
           <div className="track-list-empty">
             <span className="text-muted">{t("tracks.empty")}</span>
@@ -48,6 +48,8 @@ interface TrackItemProps {
 }
 
 function TrackItem({ track, active, onSelect, onMute, onSolo }: TrackItemProps) {
+  const { t } = useTranslation();
+  const typeLabel = t(`tracks.${track.trackType}`);
   const colorVar =
     track.trackType === "vocal"
       ? "var(--track-vocal)"
@@ -58,12 +60,13 @@ function TrackItem({ track, active, onSelect, onMute, onSolo }: TrackItemProps) 
   return (
     <div
       className={`track-item ${active ? "active" : ""}`}
+      style={{ height: TRACK_HEIGHT }}
       onClick={onSelect}
     >
       <div className="track-color-bar" style={{ background: colorVar }} />
       <div className="track-info">
         <span className="track-name">{track.name}</span>
-        <span className="track-type text-muted">{track.trackType}</span>
+        <span className="track-type text-muted">{typeLabel}</span>
       </div>
       <div className="track-controls">
         <button

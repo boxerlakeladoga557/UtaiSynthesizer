@@ -15,22 +15,9 @@ html, body, #root {
   color: var(--text-primary);
   background: var(--bg-deep);
   -webkit-font-smoothing: antialiased;
-  user-select: none;
 }
 
-/* === Subtle background pattern (retro grid) === */
-body::before {
-  content: '';
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  background:
-    linear-gradient(var(--bg-deep) 1px, transparent 1px),
-    linear-gradient(90deg, var(--bg-deep) 1px, transparent 1px);
-  background-size: 40px 40px;
-  opacity: 0.03;
-  z-index: -1;
-}
+/* Retro grid is rendered via Canvas in the arrangement view, not as CSS overlay */
 
 /* === Scrollbar (retro styled) === */
 ::-webkit-scrollbar {

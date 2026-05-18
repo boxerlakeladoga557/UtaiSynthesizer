@@ -3,7 +3,7 @@ import { NodeShell } from "./NodeShell";
 
 export function RvcNode(_props: NodeProps) {
   return (
-    <NodeShell label="RVC" icon="🎤" color="#39c5bb" inputs={1} outputs={1}>
+    <NodeShell label="RVC" icon="[R]" color="#39c5bb" inputs={1} outputs={1}>
       <label>Model</label>
       <select>
         <option value="">Select voice...</option>

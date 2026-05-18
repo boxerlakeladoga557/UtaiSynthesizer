@@ -12,15 +12,22 @@
     "record": "录制"
   },
   "toolbar": {
-    "bpm": "BPM",
+    "bpm": "速度",
     "position": "位置",
     "snap": "吸附",
     "free": "自由",
-    "addTrack": "添加轨道"
+    "triplet": "三连音",
+    "addTrack": "添加轨道",
+    "importAudio": "导入音频素材",
+    "addMidi": "添加MIDI轨 (占位)",
+    "workflow": "工作流"
   },
   "tracks": {
     "title": "轨道",
-    "empty": "拖放音频文件或添加新轨道"
+    "empty": "拖放音频文件或添加新轨道",
+    "vocal": "声乐",
+    "audio": "音频",
+    "instrument": "乐器"
   },
   "training": {
     "title": "训练",
@@ -61,6 +68,7 @@
     "cancel": "取消",
     "confirm": "确认",
     "save": "保存",
-    "open": "打开"
+    "open": "打开",
+    "close": "关闭"
   }
 }

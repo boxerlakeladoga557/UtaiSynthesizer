@@ -3,7 +3,7 @@ import { NodeShell } from "./NodeShell";
 
 export function SoVitsNode(_props: NodeProps) {
   return (
-    <NodeShell label="SoVITS" icon="✨" color="#8b5cf6" inputs={1} outputs={1}>
+    <NodeShell label="SoVITS" icon="[S]" color="#8b5cf6" inputs={1} outputs={1}>
       <label>Model</label>
       <select>
         <option value="">Select voice...</option>

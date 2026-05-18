@@ -1,27 +1,11 @@
 .track-list {
-  display: flex;
-  flex-direction: column;
   background: var(--bg-surface);
   border-right: 1px solid var(--border-subtle);
-  min-width: 160px;
+  overflow: hidden;
 }
 
-.track-list-header {
-  height: 28px;
-  display: flex;
-  align-items: center;
-  padding: 0 var(--space-lg);
-  font-size: var(--font-size-xs);
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  border-bottom: 1px solid var(--border-subtle);
-  background: var(--bg-panel);
-}
-
-.track-list-body {
-  flex: 1;
-  overflow-y: auto;
+.track-list-scroll {
+  will-change: transform;
 }
 
 .track-list-empty {
@@ -35,12 +19,12 @@
 .track-item {
   display: flex;
   align-items: center;
-  height: 48px;
   padding: 0 var(--space-md);
   gap: var(--space-md);
   border-bottom: 1px solid var(--border-subtle);
   cursor: pointer;
   transition: background var(--transition-fast);
+  box-sizing: border-box;
 }
 
 .track-item:hover {
@@ -55,7 +39,6 @@
 .track-color-bar {
   width: 3px;
   height: 28px;
-  border-radius: 2px;
 }
 
 .track-info {
@@ -91,7 +74,6 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: var(--radius-sm);
   font-family: var(--font-mono);
 }
 

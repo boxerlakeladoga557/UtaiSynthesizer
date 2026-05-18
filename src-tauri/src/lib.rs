@@ -87,6 +87,7 @@ pub fn run() {
             commands::models::import_model,
             commands::models::delete_model,
             commands::models::check_model_exists,
+            commands::audio::load_audio_file,
             commands::audio::process_effects,
             commands::audio::export_audio,
         ])
@@ -95,7 +96,9 @@ pub fn run() {
                 let state = window.state::<Arc<AppState>>();
                 if state.training.is_active() {
                     api.prevent_close();
-                    let _ = window.hide();
+                    // TODO: show dialog asking user to stop training first
+                    // For now, minimize instead of close
+                    let _ = window.minimize();
                 }
             }
         })
