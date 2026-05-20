@@ -24,7 +24,7 @@ pub enum VoiceBackendType {
 
 struct LoadedVoice {
     backend_type: VoiceBackendType,
-    model_path: PathBuf,
+    _model_path: PathBuf,
     session_id: String,
 }
 
@@ -70,7 +70,7 @@ impl InferenceManager {
         let session_id = self.engine.load_model(model_path)?;
         let voice = LoadedVoice {
             backend_type,
-            model_path: model_path.clone(),
+            _model_path: model_path.clone(),
             session_id,
         };
         self.loaded_voices.write().insert(name.to_string(), voice);

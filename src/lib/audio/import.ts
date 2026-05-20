@@ -17,7 +17,7 @@ export async function importAudioToTrack(
   const durationTicks = Math.round(playback.durationMsToTicks(audioData.durationMs, tempo));
 
   const seg: Segment = {
-    id: `seg-${Date.now()}`,
+    id: crypto.randomUUID(),
     startTick,
     durationTicks,
     content: {
@@ -35,7 +35,7 @@ export async function importAudioToTrack(
     });
   } else {
     addTrack({
-      id: `track-${Date.now()}`,
+      id: crypto.randomUUID(),
       name: fileName,
       trackType: "audio",
       segments: [seg],

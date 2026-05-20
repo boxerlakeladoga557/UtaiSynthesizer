@@ -12,7 +12,7 @@ pub struct UndoStack {
 
 #[derive(Debug, Clone)]
 struct UndoEntry {
-    description: String,
+    _description: String,
     snapshot: String,
 }
 
@@ -28,7 +28,7 @@ impl UndoStack {
         self.history.truncate(self.position);
 
         self.history.push(UndoEntry {
-            description: description.to_string(),
+            _description: description.to_string(),
             snapshot: state_json,
         });
 

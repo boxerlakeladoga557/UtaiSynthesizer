@@ -13,7 +13,7 @@ pub struct ModelCache {
 
 struct CachedModel {
     session_id: String,
-    model_path: PathBuf,
+    _model_path: PathBuf,
     last_used: std::time::Instant,
     approx_size_mb: u64,
 }
@@ -50,7 +50,7 @@ impl ModelCache {
 
         let entry = CachedModel {
             session_id: session_id.clone(),
-            model_path: path.clone(),
+            _model_path: path.clone(),
             last_used: std::time::Instant::now(),
             approx_size_mb: approx_size,
         };

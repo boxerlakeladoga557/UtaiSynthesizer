@@ -109,7 +109,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
           };
         }
         const rightSeg: Segment = {
-          id: `seg-${Date.now()}`,
+          id: crypto.randomUUID(),
           startTick: atTick,
           durationTicks: rightDuration,
           content: rightContent,

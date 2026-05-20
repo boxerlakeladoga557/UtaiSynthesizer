@@ -14,6 +14,7 @@ interface AppState {
   zoom: number;
   scrollX: number;
   scrollY: number;
+  canvasWidth: number;
 
   toggleTrainingPanel: () => void;
   setActiveTrack: (id: string | null) => void;
@@ -23,6 +24,7 @@ interface AppState {
   closeWorkflow: () => void;
   setZoom: (zoom: number) => void;
   setScroll: (x: number, y: number) => void;
+  setCanvasWidth: (w: number) => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -34,6 +36,7 @@ export const useAppStore = create<AppState>((set) => ({
   zoom: 1.0,
   scrollX: 0,
   scrollY: 0,
+  canvasWidth: 800,
 
   toggleTrainingPanel: () =>
     set((s) => ({ trainingPanelOpen: !s.trainingPanelOpen })),
@@ -45,4 +48,5 @@ export const useAppStore = create<AppState>((set) => ({
   closeWorkflow: () => set({ workflowSegmentId: null }),
   setZoom: (zoom) => set({ zoom: Math.max(0.1, Math.min(10, zoom)) }),
   setScroll: (x, y) => set({ scrollX: x, scrollY: y }),
+  setCanvasWidth: (w) => set({ canvasWidth: w }),
 }));

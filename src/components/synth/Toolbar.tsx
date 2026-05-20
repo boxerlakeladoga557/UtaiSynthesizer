@@ -98,7 +98,7 @@ export function Toolbar() {
   const handleAddMidiTrack = () => {
     setShowAddMenu(false);
     addTrack({
-      id: `track-${Date.now()}`,
+      id: crypto.randomUUID(),
       name: `Vocal ${tracks.filter((t) => t.trackType === "vocal").length + 1}`,
       trackType: "vocal",
       segments: [],
@@ -134,7 +134,7 @@ export function Toolbar() {
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  });
+  }, [isPlaying, selectedSegment, tracks, audioFiles, playheadTick, tempo]);
 
   useEffect(() => {
     if (!showAddMenu) return;

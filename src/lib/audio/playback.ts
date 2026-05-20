@@ -7,6 +7,7 @@ let audioCtx: AudioContext | null = null;
 const loadedBuffers = new Map<string, AudioBuffer>();
 
 interface ScheduledSource {
+  trackId: string;
   source: AudioBufferSourceNode;
   gain: GainNode;
   panner: StereoPannerNode;
@@ -147,7 +148,7 @@ export async function playAllTracks(
       };
 
       source.start(now + startDelay, audioOffset, playDuration);
-      scheduledSources.push({ source, gain, panner });
+      scheduledSources.push({ trackId: track.id, source, gain, panner });
       totalScheduled++;
     }
   }
@@ -162,8 +163,22 @@ export function stopPlayback() {
   scheduledSources = [];
 }
 
-export function updateTrackVolume(_trackId: string, _volumeDb: number) {}
-export function updateTrackPan(_trackId: string, _pan: number) {}
+export function updateTrackVolume(trackId: string, volumeDb: number) {
+  const vol = dbToLinear(volumeDb);
+  for (const s of scheduledSources) {
+    if (s.trackId === trackId) {
+      s.gain.gain.setValueAtTime(vol, s.gain.context.currentTime);
+    }
+  }
+}
+
+export function updateTrackPan(trackId: string, pan: number) {
+  for (const s of scheduledSources) {
+    if (s.trackId === trackId) {
+      s.panner.pan.setValueAtTime(pan, s.panner.context.currentTime);
+    }
+  }
+}
 
 export function getContextTime(): number {
   return audioCtx?.currentTime ?? 0;

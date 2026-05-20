@@ -1,4 +1,4 @@
-import { useRef, useCallback } from "react";
+import { useRef, useCallback, useEffect } from "react";
 import { Toolbar } from "./Toolbar";
 import { TrackList } from "./TrackList";
 import { TimelineRuler } from "./TimelineRuler";
@@ -12,9 +12,21 @@ import "./DawView.css";
 const HEADER_WIDTH = 200;
 
 export function DawView() {
-  const { scrollX, scrollY, setScroll, zoom } = useAppStore();
+  const { scrollX, scrollY, setScroll, zoom, canvasWidth, setCanvasWidth } = useAppStore();
   const { tracks, timeSignature } = useProjectStore();
   const canvasContainerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = canvasContainerRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (entry) setCanvasWidth(entry.contentRect.width);
+    });
+    observer.observe(el);
+    setCanvasWidth(el.clientWidth);
+    return () => observer.disconnect();
+  }, [setCanvasWidth]);
 
   const totalTicks = Math.max(
     TICKS_PER_BEAT * timeSignature[0] * 32,
@@ -22,7 +34,6 @@ export function DawView() {
   );
   const totalWidth = totalTicks * PIXELS_PER_TICK * zoom;
 
-  // Track header area: scroll always vertical
   const handleTrackListWheel = useCallback(
     (e: React.WheelEvent) => {
       e.stopPropagation();
@@ -47,7 +58,7 @@ export function DawView() {
         <HScrollbar
           scrollX={scrollX}
           totalWidth={totalWidth}
-          viewWidth={800}
+          viewWidth={canvasWidth}
           onChange={(x) => setScroll(x, scrollY)}
         />
       </div>

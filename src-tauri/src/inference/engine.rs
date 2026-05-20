@@ -11,9 +11,7 @@ pub struct OnnxEngine {
 }
 
 struct LoadedSession {
-    path: PathBuf,
-    // The actual ort::Session will be stored here once models are available
-    // For now we track paths to validate the architecture compiles
+    _path: PathBuf,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -50,7 +48,7 @@ impl OnnxEngine {
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let session = LoadedSession { path: path.clone() };
+        let session = LoadedSession { _path: path.clone() };
         self.sessions.write().insert(id.clone(), session);
 
         tracing::info!("Registered ONNX model: {} -> {}", path.display(), id);

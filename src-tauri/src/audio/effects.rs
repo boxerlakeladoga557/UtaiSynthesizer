@@ -182,12 +182,16 @@ fn apply_gain(buffer: &AudioBuffer, gain_db: f32) -> AudioBuffer {
 }
 
 fn apply_fade_in(buffer: &AudioBuffer, duration_ms: u32) -> AudioBuffer {
-    let fade_samples = (buffer.sample_rate as f64 * duration_ms as f64 / 1000.0) as usize;
+    let channels = buffer.channels as usize;
+    let fade_frames = (buffer.sample_rate as f64 * duration_ms as f64 / 1000.0) as usize;
+    let total_frames = buffer.samples.len() / channels;
     let mut samples = buffer.samples.clone();
 
-    for i in 0..fade_samples.min(samples.len()) {
-        let gain = i as f32 / fade_samples as f32;
-        samples[i] *= gain;
+    for frame in 0..fade_frames.min(total_frames) {
+        let gain = frame as f32 / fade_frames as f32;
+        for ch in 0..channels {
+            samples[frame * channels + ch] *= gain;
+        }
     }
 
     AudioBuffer {
@@ -198,14 +202,17 @@ fn apply_fade_in(buffer: &AudioBuffer, duration_ms: u32) -> AudioBuffer {
 }
 
 fn apply_fade_out(buffer: &AudioBuffer, duration_ms: u32) -> AudioBuffer {
-    let fade_samples = (buffer.sample_rate as f64 * duration_ms as f64 / 1000.0) as usize;
+    let channels = buffer.channels as usize;
+    let fade_frames = (buffer.sample_rate as f64 * duration_ms as f64 / 1000.0) as usize;
+    let total_frames = buffer.samples.len() / channels;
     let mut samples = buffer.samples.clone();
-    let total = samples.len();
 
-    for i in 0..fade_samples.min(total) {
-        let idx = total - 1 - i;
-        let gain = i as f32 / fade_samples as f32;
-        samples[idx] *= 1.0 - gain;
+    for i in 0..fade_frames.min(total_frames) {
+        let frame = total_frames - 1 - i;
+        let gain = 1.0 - (i as f32 / fade_frames as f32);
+        for ch in 0..channels {
+            samples[frame * channels + ch] *= gain;
+        }
     }
 
     AudioBuffer {

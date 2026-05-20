@@ -13,11 +13,18 @@ models/**/*.npy
 # Embedded Python runtime (too large for git)
 python/
 
+# Python virtualenv
+.venv/
+converter/.venv/
+
 # Python cache
 __pycache__/
 *.pyc
 *.pyo
 training/**/__pycache__/
+
+# Converter inspection output (generated, machine-specific)
+converter/inspections/
 
 # Model files (user data)
 *.pth

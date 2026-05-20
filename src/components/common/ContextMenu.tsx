@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./ContextMenu.css";
 
 export interface MenuItem {
@@ -18,6 +18,20 @@ interface Props {
 
 export function ContextMenu({ x, y, items, onClose }: Props) {
   const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState({ left: x, top: y });
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    let left = x;
+    let top = y;
+    if (left + rect.width > window.innerWidth) left = window.innerWidth - rect.width - 4;
+    if (top + rect.height > window.innerHeight) top = window.innerHeight - rect.height - 4;
+    if (left < 0) left = 4;
+    if (top < 0) top = 4;
+    setPos({ left, top });
+  }, [x, y]);
 
   useEffect(() => {
     const handle = (e: MouseEvent) => {
@@ -36,14 +50,8 @@ export function ContextMenu({ x, y, items, onClose }: Props) {
     };
   }, [onClose]);
 
-  // Keep menu within viewport
-  const style: React.CSSProperties = {
-    left: x,
-    top: y,
-  };
-
   return (
-    <div className="ctx-menu" ref={ref} style={style}>
+    <div className="ctx-menu" ref={ref} style={pos}>
       {items.map((item, i) => (
         <button
           key={i}

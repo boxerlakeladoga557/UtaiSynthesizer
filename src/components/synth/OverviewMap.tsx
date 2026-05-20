@@ -8,7 +8,7 @@ import "./OverviewMap.css";
 export function OverviewMap() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const { tracks, playheadTick, setPlayhead, timeSignature } = useProjectStore();
-  const { zoom, scrollX } = useAppStore();
+  const { zoom, scrollX, canvasWidth: cw } = useAppStore();
   const { audioFiles } = useAudioStore();
 
   const totalTicks = Math.max(
@@ -70,11 +70,9 @@ export function OverviewMap() {
       }
     }
 
-    // Viewport indicator
     const ppt = PIXELS_PER_TICK * zoom;
     const viewStartRatio = scrollX / ppt / totalTicks;
-    // Estimate visible ticks from the arrangement canvas width (approximate)
-    const visibleTicks = 800 / ppt;
+    const visibleTicks = cw / ppt;
     const viewEndRatio = (scrollX / ppt + visibleTicks) / totalTicks;
 
     ctx.fillStyle = "rgba(57,197,187,0.1)";
@@ -97,7 +95,7 @@ export function OverviewMap() {
     ctx.strokeStyle = "#2a3a5c";
     ctx.lineWidth = 1;
     ctx.strokeRect(0, 0, width, height);
-  }, [tracks, audioFiles, totalTicks, playheadTick, zoom, scrollX]);
+  }, [tracks, audioFiles, totalTicks, playheadTick, zoom, scrollX, cw]);
 
   useEffect(() => {
     draw();
