@@ -173,6 +173,24 @@ impl NativePipeline {
         audio: &AudioData,
         progress_cb: &dyn Fn(f32) -> bool,
     ) -> Result<Vec<StemAudio>> {
+        // Mono input to a stereo model: duplicate to stereo, matching original MSST
+        // (msst_infer.py:278-284). Without this every stereo path's is_stereo gate would
+        // feed a mono-shaped tensor into a stereo graph and fail at inference. Done at
+        // THIS single point so normalize / TTA / residual all see the same stereo mix.
+        let mono_duplicated;
+        let audio = if self.config.stereo && audio.channels == 1 {
+            tracing::info!("Mono input to a stereo model — duplicating to stereo (MSST semantics)");
+            mono_duplicated = AudioData {
+                left: audio.left.clone(),
+                right: audio.left.clone(),
+                channels: 2,
+                sample_rate: audio.sample_rate,
+            };
+            &mono_duplicated
+        } else {
+            audio
+        };
+
         // htdemucs (hybrid demucs) is NOT mean/std-normalized in MSST, and its node UI hides the
         // Normalize toggle — so a stale `normalize=true` carried over from a spectral model on the
         // same node must not apply here. Guarding at this single point keeps the UI and engine honest.
