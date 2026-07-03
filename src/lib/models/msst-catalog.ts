@@ -105,6 +105,8 @@ const GH_CFG = "https://raw.githubusercontent.com/TRvlvr/application_data/main/m
 const GH_SEP = "https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs";
 const FB_CDN = "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer";
 const GH_DEMUCS = "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models";
+const GH_ZFT = "https://github.com/ZFTurbo/Music-Source-Separation-Training/releases/download";
+const GH_ZFT_CFG = "https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/main/configs";
 
 export const MSST_CATALOG: MsstCatalogEntry[] = [
   // ════════════════════════════════════════
@@ -135,6 +137,7 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt", fileSize: 1_600_000_000,
     stems: ["Vocals", "Instrumental"], sdrScore: 11.44,
     downloadUrl: `${MSST}/model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt`,
+    configUrl: `${MSST}/model_mel_band_roformer_ep_3005_sdr_11.4360.yaml`,
   },
   {
     id: "mel_vocals_kim", category: "vocals", architecture: "mel_band_roformer", source: "official",
@@ -143,6 +146,8 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "MelBandRoformer.ckpt", fileSize: 1_500_000_000,
     stems: ["Vocals", "Instrumental"],
     downloadUrl: `${HF}/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt`,
+    // Author repo hosts no config; this is the pairing documented by ZFTurbo's pretrained_models.md.
+    configUrl: `${GH_ZFT_CFG}/KimberleyJensen/config_vocals_mel_band_roformer_kj.yaml`,
   },
   {
     id: "mel_vocals_kim_ft", category: "vocals", architecture: "mel_band_roformer", source: "official",
@@ -151,6 +156,8 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "kimmel_unwa_ft.ckpt", fileSize: 1_500_000_000,
     stems: ["Vocals", "Instrumental"],
     downloadUrl: `${HF}/pcunwa/Kim-Mel-Band-Roformer-FT/resolve/main/kimmel_unwa_ft.ckpt`,
+    // Author recipe: chunk 485100 / num_overlap 8 (slower than the Kim original's 352800/2).
+    configUrl: `${HF}/pcunwa/Kim-Mel-Band-Roformer-FT/resolve/main/config_kimmel_unwa_ft.yaml`,
   },
   {
     id: "mel_vocals_big_syhft_v1", category: "vocals", architecture: "mel_band_roformer", source: "official",
@@ -159,6 +166,7 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "MelBandRoformerBigSYHFTV1.ckpt", fileSize: 3_200_000_000,
     stems: ["Vocals", "Instrumental"],
     downloadUrl: `${HF}/SYH99999/MelBandRoformerBigSYHFTV1Fast/resolve/main/MelBandRoformerBigSYHFTV1.ckpt`,
+    configUrl: `${HF}/SYH99999/MelBandRoformerBigSYHFTV1Fast/resolve/main/config.yaml`,
   },
   {
     id: "mel_vocals_big_beta4", category: "vocals", architecture: "mel_band_roformer", source: "official",
@@ -167,6 +175,9 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "melband_roformer_big_beta4.ckpt", fileSize: 3_200_000_000,
     stems: ["Vocals", "Instrumental"],
     downloadUrl: `${HF}/pcunwa/Mel-Band-Roformer-big/resolve/main/melband_roformer_big_beta4.ckpt`,
+    // beta4 is the depth-12 odd-one-out in this repo — the generic config_melbandroformer_big.yaml
+    // (depth 6) would silently misconvert it. This yaml is named for beta4 specifically.
+    configUrl: `${HF}/pcunwa/Mel-Band-Roformer-big/resolve/main/config_melbandroformer_big_beta4.yaml`,
   },
   {
     id: "mel_vocals_big_beta5e", category: "vocals", architecture: "mel_band_roformer", source: "official",
@@ -175,6 +186,7 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "big_beta5e.ckpt", fileSize: 3_200_000_000,
     stems: ["Vocals", "Instrumental"],
     downloadUrl: `${HF}/pcunwa/Mel-Band-Roformer-big/resolve/main/big_beta5e.ckpt`,
+    configUrl: `${HF}/pcunwa/Mel-Band-Roformer-big/resolve/main/big_beta5e.yaml`,
   },
   {
     id: "mel_vocals_syhft_v2", category: "vocals", architecture: "mel_band_roformer", source: "official",
@@ -183,6 +195,8 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "MelBandRoformerSYHFTV2.ckpt", fileSize: 1_600_000_000,
     stems: ["Vocals", "Instrumental"],
     downloadUrl: `${HF}/SYH99999/MelBandRoformerSYHFTV2/resolve/main/MelBandRoformerSYHFTV2.ckpt`,
+    // Family config hosted by the same author in the SYHFT V1 repo (V2/V2.5 repos ship no yaml).
+    configUrl: `${HF}/SYH99999/MelBandRoformerSYHFT/resolve/main/config_vocals_mel_band_roformer_ft.yaml`,
   },
   {
     id: "mel_vocals_syhft_v25", category: "vocals", architecture: "mel_band_roformer", source: "official",
@@ -190,7 +204,10 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     description: { zh: "SYH99999 人声模型 V2.5，最新", en: "SYH99999 vocal model V2.5, latest", ja: "SYH99999 ボーカルモデル V2.5、最新" },
     filename: "MelBandRoformerSYHFTV2.5.ckpt", fileSize: 1_600_000_000,
     stems: ["Vocals", "Instrumental"],
-    downloadUrl: `${HF}/SYH99999/MelBandRoformerSYHFTV2.5/resolve/main/MelBandRoformerSYHFTV2.5.ckpt`,
+    // The author's HF repo is malformed (ckpt nested inside a same-named folder → the flat URL
+    // 404s); this GH mirror is byte-identical and flat.
+    downloadUrl: `${GH_SEP}/MelBandRoformerSYHFTV2.5.ckpt`,
+    configUrl: `${HF}/SYH99999/MelBandRoformerSYHFT/resolve/main/config_vocals_mel_band_roformer_ft.yaml`,
   },
   {
     id: "mel_vocals_duality_v1", category: "vocals", architecture: "mel_band_roformer", source: "official",
@@ -199,6 +216,7 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "melband_roformer_instvoc_duality_v1.ckpt", fileSize: 1_500_000_000,
     stems: ["Vocals", "Instrumental"],
     downloadUrl: `${HF}/pcunwa/Mel-Band-Roformer-InstVoc-Duality/resolve/main/melband_roformer_instvoc_duality_v1.ckpt`,
+    configUrl: `${HF}/pcunwa/Mel-Band-Roformer-InstVoc-Duality/resolve/main/config_melbandroformer_instvoc_duality.yaml`,
   },
   {
     id: "mel_vocals_duality_v2", category: "vocals", architecture: "mel_band_roformer", source: "official",
@@ -207,6 +225,8 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "melband_roformer_instvox_duality_v2.ckpt", fileSize: 1_500_000_000,
     stems: ["Vocals", "Instrumental"],
     downloadUrl: `${HF}/pcunwa/Mel-Band-Roformer-InstVoc-Duality/resolve/main/melband_roformer_instvox_duality_v2.ckpt`,
+    // One family config covers v1+v2 (identical arch, author hosts a single yaml).
+    configUrl: `${HF}/pcunwa/Mel-Band-Roformer-InstVoc-Duality/resolve/main/config_melbandroformer_instvoc_duality.yaml`,
   },
   {
     id: "mdx23c_hq", category: "vocals", architecture: "mdx23c", source: "community",
@@ -257,6 +277,8 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "inst_v1e.ckpt", fileSize: 1_500_000_000,
     stems: ["Instrumental", "Vocals"],
     downloadUrl: `${HF}/pcunwa/Mel-Band-Roformer-Inst/resolve/main/inst_v1e.ckpt`,
+    // v1 family shares the depth-6 config; the repo's other yaml (inst_v2) is depth-12 — wrong here.
+    configUrl: `${HF}/pcunwa/Mel-Band-Roformer-Inst/resolve/main/config_melbandroformer_inst.yaml`,
   },
   {
     id: "mel_inst_v1", category: "instrumental", architecture: "mel_band_roformer", source: "official",
@@ -265,6 +287,7 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "melband_roformer_inst_v1.ckpt", fileSize: 1_500_000_000,
     stems: ["Instrumental", "Vocals"],
     downloadUrl: `${HF}/pcunwa/Mel-Band-Roformer-Inst/resolve/main/melband_roformer_inst_v1.ckpt`,
+    configUrl: `${HF}/pcunwa/Mel-Band-Roformer-Inst/resolve/main/config_melbandroformer_inst.yaml`,
   },
   {
     id: "mel_bleed_suppress", category: "instrumental", architecture: "mel_band_roformer", source: "community",
@@ -273,6 +296,7 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "mel_band_roformer_bleed_suppressor_v1.ckpt", fileSize: 1_500_000_000,
     stems: ["Clean", "Bleed"],
     downloadUrl: `${GH_SEP}/mel_band_roformer_bleed_suppressor_v1.ckpt`,
+    configUrl: `${GH_SEP}/config_mel_band_roformer_bleed_suppressor_v1.yaml`,
   },
 
   // ════════════════════════════════════════
@@ -284,7 +308,10 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     description: { zh: "去噪模型 (aufr33)，SDR 27.99", en: "Denoise by aufr33, SDR 27.99", ja: "ノイズ除去 (aufr33)、SDR 27.99" },
     filename: "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt", fileSize: 1_500_000_000,
     stems: ["Clean", "Noise"], sdrScore: 27.99,
-    downloadUrl: `${HF}/jarredou/aufr33_MelBand_Denoise/resolve/main/denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt`,
+    // The jarredou HF account (original host) is gone — 401 on every URL. ZFTurbo's release is
+    // the authoritative surviving origin (docs/pretrained_models.md pairs these exact files).
+    downloadUrl: `${GH_ZFT}/v.1.0.7/denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt`,
+    configUrl: `${GH_ZFT}/v.1.0.7/model_mel_band_roformer_denoise.yaml`,
   },
   {
     id: "mel_denoise_aggr", category: "denoise", architecture: "mel_band_roformer", source: "community",
@@ -292,7 +319,9 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     description: { zh: "激进去噪 (aufr33)，SDR 27.98", en: "Aggressive denoise by aufr33, SDR 27.98", ja: "アグレッシブノイズ除去 (aufr33)、SDR 27.98" },
     filename: "denoise_mel_band_roformer_aufr33_aggr_sdr_27.9768.ckpt", fileSize: 1_500_000_000,
     stems: ["Clean", "Noise"], sdrScore: 27.98,
-    downloadUrl: `${HF}/jarredou/aufr33_MelBand_Denoise/resolve/main/denoise_mel_band_roformer_aufr33_aggr_sdr_27.9768.ckpt`,
+    // Same dead jarredou host as mel_denoise; one shared config covers both denoise variants.
+    downloadUrl: `${GH_ZFT}/v.1.0.7/denoise_mel_band_roformer_aufr33_aggr_sdr_27.9768.ckpt`,
+    configUrl: `${GH_ZFT}/v.1.0.7/model_mel_band_roformer_denoise.yaml`,
   },
 
   // ════════════════════════════════════════
@@ -305,6 +334,8 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt", fileSize: 1_500_000_000,
     stems: ["Dry", "Reverb"], sdrScore: 19.17,
     downloadUrl: `${HF}/anvuew/dereverb_mel_band_roformer/resolve/main/dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt`,
+    // Stereo config (the repo's mono variant has its own separate ckpt+yaml — do not mix).
+    configUrl: `${HF}/anvuew/dereverb_mel_band_roformer/resolve/main/dereverb_mel_band_roformer_anvuew.yaml`,
   },
   {
     id: "mel_dereverb_less", category: "dereverb", architecture: "mel_band_roformer", source: "official",
@@ -313,6 +344,8 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "dereverb_mel_band_roformer_less_aggressive_anvuew_sdr_18.8050.ckpt", fileSize: 1_500_000_000,
     stems: ["Dry", "Reverb"], sdrScore: 18.81,
     downloadUrl: `${HF}/anvuew/dereverb_mel_band_roformer/resolve/main/dereverb_mel_band_roformer_less_aggressive_anvuew_sdr_18.8050.ckpt`,
+    // Mid-training checkpoint of the same run as mel_dereverb — same arch, same config.
+    configUrl: `${HF}/anvuew/dereverb_mel_band_roformer/resolve/main/dereverb_mel_band_roformer_anvuew.yaml`,
   },
   {
     id: "mel_dereverb_echo", category: "dereverb", architecture: "mel_band_roformer", source: "official",
@@ -321,6 +354,9 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "dereverb-echo_mel_band_roformer_sdr_10.0169.ckpt", fileSize: 1_500_000_000,
     stems: ["Dry", "Reverb+Echo"], sdrScore: 10.02,
     downloadUrl: `${HF}/Sucial/Dereverb-Echo_Mel_Band_Roformer/resolve/main/dereverb-echo_mel_band_roformer_sdr_10.0169.ckpt`,
+    // dim-256/depth-8 V1 config; the repo's config_dereverb_echo_mbr_v2.yaml belongs to the
+    // v2/big/fused models and would misconvert this ckpt.
+    configUrl: `${HF}/Sucial/Dereverb-Echo_Mel_Band_Roformer/resolve/main/config_dereverb-echo_mel_band_roformer.yaml`,
   },
   {
     id: "bs_dereverb", category: "dereverb", architecture: "bs_roformer", source: "official",
@@ -350,7 +386,12 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     description: { zh: "去和声/背景人声 (aufr33+viperx)，SDR 10.20", en: "Remove backing vocals by aufr33+viperx, SDR 10.20", ja: "バッキングボーカル除去 (aufr33+viperx)、SDR 10.20" },
     filename: "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt", fileSize: 1_500_000_000,
     stems: ["Lead Vocal", "Backing"], sdrScore: 10.20,
-    downloadUrl: `${HF}/jarredou/aufr33-viperx-karaoke-melroformer-model/resolve/main/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt`,
+    // Original jarredou HF repo is now gated (401); this GH mirror ckpt is byte-identical and its
+    // paired yaml matches the original config on every model/audio/inference param (cross-checked
+    // against a second independent mirror). Mirror instrument STRINGS are Vocals/Instrumental
+    // (original said karaoke/other) — same order/content, only naming.
+    downloadUrl: `${GH_SEP}/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt`,
+    configUrl: `${GH_SEP}/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956_config.yaml`,
   },
 
   // ════════════════════════════════════════
@@ -409,6 +450,8 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     // target_instrument = crowd → port 0 is the CROWD noise, port 1 the clean residual.
     stems: ["Crowd", "Clean"], sdrScore: 8.71,
     downloadUrl: `${MSST}/mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144.ckpt`,
+    // Byte-identical to the authoritative ZFTurbo v.1.0.4 release copy; confirms [crowd, other].
+    configUrl: `${MSST}/model_mel_band_roformer_crowd.yaml`,
   },
   {
     id: "bs_chorus", category: "special", architecture: "bs_roformer", source: "official",
@@ -427,6 +470,7 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     // direct 2-stem [aspiration, other] → port 0 is the BREATH stem, port 1 the clean track.
     stems: ["Breath", "Clean"], sdrScore: 18.98,
     downloadUrl: `${HF}/Sucial/Aspiration_Mel_Band_Roformer/resolve/main/aspiration_mel_band_roformer_sdr_18.9845.ckpt`,
+    configUrl: `${HF}/Sucial/Aspiration_Mel_Band_Roformer/resolve/main/config_aspiration_mel_band_roformer.yaml`,
   },
   {
     id: "bs_drum_bass", category: "special", architecture: "bs_roformer", source: "official",
