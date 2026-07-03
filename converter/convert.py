@@ -158,7 +158,22 @@ def convert_sovits(input_path: Path, output_path: Path):
     print(f"Sample rate: 44100, SSL dim: {ssl_dim}, Speakers: {n_speakers}")
 
 
-def convert_bs_roformer(input_path: Path, output_path: Path):
+def _inference_params_from_yaml(config_yaml, fallback_chunk: int, fallback_overlap: int):
+    """Original MSST inference recipe: audio.chunk_size + inference.num_overlap.
+    Roformer separation quality depends on the inference chunk length matching the
+    training dim_t — do NOT shrink these for speed (S16 did: 131584/2 vs the trained
+    352800/4, a real audible SDR hit). The app's overlap slider is the speed knob."""
+    if config_yaml is None:
+        return fallback_chunk, fallback_overlap
+    import yaml  # hard-fail if pyyaml missing: silent fallback would bake wrong params
+    with open(config_yaml) as f:
+        y = yaml.safe_load(f) or {}
+    chunk = (y.get("audio") or {}).get("chunk_size", fallback_chunk)
+    overlap = (y.get("inference") or {}).get("num_overlap", fallback_overlap)
+    return chunk, overlap
+
+
+def convert_bs_roformer(input_path: Path, output_path: Path, config_yaml: Path = None):
     """Convert BSRoformer .ckpt model to ONNX."""
     config = detect_config(str(input_path))
     model = load_bs_roformer(str(input_path), config)
@@ -213,7 +228,8 @@ def convert_bs_roformer(input_path: Path, output_path: Path):
     print(f"Batch-axis check passed: B=2 == 2x(B=1), diff = {b2_diff:.3e}")
 
     hop_length = config.get("stft_hop_length", 441)
-    chunk_size = 131584  # ~3s at 44100Hz — keeps T≈299 frames, avoids O(T²) attention blowup
+    # Fallback = viperx BSRoformer family (ep_317/ep_368 yamls both say 352800/4).
+    chunk_size, num_overlap = _inference_params_from_yaml(config_yaml, 352800, 4)
 
     config_path = output_path.with_suffix(".json")
     config_data = {
@@ -226,7 +242,7 @@ def convert_bs_roformer(input_path: Path, output_path: Path):
         "win_length": config.get("stft_win_length", 2048),
         "freq_bins": freq_bins,
         "chunk_size": chunk_size,
-        "num_overlap": 2,
+        "num_overlap": num_overlap,
         "batch_size": 1,
         "dynamic_batch": True,
     }
@@ -295,7 +311,8 @@ def convert_mel_band_roformer(input_path: Path, output_path: Path,
     print(f"Batch-axis check passed: B=2 == 2x(B=1), diff = {b2_diff:.3e}")
 
     hop_length = config.get("stft_hop_length", 441)
-    chunk_size = 131584  # ~3s at 44100Hz — keeps T≈299 frames, avoids O(T²) attention blowup
+    # Fallback = melband_roformer_inst_v2 yaml (485100/4); pass --config for other melband models.
+    chunk_size, num_overlap = _inference_params_from_yaml(config_yaml, 485100, 4)
 
     config_path = output_path.with_suffix(".json")
     config_data = {
@@ -308,7 +325,7 @@ def convert_mel_band_roformer(input_path: Path, output_path: Path,
         "win_length": config.get("stft_win_length", n_fft),
         "freq_bins": freq_bins,
         "chunk_size": chunk_size,
-        "num_overlap": 2,
+        "num_overlap": num_overlap,
         "batch_size": 1,
     }
     config_path.write_text(json.dumps(config_data, indent=2))
@@ -466,7 +483,8 @@ def main():
                         choices=["rvc", "sovits", "bs_roformer", "mel_band_roformer", "mdx23c", "htdemucs"],
                         help="Model type")
     parser.add_argument("--config", type=str, default=None,
-                        help="Optional YAML config (for mel_band_roformer / mdx23c STFT params)")
+                        help="Optional YAML config (STFT params for mel_band_roformer / mdx23c; "
+                             "original inference chunk_size/num_overlap for roformers)")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -483,7 +501,8 @@ def main():
     elif args.type == "sovits":
         convert_sovits(input_path, output_path)
     elif args.type == "bs_roformer":
-        convert_bs_roformer(input_path, output_path)
+        config_yaml = Path(args.config) if args.config else None
+        convert_bs_roformer(input_path, output_path, config_yaml)
     elif args.type == "mel_band_roformer":
         config_yaml = Path(args.config) if args.config else None
         convert_mel_band_roformer(input_path, output_path, config_yaml)

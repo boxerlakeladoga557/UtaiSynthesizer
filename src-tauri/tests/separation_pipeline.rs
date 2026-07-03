@@ -1,10 +1,27 @@
 use std::path::PathBuf;
-use utai_lib::inference::engine::OnnxEngine;
+use utai_lib::inference::engine::{DeviceConfig, OnnxEngine};
 use utai_lib::separation::pipeline::{self, NativePipeline};
 use utai_lib::separation::stft::{self, StftConfig};
 
+fn app_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+}
+
+/// The app does this in run() before any ort use; without it, `cargo test` hangs forever at
+/// 0 CPU on the first session build (invisible modal DLL dialog + uninitialized load-dynamic ORT).
+fn init_ort() {
+    utai_lib::suppress_windows_dll_error_dialogs();
+    utai_lib::init_ort_runtime(&app_root());
+}
+
 fn bs_roformer_onnx_path() -> PathBuf {
-    PathBuf::from(r"D:\MyDev\TESTING\MSST\bs_roformer_vocals.onnx")
+    // The app's deployed model (post-S16 RoPE fix). The old TESTING\MSST\bs_roformer_vocals.onnx
+    // was a stale pre-fix export (broken RoPE, near-zero masks) — never point tests at stale copies.
+    app_root()
+        .join("data")
+        .join("models")
+        .join("msst")
+        .join("model_bs_roformer_ep_317_sdr_12.9755.onnx")
 }
 
 fn test_wav_path() -> PathBuf {
@@ -106,6 +123,37 @@ fn test_load_wav() {
     eprintln!("Loaded WAV: {} channels, {} Hz, {} samples", audio.channels, audio.sample_rate, audio.left.len());
 }
 
+/// Manual E2E on real audio:
+///   UTAI_SEP_INPUT=<44.1kHz stereo wav> [UTAI_SEP_MODEL=<onnx>] \
+///   cargo test --test separation_pipeline separate_env_wav -- --ignored --nocapture
+/// Saves <input>.vocals.wav / <input>.instrumental.wav next to the input.
+#[test]
+#[ignore]
+fn separate_env_wav() {
+    let input = std::env::var("UTAI_SEP_INPUT").expect("set UTAI_SEP_INPUT to a wav path");
+    let model_path = std::env::var("UTAI_SEP_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| bs_roformer_onnx_path());
+
+    init_ort();
+    let engine = OnnxEngine::new();
+    // CPU EP for numerical parity runs (CUDA TF32 would blur the comparison); set
+    // UTAI_SEP_DEVICE=auto to use the GPU chain instead.
+    if std::env::var("UTAI_SEP_DEVICE").as_deref() != Ok("auto") {
+        engine.set_device(DeviceConfig::Cpu);
+    }
+    let pipe = NativePipeline::new(&engine, &model_path).expect("Failed to create pipeline");
+    let audio = pipeline::load_wav(&PathBuf::from(&input)).unwrap();
+
+    let stems = pipe.separate(&audio, &|_p| true).expect("Separation failed");
+    for stem in &stems {
+        let path = PathBuf::from(format!("{}.{}.wav", input, stem.label));
+        pipeline::save_wav(&path, stem, pipe.config().sample_rate).unwrap();
+        eprintln!("Saved: {}", path.display());
+    }
+    pipe.unload();
+}
+
 #[test]
 fn test_bs_roformer_native_pipeline() {
     let model_path = bs_roformer_onnx_path();
@@ -120,6 +168,7 @@ fn test_bs_roformer_native_pipeline() {
     let wav_path = test_wav_path();
     generate_test_wav(&wav_path);
 
+    init_ort();
     let engine = OnnxEngine::new();
     let pipe = NativePipeline::new(&engine, &model_path).expect("Failed to create pipeline");
 

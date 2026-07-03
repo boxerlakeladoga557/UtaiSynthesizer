@@ -57,10 +57,10 @@ export const ARCHITECTURE_LABELS: Record<MsstArchitecture, string> = {
 /** Per-architecture default `num_overlap` — MUST mirror what converter/convert.py writes into each
  *  model's JSON. Used ONLY to DISPLAY the model's true default in the node when the user hasn't
  *  overridden it; the actual value still comes from the model JSON on the Rust side. Keep in sync
- *  with the converter (bs/mel roformer use 2; mdx23c and htdemucs use 4). */
+ *  with the converter (all 4 use the original MSST inference recipe: num_overlap 4). */
 export const MSST_DEFAULT_NUM_OVERLAP: Record<MsstArchitecture, number> = {
-  bs_roformer: 2,
-  mel_band_roformer: 2,
+  bs_roformer: 4,
+  mel_band_roformer: 4,
   mdx23c: 4,
   htdemucs: 4,
 };

@@ -53,11 +53,12 @@ impl StftProcessor {
         let padded_len = pad + signal.len() + pad;
         let mut padded = vec![0.0f32; padded_len];
         padded[pad..pad + signal.len()].copy_from_slice(signal);
-        for i in 0..pad.min(signal.len()) {
-            padded[pad - 1 - i] = signal[i];
+        // torch reflect padding excludes the edge sample: [.. x2 x1 | x0 x1 x2 ..]
+        for i in 0..pad.min(signal.len().saturating_sub(1)) {
+            padded[pad - 1 - i] = signal[i + 1];
         }
-        for i in 0..pad.min(signal.len()) {
-            padded[pad + signal.len() + i] = signal[signal.len() - 1 - i];
+        for i in 0..pad.min(signal.len().saturating_sub(1)) {
+            padded[pad + signal.len() + i] = signal[signal.len() - 2 - i];
         }
 
         let num_frames = if padded_len >= n_fft {
@@ -194,17 +195,23 @@ fn hann_window(length: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Apply mask element-wise: result[f,t,ri] = stft[f,t,ri] * mask[f,t,ri]
-/// BSRoformer/MelBandRoformer masks are NOT complex — each ri channel
-/// is an independent scalar multiplier.
+/// Apply mask via TRUE complex multiplication: (sr+i·si)(mr+i·mi).
+/// BSRoformer/MelBandRoformer masks ARE complex — the original applies them as
+/// view_as_complex(stft) * view_as_complex(mask) (bs_roformer.py "complex number
+/// multiplication"), which rotates phase. Element-wise (re*re, im*im) is NOT
+/// equivalent and caps separation at ~4 dB SNR vs ~131 dB (measured).
 pub fn apply_complex_mask(stft_repr: &Array3<f32>, mask: &Array3<f32>) -> Array3<f32> {
     let shape = stft_repr.shape();
     let mut result = Array3::<f32>::zeros((shape[0], shape[1], 2));
 
     for f in 0..shape[0] {
         for t in 0..shape[1] {
-            result[[f, t, 0]] = stft_repr[[f, t, 0]] * mask[[f, t, 0]];
-            result[[f, t, 1]] = stft_repr[[f, t, 1]] * mask[[f, t, 1]];
+            let sr = stft_repr[[f, t, 0]];
+            let si = stft_repr[[f, t, 1]];
+            let mr = mask[[f, t, 0]];
+            let mi = mask[[f, t, 1]];
+            result[[f, t, 0]] = sr * mr - si * mi;
+            result[[f, t, 1]] = sr * mi + si * mr;
         }
     }
     result
@@ -324,12 +331,12 @@ mod tests {
         let freq_bins = spec.shape()[0];
         let frames = spec.shape()[1];
 
-        // Identity mask: all 1.0 for both real and imag channels
+        // Identity mask under complex multiplication: 1 + 0i
         let mut mask = Array3::<f32>::zeros((freq_bins, frames, 2));
         for f in 0..freq_bins {
             for t in 0..frames {
                 mask[[f, t, 0]] = 1.0;
-                mask[[f, t, 1]] = 1.0;
+                mask[[f, t, 1]] = 0.0;
             }
         }
 

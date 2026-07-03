@@ -106,9 +106,28 @@ impl Drop for TaskGuard {
     }
 }
 
+/// Stop Windows from popping a MODAL "DLL not found" dialog that BLOCKS the process when a DLL
+/// dependency can't be resolved — let LoadLibrary fail fast instead. MUST run before the first
+/// ort DLL load (run() does; standalone harnesses like `cargo test` must call it themselves,
+/// otherwise a missing CUDA dependency hangs the process at 0 CPU with an invisible dialog).
+pub fn suppress_windows_dll_error_dialogs() {
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn SetErrorMode(u_mode: u32) -> u32;
+        }
+        const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+        const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
+        unsafe {
+            SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+        }
+    }
+}
+
 /// Find and initialize the ORT runtime DLL.
 /// Picks CUDA or DirectML DLL based on user's saved device preference.
-fn init_ort_runtime(app_dir: &std::path::Path) {
+/// pub so out-of-app harnesses (integration tests) can reuse the exact app init path.
+pub fn init_ort_runtime(app_dir: &std::path::Path) {
     let dll_name = "onnxruntime.dll";
     let runtime_dir = app_dir.join("runtime").join("ort");
 
@@ -388,20 +407,9 @@ fn resolve_app_dir() -> std::path::PathBuf {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    #[cfg(windows)]
-    {
-        // Stop Windows from popping a MODAL "DLL not found" dialog that BLOCKS startup when a CUDA
-        // dependency (cudart/cublas) can't be resolved — let LoadLibrary fail fast so init_ort_runtime
-        // falls back to the DirectML build instead of hanging (observed: Auto loading the CUDA build hung).
-        extern "system" {
-            fn SetErrorMode(u_mode: u32) -> u32;
-        }
-        const SEM_FAILCRITICALERRORS: u32 = 0x0001;
-        const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
-        unsafe {
-            SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
-        }
-    }
+    // Observed: Auto loading the CUDA build hung on a missing cudart/cublas without this —
+    // fail fast so init_ort_runtime falls back to the DirectML build instead of hanging.
+    suppress_windows_dll_error_dialogs();
     let log_dir = logging::get_log_dir();
     let _ = std::fs::create_dir_all(&log_dir);
 
