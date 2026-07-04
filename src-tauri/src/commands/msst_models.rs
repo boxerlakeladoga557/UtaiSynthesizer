@@ -194,7 +194,12 @@ pub async fn download_msst_model(
         Some("ckpt") | Some("pth") | Some("th") | Some("bin")
     );
     let arch = resolve_architecture(architecture.as_deref(), &filename);
-    if arch != "unknown" && is_model_file {
+    // Legacy MDX-Net models are ALREADY .onnx — the "conversion" validates the graph and
+    // writes the sidecar json (without which the native pipeline refuses the model and it
+    // silently falls into the python sidecar). Only that arch may convert an .onnx.
+    let is_mdx_net_onnx = arch == "mdx_net"
+        && dest.extension().and_then(|e| e.to_str()) == Some("onnx");
+    if arch != "unknown" && (is_model_file || is_mdx_net_onnx) {
         let _ = app.emit(
             "msst-download-progress",
             DownloadProgress {
@@ -271,7 +276,7 @@ pub fn delete_msst_model(
     let stem = PathBuf::from(&filename);
     let stem_name = stem.file_stem().unwrap_or_default().to_string_lossy();
 
-    for ext in &["json", "yaml", "yml", "onnx"] {
+    for ext in &["json", "yaml", "yml", "onnx", "fp16.onnx"] {
         let related = dir.join(format!("{}.{}", stem_name, ext));
         if related.exists() {
             std::fs::remove_file(&related).ok();
@@ -424,7 +429,8 @@ async fn run_fp16_converter(fp32_onnx: &Path, app_dir: &Path) -> Result<String, 
 /// are only the fallback for URL/local imports without catalog metadata.
 fn resolve_architecture(explicit: Option<&str>, filename: &str) -> String {
     if let Some(a) = explicit {
-        if matches!(a, "bs_roformer" | "mel_band_roformer" | "mdx23c" | "htdemucs") {
+        if matches!(a, "bs_roformer" | "mel_band_roformer" | "mdx23c" | "htdemucs"
+                       | "uvr_vr" | "mdx_net") {
             return a.to_string();
         }
         tracing::warn!("Ignoring unknown architecture hint '{}' — falling back to name detection", a);
@@ -441,7 +447,18 @@ fn detect_architecture_from_name(filename: &str) -> String {
     } else if lower.contains("bs_roformer") || lower.contains("bsroformer") {
         "bs_roformer".to_string()
     } else if lower.contains("mdx23c") || lower.contains("tfc_tdf") {
+        // NOTE: must stay BEFORE the looser "mdxnet" check below.
         "mdx23c".to_string()
+    } else if lower.contains("mdxnet") || lower.contains("mdx_net") {
+        // Legacy UVR MDX-Net .onnx (e.g. UVR_MDXNET_KARA*.onnx).
+        "mdx_net".to_string()
+    } else if lower.contains("karaoke-uvr") || lower.contains("de-echo")
+        || lower.contains("deecho") || lower.contains("denoise")
+        || lower.contains("de-reverb") || lower.contains("wind_inst")
+    {
+        // UVR VR-arch .pth family (registry-gated in the converter — an unknown
+        // VR model fails there with a clear message, not with garbage output).
+        "uvr_vr".to_string()
     } else {
         "unknown".to_string()
     }

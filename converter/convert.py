@@ -1,9 +1,11 @@
 """Model converter: .pth/.ckpt → .onnx
 
-Converts RVC, SoVITS, BSRoformer, MelBandRoformer, and MDX23C checkpoints
-to ONNX format for inference via ONNX Runtime in the Rust backend.
+Converts RVC, SoVITS, BSRoformer, MelBandRoformer, MDX23C, HTDemucs, and
+UVR VR-arch checkpoints to ONNX format for inference via ONNX Runtime in the
+Rust backend; legacy MDX-Net models are already ONNX and get a passthrough
+(validate + write the sidecar json).
 
-Requires PyTorch (CPU is sufficient for conversion).
+Requires PyTorch (CPU is sufficient for conversion; mdx_net needs no torch).
 
 Usage:
     python convert.py --input model.pth  --output model.onnx --type rvc
@@ -12,16 +14,24 @@ Usage:
     python convert.py --input model.ckpt --output model.onnx --type mel_band_roformer [--config model.yaml]
     python convert.py --input model.ckpt --output model.onnx --type mdx23c --config model.yaml
     python convert.py --input model.th   --output model.onnx --type htdemucs [--config model.yaml]
+    python convert.py --input model.pth  --output model.onnx --type uvr_vr
+    python convert.py --input model.onnx --output model.onnx --type mdx_net
+
+uvr_vr/mdx_net take no --config: their params come from embedded registries
+keyed by UVR's tail-hash (architectures/uvr_vr.py, architectures/mdx_net.py);
+unknown hashes are refused, not guessed.
 
 Separation types accept --precision fp32|fp16|both (default fp32). fp16 keeps
 the shared <stem>.json and writes <stem>.fp16.onnx (deleting the fp32 .onnx);
 both keeps both files. rvc/sovits ignore --precision. fp16 is numerically
-verified (45 dB gate) for all four separation types (FP16_VERIFIED_TYPES).
+verified (45 dB gate) for the four FP16_VERIFIED_TYPES only — uvr_vr/mdx_net
+are refused until they pass their own CUDA-EP gate (verify/README.md 关卡 3).
 """
 
 import argparse
 import json
 import math
+import shutil
 import sys
 from pathlib import Path
 
@@ -46,12 +56,20 @@ from architectures.htdemucs import (
     load_from_checkpoint as load_htdemucs,
     detect_config as detect_htdemucs_config,
 )
+from architectures.uvr_vr import (
+    load_from_checkpoint as load_uvr_vr,
+    detect_config as detect_uvr_vr_config,
+    VrMaskModel,
+    WINDOW_SIZE as VR_WINDOW_SIZE,
+    NON_ACCOM_STEMS,
+)
 from architectures.msst_yaml import load_msst_yaml, stem_fields, stem_fields_from_yaml
 
 # --precision applies to these (rvc/sovits ignore it); fp16 is numerically
-# verified (>45 dB vs fp32) for the roformer archs + mdx23c (71.0/75.5 dB)
-# ONLY — refuse the rest.
-SEPARATION_TYPES = {"bs_roformer", "mel_band_roformer", "mdx23c", "htdemucs"}
+# verified (>45 dB vs fp32) for the roformer archs + mdx23c + htdemucs ONLY —
+# refuse the rest (uvr_vr/mdx_net must pass their own CUDA-EP gate first).
+SEPARATION_TYPES = {"bs_roformer", "mel_band_roformer", "mdx23c", "htdemucs",
+                    "uvr_vr", "mdx_net"}
 FP16_VERIFIED_TYPES = {"bs_roformer", "mel_band_roformer", "mdx23c", "htdemucs"}
 
 
@@ -542,12 +560,174 @@ def convert_htdemucs(input_path: Path, output_path: Path, config_yaml: Path = No
     print(f"Sources: {sources}, FFT: {nfft}, Segment: {segment}s ({segment_samples} samples)")
 
 
+def convert_uvr_vr(input_path: Path, output_path: Path):
+    """Convert UVR VR-arch .pth model to ONNX (mask predictor, fixed T window)."""
+    config = detect_uvr_vr_config(str(input_path))
+    net = load_uvr_vr(str(input_path), config)
+    model = VrMaskModel(net)
+    model.eval()
+
+    mp = config["model_params"]
+    bins = mp["bins"]
+
+    # Magnitude domain input ([0,1) after the pipeline's global max-norm) —
+    # torch.rand keeps the parity check in-domain.
+    dummy = torch.rand(1, 2, bins + 1, VR_WINDOW_SIZE)
+
+    with torch.no_grad():
+        test_out = model(dummy)
+    print(f"Test inference OK: input {list(dummy.shape)} -> output {list(test_out.shape)}")
+
+    torch.onnx.export(
+        model,
+        (dummy,),
+        str(output_path),
+        input_names=["mag"],
+        output_names=["mask"],
+        # T is deliberately static (=WINDOW_SIZE crops, DML-friendly); only batch is dynamic.
+        dynamic_axes={
+            "mag": {0: "batch"},
+            "mask": {0: "batch"},
+        },
+        opset_version=17,
+        do_constant_folding=True,
+        dynamo=False,
+    )
+
+    import onnx
+    onnx_model = onnx.load(str(output_path))
+    onnx.checker.check_model(onnx_model)
+    print(f"ONNX check passed: {output_path}")
+
+    import onnxruntime as ort
+    sess = ort.InferenceSession(str(output_path))
+    ort_out = sess.run(None, {"mag": dummy.numpy()})
+    diff = abs(test_out.numpy() - ort_out[0]).max()
+    print(f"ORT verification: max diff = {diff:.6e}")
+    # Batch-axis self-check (same rationale as the roformers): a B=2 batch must
+    # equal two independent B=1 runs — proves the dynamic batch axis survived
+    # tracing (the v5.1 LSTM reshape is the risky spot) before Rust batches windows.
+    dummy2 = torch.cat([dummy, torch.rand(1, 2, bins + 1, VR_WINDOW_SIZE)], dim=0)
+    ort_b2 = sess.run(None, {"mag": dummy2.numpy()})[0]
+    s0 = sess.run(None, {"mag": dummy2[0:1].numpy()})[0]
+    s1 = sess.run(None, {"mag": dummy2[1:2].numpy()})[0]
+    b2_diff = max(abs(ort_b2[0] - s0[0]).max(), abs(ort_b2[1] - s1[0]).max())
+    assert b2_diff < 1e-3, f"BATCH-AXIS EXPORT BROKEN: B=2 != 2x(B=1) (diff {b2_diff:.3e})"
+    print(f"Batch-axis check passed: B=2 == 2x(B=1), diff = {b2_diff:.3e}")
+
+    band_keys = sorted(mp["band"].keys())
+    top = mp["band"][band_keys[-1]]
+    bands = []
+    for d in band_keys:
+        bp = mp["band"][d]
+        band = {"sr": bp["sr"], "hl": bp["hl"], "n_fft": bp["n_fft"],
+                "crop_start": bp["crop_start"], "crop_stop": bp["crop_stop"]}
+        # Optional per-band keys pass through verbatim (Rust mirrors the original
+        # presence/threshold checks, e.g. top-band hpf only applies when > 0).
+        for k in ("hpf_start", "hpf_stop", "lpf_start", "lpf_stop", "convert_channels"):
+            if k in bp:
+                band[k] = bp[k]
+        bands.append(band)
+
+    config_data = {
+        "type": "uvr_vr",
+        "sample_rate": mp["sr"],
+        "stereo": True,
+        "num_stems": 2,
+        # Schema-required STFT trio = TOP band's values; the VR pipeline reads `bands`.
+        "n_fft": top["n_fft"],
+        "hop_length": top["hl"],
+        "win_length": top["n_fft"],
+        "window_size": VR_WINDOW_SIZE,
+        "offset": net.offset,
+        "bins": bins,
+        "is_v51": bool(config["is_v51"]),
+        "pre_filter_start": mp["pre_filter_start"],
+        "pre_filter_stop": mp["pre_filter_stop"],
+        # v5.0 GLOBAL waveform-domain channel transforms (v5.1 uses per-band
+        # convert_channels in `bands` instead; both default off).
+        "reverse": bool(mp.get("reverse", False)),
+        "mid_side": bool(mp.get("mid_side", False)),
+        "mid_side_b2": bool(mp.get("mid_side_b2", False)),
+        "bands": bands,
+        "aggr_split_bin": mp["band"][1]["crop_stop"],
+        "primary_non_accom": config["primary_stem"] in NON_ACCOM_STEMS,
+        "batch_size": 4,
+        "dynamic_batch": True,
+        "stem_names": list(config["stem_names"]),
+    }
+    config_path = _write_model_json(output_path, config_data)
+
+    print(f"Converted UVR VR ({config['name']}, "
+          f"{'v5.1 CascadedNet' if config['is_v51'] else 'v5.0 CascadedASPPNet'}): "
+          f"{input_path} -> {output_path}")
+    print(f"Config saved: {config_path}")
+    print(f"Bins: {bins}, Bands: {len(bands)}, Window: {VR_WINDOW_SIZE}, "
+          f"Offset: {net.offset}, Stems: {config['stem_names']}")
+
+
+def convert_mdx_net(input_path: Path, output_path: Path):
+    """Legacy MDX-Net passthrough: validate the existing .onnx + write the json."""
+    from architectures.mdx_net import detect_config as detect_mdx_net_config, MDX_HOP
+    config = detect_mdx_net_config(str(input_path))
+    dim_f, dim_t = config["dim_f"], config["dim_t"]
+
+    if input_path.resolve() != output_path.resolve():
+        shutil.copyfile(input_path, output_path)
+
+    import onnx
+    onnx_model = onnx.load(str(output_path))
+    onnx.checker.check_model(onnx_model)
+    # Cross-check the graph's static F/T dims against the registry — a registry
+    # typo or a mislabeled file must fail HERE, not as garbage audio at runtime.
+    in0 = onnx_model.graph.input[0]
+    dims = [d.dim_value for d in in0.type.tensor_type.shape.dim]
+    if dims[1:] != [4, dim_f, dim_t]:
+        raise ValueError(
+            f"ONNX input shape {dims} does not match registry "
+            f"[batch, 4, {dim_f}, {dim_t}] for {config['name']}")
+    print(f"ONNX check passed: {output_path} (input [batch, 4, {dim_f}, {dim_t}])")
+
+    import numpy as np
+    import onnxruntime as ort
+    sess = ort.InferenceSession(str(output_path))
+    smoke = sess.run(None, {"input": np.zeros((1, 4, dim_f, dim_t), dtype=np.float32)})[0]
+    if smoke.shape != (1, 4, dim_f, dim_t) or not np.isfinite(smoke).all():
+        raise ValueError(f"ORT smoke run failed: output shape {smoke.shape}")
+    print("ORT smoke run passed")
+
+    config_data = {
+        "type": "mdx_net",
+        "sample_rate": 44100,
+        "stereo": True,
+        "num_stems": 1,
+        "n_fft": config["n_fft"],
+        "hop_length": MDX_HOP,
+        "win_length": config["n_fft"],
+        "dim_f": dim_f,
+        "dim_t": dim_t,
+        "chunk_size": MDX_HOP * (dim_t - 1),
+        "num_overlap": 2,
+        "compensate": config["compensate"],
+        "batch_size": 1,
+        "stem_names": list(config["stem_names"]),
+        "residual_name": config["residual_name"],
+    }
+    config_path = _write_model_json(output_path, config_data)
+
+    print(f"Converted MDX-Net ({config['name']}): {input_path} -> {output_path}")
+    print(f"Config saved: {config_path}")
+    print(f"n_fft: {config['n_fft']}, compensate: {config['compensate']}, "
+          f"stem: {config['stem_names'][0]} (+residual {config['residual_name']})")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert .pth/.ckpt models to ONNX")
     parser.add_argument("--input", type=str, required=True, help="Input .pth/.ckpt file")
     parser.add_argument("--output", type=str, required=True, help="Output .onnx file")
     parser.add_argument("--type", type=str, required=True,
-                        choices=["rvc", "sovits", "bs_roformer", "mel_band_roformer", "mdx23c", "htdemucs"],
+                        choices=["rvc", "sovits", "bs_roformer", "mel_band_roformer",
+                                 "mdx23c", "htdemucs", "uvr_vr", "mdx_net"],
                         help="Model type")
     parser.add_argument("--config", type=str, default=None,
                         help="Optional MSST training YAML (STFT params for mel_band_roformer / "
@@ -592,6 +772,10 @@ def main():
     elif args.type == "htdemucs":
         config_yaml = Path(args.config) if args.config else None
         convert_htdemucs(input_path, output_path, config_yaml)
+    elif args.type == "uvr_vr":
+        convert_uvr_vr(input_path, output_path)
+    elif args.type == "mdx_net":
+        convert_mdx_net(input_path, output_path)
 
     if args.precision != "fp32" and args.type in SEPARATION_TYPES:
         # The torch export above MUST stay fp32 — it is the intermediate the

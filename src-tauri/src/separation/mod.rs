@@ -65,6 +65,14 @@ pub struct SeparationConfig {
     /// and REQUIRED for MelBand inst_v2 on 12GB cards (fp32 saturates VRAM into WDDM paging).
     #[serde(default)]
     pub precision: Option<String>,
+    /// UVR VR arch only: aggressiveness (−100..100, UVR default 5).
+    #[serde(default)]
+    pub aggression: Option<i32>,
+    /// UVR VR arch only: post-process (merge_artifacts) toggle + threshold (0.1/0.2/0.3).
+    #[serde(default)]
+    pub post_process: Option<bool>,
+    #[serde(default)]
+    pub post_process_threshold: Option<f32>,
 }
 
 fn default_device() -> String {
@@ -178,6 +186,12 @@ impl SeparationManager {
         pipe.set_shifts(config.shifts);
         if let Some(b) = config.batch {
             pipe.set_batch(b);
+        }
+        if let Some(a) = config.aggression {
+            pipe.set_aggression(a);
+        }
+        if let Some(pp) = config.post_process {
+            pipe.set_post_process(pp, config.post_process_threshold);
         }
         // Report the EP actually backing this run so the user can confirm what hardware ran (and
         // whether Auto / an explicit pick ended up on GPU or fell back).

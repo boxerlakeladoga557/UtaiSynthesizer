@@ -11,6 +11,8 @@ use utai_dsp::{
     normalize_audio, prepare_padded_audio, shift_left, shift_right, sum_freq_time,
     AudioAccumulator,
 };
+use utai_dsp::mdx::{mdx_pad_mix, np_hanning, zero_low_bins};
+use utai_dsp::vr;
 // Re-export so the established external paths (pipeline::AudioData etc.) stay valid.
 pub use utai_dsp::{AudioData, StemAudio};
 use crate::inference::engine::{InputTensor, OnnxEngine};
@@ -72,6 +74,78 @@ pub struct ModelConfig {
     // Legacy field — ignored if num_overlap is set
     #[serde(default)]
     pub overlap: usize,
+
+    // ── UVR VR arch (type == "uvr_vr"; converter architectures/uvr_vr.py) ──
+    /// Model window in STFT frames (crops fed to the net; T is STATIC in the export).
+    #[serde(default)]
+    pub window_size: usize,
+    /// predict_mask time crop per side (v5.0: 128, v5.1: 64) — baked into the ONNX
+    /// output width (window_size − 2·offset = roi).
+    #[serde(default)]
+    pub offset: usize,
+    /// Combined multiband bin count (model input freq dim = bins + 1).
+    #[serde(default)]
+    pub bins: usize,
+    #[serde(default)]
+    pub is_v51: bool,
+    #[serde(default)]
+    pub pre_filter_start: i64,
+    #[serde(default)]
+    pub pre_filter_stop: i64,
+    /// v5.0 GLOBAL waveform-domain channel transforms (6_HP uses mid_side_b2).
+    #[serde(default)]
+    pub reverse: bool,
+    #[serde(default)]
+    pub mid_side: bool,
+    #[serde(default)]
+    pub mid_side_b2: bool,
+    /// Multiband table (lowest→highest); presence gates the VR path's sanity check.
+    #[serde(default)]
+    pub bands: Option<Vec<VrBandConfig>>,
+    /// Aggressiveness split row = band 1's crop_stop (exponent differs below/above).
+    #[serde(default)]
+    pub aggr_split_bin: usize,
+    /// Primary stem ∈ UVR's NON_ACCOM_STEMS (flips the aggressiveness exponent).
+    #[serde(default)]
+    pub primary_non_accom: bool,
+    /// Runtime: UI aggression (−100..100, UVR default 5 → mask exponent tweak).
+    #[serde(default)]
+    pub aggression: Option<i32>,
+    /// Runtime: UVR post-process (merge_artifacts) toggle + threshold (0.1/0.2/0.3).
+    #[serde(default)]
+    pub post_process: bool,
+    #[serde(default)]
+    pub post_process_threshold: Option<f32>,
+
+    // ── Legacy MDX-Net (type == "mdx_net"; converter architectures/mdx_net.py) ──
+    /// Static time frames of the graph (256 for the KARA models).
+    #[serde(default)]
+    pub dim_t: usize,
+    /// UVR per-model output gain (applied to the primary stem BEFORE the residual).
+    #[serde(default)]
+    pub compensate: Option<f32>,
+}
+
+/// One VR band's DSP params (converter json `bands` entry; mirrors
+/// `utai_dsp::vr::VrBandParam`). Filter keys are absent where the reference
+/// JSON omits them (band 1 has no hpf, the top band no lpf).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VrBandConfig {
+    pub sr: u32,
+    pub hl: usize,
+    pub n_fft: usize,
+    pub crop_start: usize,
+    pub crop_stop: usize,
+    #[serde(default)]
+    pub hpf_start: Option<i64>,
+    #[serde(default)]
+    pub hpf_stop: Option<i64>,
+    #[serde(default)]
+    pub lpf_start: Option<i64>,
+    #[serde(default)]
+    pub lpf_stop: Option<i64>,
+    #[serde(default)]
+    pub convert_channels: Option<String>,
 }
 
 fn default_chunk_size() -> usize { 131584 }
@@ -162,6 +236,19 @@ impl NativePipeline {
         self.config.shifts = n;
     }
 
+    /// VR aggressiveness (UI, −100..100; UVR default 5). No-op for other archs.
+    pub fn set_aggression(&mut self, v: i32) {
+        self.config.aggression = Some(v);
+    }
+
+    /// VR post-process (merge_artifacts) toggle + threshold (UI). No-op for other archs.
+    pub fn set_post_process(&mut self, on: bool, threshold: Option<f32>) {
+        self.config.post_process = on;
+        if threshold.is_some() {
+            self.config.post_process_threshold = threshold;
+        }
+    }
+
     /// Run separation. Returns (stem_label, audio_data) pairs.
     /// `progress_cb` returns `true` to continue, `false` to cancel.
     ///
@@ -194,7 +281,10 @@ impl NativePipeline {
         // htdemucs (hybrid demucs) is NOT mean/std-normalized in MSST, and its node UI hides the
         // Normalize toggle — so a stale `normalize=true` carried over from a spectral model on the
         // same node must not apply here. Guarding at this single point keeps the UI and engine honest.
-        let mut stems = if self.config.normalize && self.config.model_type != "htdemucs" {
+        // uvr_vr normalizes its own magnitude globally (reference semantics) and mdx_net has no
+        // input normalization at all — both must ignore a stale flag the same way.
+        let skip_normalize = matches!(self.config.model_type.as_str(), "htdemucs" | "uvr_vr" | "mdx_net");
+        let mut stems = if self.config.normalize && !skip_normalize {
             let (mean, std) = compute_audio_mean_std(audio);
             tracing::info!("MSST normalize ON (mean={:.6}, std={:.6})", mean, std);
             let normed = normalize_audio(audio, mean, std);
@@ -234,7 +324,10 @@ impl NativePipeline {
     ) -> Result<Vec<StemAudio>> {
         let stereo = self.config.stereo && audio.channels == 2;
         let mut augs: Vec<Aug> = vec![Aug::Identity];
-        if self.config.use_tta {
+        // uvr_vr implements the ORIGINAL VR TTA (a half-window-shifted second mask pass,
+        // averaged in mask domain) inside separate_vr — the generic polarity/channel-swap
+        // passes here are NOT what UVR's TTA option means and must not stack on top.
+        if self.config.use_tta && self.config.model_type != "uvr_vr" {
             augs.push(Aug::Polarity);
             if stereo {
                 augs.push(Aug::ChannelSwap);
@@ -304,13 +397,12 @@ impl NativePipeline {
         progress_cb: &dyn Fn(f32) -> bool,
     ) -> Result<Vec<StemAudio>> {
         match self.config.processing_mode {
-            ProcessingMode::Spectral => {
-                if self.config.model_type == "mdx23c" {
-                    self.separate_mdx23c(audio, progress_cb)
-                } else {
-                    self.separate_spectral(audio, progress_cb)
-                }
-            }
+            ProcessingMode::Spectral => match self.config.model_type.as_str() {
+                "mdx23c" => self.separate_mdx23c(audio, progress_cb),
+                "uvr_vr" => self.separate_vr(audio, progress_cb),
+                "mdx_net" => self.separate_mdx_net(audio, progress_cb),
+                _ => self.separate_spectral(audio, progress_cb),
+            },
             ProcessingMode::Waveform => self.separate_waveform(audio, progress_cb),
             ProcessingMode::Hybrid => self.separate_hybrid(audio, progress_cb),
         }
@@ -826,6 +918,326 @@ impl NativePipeline {
         tracing::info!("[perf] separate_hybrid TOTAL: {:.1} ms ({} segments)", t_total.elapsed().as_secs_f64() * 1e3, seg_idx);
 
         Ok(stems)
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // UVR VR arch — whole-song multiband magnitude masking
+    // (reference: vr_separator.py + spec_utils.py; see utai_dsp::vr)
+    // ═══════════════════════════════════════════════════════════════
+    fn separate_vr(
+        &self,
+        audio: &AudioData,
+        progress_cb: &dyn Fn(f32) -> bool,
+    ) -> Result<Vec<StemAudio>> {
+        let bands_cfg = self.config.bands.as_ref().ok_or_else(|| {
+            UtaiError::Audio("uvr_vr model json is missing the `bands` table".into())
+        })?;
+        if bands_cfg.is_empty() || self.config.bins == 0 || self.config.window_size == 0 {
+            return Err(UtaiError::Audio("uvr_vr model json has invalid VR params".into()));
+        }
+        let params = vr::VrParams {
+            bins: self.config.bins,
+            pre_filter_start: self.config.pre_filter_start,
+            pre_filter_stop: self.config.pre_filter_stop,
+            is_v51: self.config.is_v51,
+            reverse: self.config.reverse,
+            mid_side: self.config.mid_side,
+            mid_side_b2: self.config.mid_side_b2,
+            bands: bands_cfg
+                .iter()
+                .map(|b| vr::VrBandParam {
+                    sr: b.sr,
+                    hl: b.hl,
+                    n_fft: b.n_fft,
+                    crop_start: b.crop_start,
+                    crop_stop: b.crop_stop,
+                    hpf_start: b.hpf_start,
+                    hpf_stop: b.hpf_stop,
+                    lpf_start: b.lpf_start,
+                    lpf_stop: b.lpf_stop,
+                    convert_channels: b.convert_channels.clone(),
+                })
+                .collect(),
+            window_size: self.config.window_size,
+            offset: self.config.offset,
+            aggr_split_bin: self.config.aggr_split_bin,
+            primary_non_accom: self.config.primary_non_accom,
+        };
+        let orig_len = audio.left.len();
+        if orig_len == 0 {
+            return Ok(vec![]);
+        }
+
+        let t_total = std::time::Instant::now();
+        // ── Phase A: multiband analysis (CPU) ──
+        let t_ana = std::time::Instant::now();
+        let combined = vr::vr_analyze(&params, &audio.left, &audio.right);
+        let (mag, phase) = vr::vr_mag_phase(&combined);
+        drop(combined); // masking reconstructs from mag·e^{iφ}, the complex spec isn't reused
+        tracing::debug!("[perf] VR analysis: {:.1} ms", t_ana.elapsed().as_secs_f64() * 1e3);
+        let n_frame = mag.shape()[2];
+        if n_frame == 0 {
+            return Ok(vec![]);
+        }
+        if !progress_cb(0.05) {
+            return Err(UtaiError::Audio("Stopped by user".into()));
+        }
+
+        // ── Phase B: window-batched mask inference ──
+        let (pad_l, pad_r, roi) = vr::make_padding(n_frame, params.window_size, params.offset);
+        let t_inf = std::time::Instant::now();
+        let mask_full = {
+            let padded = vr::pad_and_normalize_mag(&mag, pad_l, pad_r);
+            let p1 = if self.config.use_tta { 0.40 } else { 0.72 };
+            self.vr_execute_mask(&padded, roi, &params, 0.05, p1, progress_cb)?
+        };
+        // Crop to n_frame; TTA = a second pass shifted by roi/2 (original VR semantics),
+        // averaged with the first IN MASK DOMAIN.
+        let mut mask = ndarray::Array3::<f32>::zeros((2, params.bins + 1, n_frame));
+        for ch in 0..2 {
+            for f in 0..params.bins + 1 {
+                for t in 0..n_frame {
+                    mask[[ch, f, t]] = mask_full[[ch, f, t]];
+                }
+            }
+        }
+        drop(mask_full);
+        if self.config.use_tta {
+            let padded = vr::pad_and_normalize_mag(&mag, pad_l + roi / 2, pad_r + roi / 2);
+            let mask_tta = self.vr_execute_mask(&padded, roi, &params, 0.40, 0.72, progress_cb)?;
+            let shift = roi / 2;
+            for ch in 0..2 {
+                for f in 0..params.bins + 1 {
+                    for t in 0..n_frame {
+                        mask[[ch, f, t]] = (mask[[ch, f, t]] + mask_tta[[ch, f, shift + t]]) * 0.5;
+                    }
+                }
+            }
+        }
+        tracing::debug!("[perf] VR mask inference: {:.1} ms", t_inf.elapsed().as_secs_f64() * 1e3);
+
+        // ── Phase C: mask post-processing + apply ──
+        // UI aggression (UVR default 5) → value = aggression/100; exponent flip for
+        // non-accompaniment primaries (none of the shipped 9, but registry-driven).
+        let aggression = self.config.aggression.unwrap_or(5);
+        vr::adjust_aggr(
+            &mut mask,
+            self.config.primary_non_accom,
+            aggression as f64 / 100.0,
+            params.aggr_split_bin,
+        );
+        if self.config.post_process {
+            let thres = self.config.post_process_threshold.unwrap_or(0.2);
+            tracing::info!("VR post-process (merge_artifacts) ON, threshold {}", thres);
+            vr::merge_artifacts(&mut mask, thres, 64, 32);
+        }
+        let (y_spec, v_spec) = vr::vr_apply_mask(&mask, &mag, &phase);
+        drop(mask);
+        drop(mag);
+        drop(phase);
+        if !progress_cb(0.75) {
+            return Err(UtaiError::Audio("Stopped by user".into()));
+        }
+
+        // ── Phase D: per-stem multiband synthesis (CPU; the two stems are independent) ──
+        let t_syn = std::time::Instant::now();
+        let ((yl, yr), (vl, vr_)) = rayon::join(
+            || vr::vr_synthesize(&params, &y_spec),
+            || vr::vr_synthesize(&params, &v_spec),
+        );
+        tracing::debug!("[perf] VR synthesis: {:.1} ms", t_syn.elapsed().as_secs_f64() * 1e3);
+        progress_cb(1.0);
+
+        // Reference output is hl_top·(frames−1) samples (≤ input by < one hop);
+        // zero-pad the tail so stems align sample-exact with the DAW's source lane.
+        let fit = |mut v: Vec<f32>| {
+            v.resize(orig_len, 0.0);
+            v
+        };
+        let stems = vec![
+            StemAudio {
+                label: stem_label(&self.config, 0),
+                left: fit(yl),
+                right: fit(yr),
+                channels: 2,
+            },
+            StemAudio {
+                label: stem_label(&self.config, 1),
+                left: fit(vl),
+                right: fit(vr_),
+                channels: 2,
+            },
+        ];
+        tracing::info!(
+            "[perf] separate_vr TOTAL: {:.1} ms ({} frames)",
+            t_total.elapsed().as_secs_f64() * 1e3, n_frame
+        );
+        Ok(stems)
+    }
+
+    /// One full masking pass over the padded magnitude: slide `window_size`-wide crops
+    /// at stride `roi`, batch them, run the ONNX mask net (output width = roi — the
+    /// offset crop is baked into the graph), concat along time.
+    fn vr_execute_mask(
+        &self,
+        padded: &ndarray::Array3<f32>,
+        roi: usize,
+        params: &vr::VrParams,
+        p0: f32,
+        p1: f32,
+        progress_cb: &dyn Fn(f32) -> bool,
+    ) -> Result<ndarray::Array3<f32>> {
+        let bins1 = padded.shape()[1];
+        let total_t = padded.shape()[2];
+        let ws = params.window_size;
+        let patches = (total_t - 2 * params.offset) / roi;
+        if patches == 0 {
+            return Err(UtaiError::Audio("VR window error: input too short".into()));
+        }
+        let mut mask = ndarray::Array3::<f32>::zeros((2, bins1, patches * roi));
+        let b = self.effective_batch();
+        let win_floats = 2 * bins1 * ws;
+        let out_floats = 2 * bins1 * roi;
+        let mut done = 0usize;
+        while done < patches {
+            let bg = b.min(patches - done);
+            let mut input_data = vec![0.0f32; bg * win_floats];
+            for j in 0..bg {
+                vr::copy_mag_window(
+                    padded,
+                    (done + j) * roi,
+                    ws,
+                    &mut input_data[j * win_floats..(j + 1) * win_floats],
+                );
+            }
+            let input = InputTensor::F32 {
+                data: input_data,
+                shape: vec![bg as i64, 2, bins1 as i64, ws as i64],
+            };
+            let outputs = self.engine().run(&self.session_id, vec![("mag", input)])?;
+            let out = outputs.into_iter().next().ok_or_else(|| {
+                UtaiError::Audio("VR model produced no output".into())
+            })?;
+            if out.len() < bg * out_floats {
+                return Err(UtaiError::Audio(format!(
+                    "VR mask output too small: {} < {}", out.len(), bg * out_floats
+                )));
+            }
+            for j in 0..bg {
+                let t0 = (done + j) * roi;
+                for ch in 0..2 {
+                    for f in 0..bins1 {
+                        let base = ((j * 2 + ch) * bins1 + f) * roi;
+                        for i in 0..roi {
+                            mask[[ch, f, t0 + i]] = out[base + i];
+                        }
+                    }
+                }
+            }
+            done += bg;
+            let p = p0 + (p1 - p0) * done as f32 / patches as f32;
+            if !progress_cb(p) {
+                return Err(UtaiError::Audio("Stopped by user".into()));
+            }
+        }
+        Ok(mask)
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Legacy MDX-Net (UVR KARA models) — direct-spectrogram nets
+    // (reference: UVR SeperateMDX / audio-separator mdx_separator.py)
+    // ═══════════════════════════════════════════════════════════════
+    fn separate_mdx_net(
+        &self,
+        audio: &AudioData,
+        progress_cb: &dyn Fn(f32) -> bool,
+    ) -> Result<Vec<StemAudio>> {
+        let proc = StftProcessor::new(stft::StftConfig {
+            n_fft: self.config.n_fft,
+            hop_length: self.config.hop_length,
+            win_length: self.config.win_length,
+        });
+        let dim_f = self.config.dim_f;
+        let dim_t = self.config.dim_t;
+        if dim_f == 0 || dim_t == 0 {
+            return Err(UtaiError::Audio("mdx_net model json needs dim_f/dim_t".into()));
+        }
+        let hop = self.config.hop_length;
+        let trim = self.config.n_fft / 2;
+        // chunk = hop·(dim_t−1): the graph's T axis is static, so the geometry is fixed.
+        let chunk_size = hop * (dim_t - 1);
+        let gen_size = chunk_size - 2 * trim;
+        let num_overlap = self.config.num_overlap.max(1);
+        let step = (chunk_size / num_overlap).max(1);
+        let compensate = self.config.compensate.unwrap_or(1.0);
+        let orig_len = audio.left.len();
+        if orig_len == 0 {
+            return Ok(vec![]);
+        }
+
+        let t_total = std::time::Instant::now();
+        let (pl, pr) = mdx_pad_mix(&audio.left, &audio.right, trim, gen_size);
+        let padded_len = pl.len();
+        let mut acc = AudioAccumulator::new(padded_len, true);
+        let starts: Vec<usize> = (0..padded_len).step_by(step).collect();
+        let total = starts.len();
+        let mut perf_infer = 0.0f64;
+
+        for (i, &start) in starts.iter().enumerate() {
+            let end = (start + chunk_size).min(padded_len);
+            let actual = end - start;
+            let mut cl = vec![0.0f32; chunk_size];
+            let mut cr = vec![0.0f32; chunk_size];
+            cl[..actual].copy_from_slice(&pl[start..end]);
+            cr[..actual].copy_from_slice(&pr[start..end]);
+
+            let spec_l = proc.stft(&cl);
+            let spec_r = proc.stft(&cr);
+            debug_assert_eq!(spec_l.shape()[1], dim_t);
+            let mut cac = assemble_cac(&spec_l, &spec_r, dim_f, dim_t);
+            zero_low_bins(&mut cac, dim_f, dim_t); // spek[:, :, :3, :] *= 0 (both references)
+
+            let input = InputTensor::F32 {
+                data: cac,
+                shape: vec![1, 4, dim_f as i64, dim_t as i64],
+            };
+            let t_run = std::time::Instant::now();
+            let outputs = self.engine().run(&self.session_id, vec![("input", input)])?;
+            perf_infer += t_run.elapsed().as_secs_f64();
+            let out = outputs.into_iter().next().ok_or_else(|| {
+                UtaiError::Audio("MDX-Net model produced no output".into())
+            })?;
+
+            // Output IS the primary stem's spectrogram (no mask). Rows ≥ dim_f
+            // (up to nyquist) stay zero, matching the reference zero-pad.
+            let (sl, sr_) = deinterleave_cac(&out, 0, dim_f, dim_t, proc.freq_bins());
+            let left = proc.istft(&sl, chunk_size);
+            let right = proc.istft(&sr_, chunk_size);
+
+            // hanning(actual) OLA — result/divider semantics via the accumulator.
+            let window = np_hanning(actual);
+            acc.add_windowed_stereo(&left[..actual], &right[..actual], start, &window);
+
+            if !progress_cb((i + 1) as f32 / total as f32) {
+                return Err(UtaiError::Audio("Stopped by user".into()));
+            }
+        }
+
+        // result/divider → strip the leading trim pad → crop to input length,
+        // then UVR's compensate gain on the primary (the residual in separate()
+        // is computed AFTER this — mix − compensated primary, UVR semantics).
+        let mut stem = acc.finalize_with_border(stem_label(&self.config, 0), trim, orig_len);
+        for x in stem.left.iter_mut() {
+            *x *= compensate;
+        }
+        for x in stem.right.iter_mut() {
+            *x *= compensate;
+        }
+        tracing::info!(
+            "[perf] separate_mdx_net TOTAL: {:.1} ms ({} chunks, inference {:.1} ms)",
+            t_total.elapsed().as_secs_f64() * 1e3, total, perf_infer * 1e3
+        );
+        Ok(vec![stem])
     }
 
     fn separate_waveform(

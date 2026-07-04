@@ -1,4 +1,4 @@
-export type MsstArchitecture = "bs_roformer" | "mel_band_roformer" | "mdx23c" | "htdemucs";
+export type MsstArchitecture = "bs_roformer" | "mel_band_roformer" | "mdx23c" | "htdemucs" | "uvr_vr" | "mdx_net";
 export type MsstCategory = "vocals" | "instrumental" | "denoise" | "dereverb" | "karaoke" | "multistem" | "special";
 
 export interface I18nText { zh: string; en: string; ja: string }
@@ -52,6 +52,8 @@ export const ARCHITECTURE_LABELS: Record<MsstArchitecture, string> = {
   mel_band_roformer: "MelBand Roformer",
   mdx23c: "MDX23C",
   htdemucs: "HTDemucs",
+  uvr_vr: "VR Arch",
+  mdx_net: "MDX-Net",
 };
 
 /** Per-architecture default `num_overlap` — MUST mirror the converter/convert.py FALLBACK it
@@ -66,6 +68,10 @@ export const MSST_DEFAULT_NUM_OVERLAP: Record<MsstArchitecture, number> = {
   mel_band_roformer: 4,
   mdx23c: 4,
   htdemucs: 2,
+  // uvr_vr uses window-stride inference — the node hides the overlap slider, so this value is
+  // unused (present only to keep the Record exhaustive).
+  uvr_vr: 4,
+  mdx_net: 2,
 };
 
 export type MsstPrecision = "fp32" | "fp16";
@@ -80,6 +86,8 @@ export const MSST_DEFAULT_PRECISION: Record<MsstArchitecture, MsstPrecision> = {
   mel_band_roformer: "fp16",
   mdx23c: "fp32",
   htdemucs: "fp32",
+  uvr_vr: "fp32",
+  mdx_net: "fp32",
 };
 
 /** Archs the converter can produce fp16 for (SNR-gated per arch on CUDA: bs 65.8/70.2 dB,
@@ -88,7 +96,8 @@ export const MSST_DEFAULT_PRECISION: Record<MsstArchitecture, MsstPrecision> = {
  *  non-quiet stems vs fp32).
  *  ONE source of truth for every fp16 choice in the UI (download precision, 补转 actions).
  *  MUST mirror converter/convert.py FP16_VERIFIED_TYPES. Gate rule: fp16 verification MUST run
- *  on the CUDA EP — the CPU EP emulates fp16 in fp32 and false-passes (htdemucs NaN case). */
+ *  on the CUDA EP — the CPU EP emulates fp16 in fp32 and false-passes (htdemucs NaN case).
+ *  uvr_vr / mdx_net deliberately excluded — fp16 not CUDA-gated for them yet. */
 export const MSST_FP16_ARCHS: ReadonlySet<MsstArchitecture> = new Set(["bs_roformer", "mel_band_roformer", "mdx23c", "htdemucs"]);
 
 /** fp16 tradeoff copy shared by the model manager (download / 补转 tooltips) and the separation
@@ -107,9 +116,13 @@ const HF = "https://huggingface.co";
 const MSST = `${HF}/Eddycrack864/Music-Source-Separation-Training/resolve/main`;
 const UVR = `${HF}/Politrees/UVR_resources/resolve/main/models/MDX23C`;
 const GH_CFG = "https://raw.githubusercontent.com/TRvlvr/application_data/main/mdx_model_data/mdx_c_configs";
-const GH_SEP = "https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs";
+// nomadkaraoke's audio-separator model-configs release — mirror host for several models whose
+// original repos are dead/gated, and the canonical surviving source for the jarredou VR model.
+const ASEP_GH = "https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs";
 const FB_CDN = "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer";
-const GH_DEMUCS = "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models";
+// Official UVR download backend (the UVR app itself downloads from here) — VR/MDX-Net weights
+// plus the demucs yaml configs.
+const UVR_GH = "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models";
 const GH_ZFT = "https://github.com/ZFTurbo/Music-Source-Separation-Training/releases/download";
 const GH_ZFT_CFG = "https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/main/configs";
 
@@ -211,7 +224,7 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     stems: ["Vocals", "Instrumental"],
     // The author's HF repo is malformed (ckpt nested inside a same-named folder → the flat URL
     // 404s); this GH mirror is byte-identical and flat.
-    downloadUrl: `${GH_SEP}/MelBandRoformerSYHFTV2.5.ckpt`,
+    downloadUrl: `${ASEP_GH}/MelBandRoformerSYHFTV2.5.ckpt`,
     configUrl: `${HF}/SYH99999/MelBandRoformerSYHFT/resolve/main/config_vocals_mel_band_roformer_ft.yaml`,
   },
   {
@@ -300,8 +313,8 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     description: { zh: "抑制分离后的人声泄漏，后处理用", en: "Suppress vocal bleed in separated stems", ja: "分離後のボーカルリーク抑制" },
     filename: "mel_band_roformer_bleed_suppressor_v1.ckpt", fileSize: 1_500_000_000,
     stems: ["Clean", "Bleed"],
-    downloadUrl: `${GH_SEP}/mel_band_roformer_bleed_suppressor_v1.ckpt`,
-    configUrl: `${GH_SEP}/config_mel_band_roformer_bleed_suppressor_v1.yaml`,
+    downloadUrl: `${ASEP_GH}/mel_band_roformer_bleed_suppressor_v1.ckpt`,
+    configUrl: `${ASEP_GH}/config_mel_band_roformer_bleed_suppressor_v1.yaml`,
   },
 
   // ════════════════════════════════════════
@@ -327,6 +340,25 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     // Same dead jarredou host as mel_denoise; one shared config covers both denoise variants.
     downloadUrl: `${GH_ZFT}/v.1.0.7/denoise_mel_band_roformer_aufr33_aggr_sdr_27.9768.ckpt`,
     configUrl: `${GH_ZFT}/v.1.0.7/model_mel_band_roformer_denoise.yaml`,
+  },
+  {
+    // VR-arch entries carry no configUrl: params come from the converter's embedded registry.
+    id: "vr_denoise", category: "denoise", architecture: "uvr_vr", source: "official",
+    name: { zh: "UVR DeNoise (VR)", en: "UVR DeNoise (VR)", ja: "UVR DeNoise (VR)" },
+    description: { zh: "去噪 (FoxJoy)：注意主输出口是Noise（噪声本体），干净音频在第二个口No Noise", en: "Denoise (FoxJoy): note the FIRST port is Noise (the noise itself) — the clean audio is on the second port, No Noise", ja: "ノイズ除去 (FoxJoy)：第1ポートはNoise（ノイズ本体）、クリーン音声は第2ポートNo Noiseに出力" },
+    filename: "UVR-DeNoise.pth", fileSize: 127_139_365,
+    // TRUE model output order — port 0 is the NOISE stem, port 1 the clean audio. Do not swap.
+    stems: ["Noise", "No Noise"],
+    downloadUrl: `${UVR_GH}/UVR-DeNoise.pth`,
+  },
+  {
+    id: "vr_denoise_lite", category: "denoise", architecture: "uvr_vr", source: "official",
+    name: { zh: "UVR DeNoise Lite (VR)", en: "UVR DeNoise Lite (VR)", ja: "UVR DeNoise Lite (VR)" },
+    description: { zh: "轻量单频带去噪版，速度快但质量略低", en: "Lightweight single-band denoise — fast, slightly lower quality", ja: "軽量シングルバンド版ノイズ除去。高速だが品質はやや低め" },
+    filename: "UVR-DeNoise-Lite.pth", fileSize: 17_922_277,
+    // Same TRUE order as vr_denoise: port 0 = noise, port 1 = clean.
+    stems: ["Noise", "No Noise"],
+    downloadUrl: `${UVR_GH}/UVR-DeNoise-Lite.pth`,
   },
 
   // ════════════════════════════════════════
@@ -381,6 +413,40 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     downloadUrl: `${UVR}/MDX23C-De-Reverb-aufr33-jarredou.ckpt`,
     configUrl: `${UVR.replace("models/MDX23C", "models/MDX23C")}/config_dereverb_mdx23c.yaml`,
   },
+  {
+    id: "vr_deecho_normal", category: "dereverb", architecture: "uvr_vr", source: "official",
+    name: { zh: "UVR De-Echo Normal (VR)", en: "UVR De-Echo Normal (VR)", ja: "UVR De-Echo Normal (VR)" },
+    description: { zh: "去回声（普通强度），常用于人声stem后处理（作者 FoxJoy）", en: "De-echo (normal strength), a common vocal-stem post-processing step (by FoxJoy)", ja: "エコー除去（通常強度）、ボーカルstemの後処理の定番（作者 FoxJoy）" },
+    filename: "UVR-De-Echo-Normal.pth", fileSize: 127_139_365,
+    stems: ["No Echo", "Echo"],
+    downloadUrl: `${UVR_GH}/UVR-De-Echo-Normal.pth`,
+  },
+  {
+    id: "vr_deecho_aggressive", category: "dereverb", architecture: "uvr_vr", source: "official",
+    name: { zh: "UVR De-Echo Aggressive (VR)", en: "UVR De-Echo Aggressive (VR)", ja: "UVR De-Echo Aggressive (VR)" },
+    description: { zh: "去回声（强力档），残留更少但对原音更激进（作者 FoxJoy）", en: "De-echo (aggressive) — less residual echo, harder on the source (by FoxJoy)", ja: "エコー除去（強力）、残留は少ないが原音への影響も大きめ（作者 FoxJoy）" },
+    filename: "UVR-De-Echo-Aggressive.pth", fileSize: 127_139_365,
+    stems: ["No Echo", "Echo"],
+    downloadUrl: `${UVR_GH}/UVR-De-Echo-Aggressive.pth`,
+  },
+  {
+    id: "vr_deecho_dereverb", category: "dereverb", architecture: "uvr_vr", source: "official",
+    name: { zh: "UVR DeEcho-DeReverb (VR)", en: "UVR DeEcho-DeReverb (VR)", ja: "UVR DeEcho-DeReverb (VR)" },
+    description: { zh: "同时去回声+去混响，AI翻唱人声清理的社区首选之一（作者 FoxJoy）", en: "Removes echo AND reverb in one pass — a community favorite for AI-cover vocal cleanup (by FoxJoy)", ja: "エコー+リバーブを同時除去。AIカバーのボーカルクリーニングで人気（作者 FoxJoy）" },
+    filename: "UVR-DeEcho-DeReverb.pth", fileSize: 223_650_277,
+    stems: ["No Reverb", "Reverb"],
+    downloadUrl: `${UVR_GH}/UVR-DeEcho-DeReverb.pth`,
+  },
+  {
+    // NOT in UVR's own download list (hence source community); the original author links
+    // (jarredou GitHub/HF) are dead — the audio-separator release is the canonical surviving host.
+    id: "vr_dereverb_aufr33", category: "dereverb", architecture: "uvr_vr", source: "community",
+    name: { zh: "De-Reverb aufr33+jarredou (VR)", en: "De-Reverb aufr33+jarredou (VR)", ja: "De-Reverb aufr33+jarredou (VR)" },
+    description: { zh: "全频带mid-side去混响（aufr33+jarredou 合作模型）", en: "Full-band mid-side de-reverb (aufr33+jarredou collaboration)", ja: "フルバンドmid-sideリバーブ除去（aufr33+jarredou 共同モデル）" },
+    filename: "UVR-De-Reverb-aufr33-jarredou.pth", fileSize: 58_928_133,
+    stems: ["Dry", "Reverb"],
+    downloadUrl: `${ASEP_GH}/UVR-De-Reverb-aufr33-jarredou.pth`,
+  },
 
   // ════════════════════════════════════════
   //  KARAOKE — 卡拉OK
@@ -395,8 +461,41 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     // paired yaml matches the original config on every model/audio/inference param (cross-checked
     // against a second independent mirror). Mirror instrument STRINGS are Vocals/Instrumental
     // (original said karaoke/other) — same order/content, only naming.
-    downloadUrl: `${GH_SEP}/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt`,
-    configUrl: `${GH_SEP}/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956_config.yaml`,
+    downloadUrl: `${ASEP_GH}/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt`,
+    configUrl: `${ASEP_GH}/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956_config.yaml`,
+  },
+  {
+    id: "vr_5hp_karaoke", category: "karaoke", architecture: "uvr_vr", source: "official",
+    name: { zh: "5_HP Karaoke (VR)", en: "5_HP Karaoke (VR)", ja: "5_HP Karaoke (VR)" },
+    description: { zh: "经典VR卡拉OK模型：Instrumental保留和声/伴唱，Vocals仅主音。常用两步法：先分离人声再用它切主音/和声（作者 Anjok07/aufr33）", en: "Classic VR karaoke model: Instrumental keeps backing vocals/harmonies, Vocals is lead only. Common 2-pass: separate vocals first, then split lead/backing (by Anjok07/aufr33)", ja: "定番VRカラオケモデル：Instrumentalはコーラスを保持、Vocalsはリードのみ。2段階処理でリード/コーラス分離に（作者 Anjok07/aufr33）" },
+    filename: "5_HP-Karaoke-UVR.pth", fileSize: 126_782_699,
+    stems: ["Instrumental", "Vocals"],
+    downloadUrl: `${UVR_GH}/5_HP-Karaoke-UVR.pth`,
+  },
+  {
+    id: "vr_6hp_karaoke", category: "karaoke", architecture: "uvr_vr", source: "official",
+    name: { zh: "6_HP Karaoke (VR)", en: "6_HP Karaoke (VR)", ja: "6_HP Karaoke (VR)" },
+    description: { zh: "与5_HP训练不同的姊妹模型，社区反馈伴奏略更干净，建议两者对比取优", en: "Sibling of 5_HP with different training; community reports slightly cleaner instrumentals — try both and keep the better result", ja: "5_HPとは学習の異なる姉妹モデル。伴奏がやや綺麗との評、両方試して良い方を採用" },
+    filename: "6_HP-Karaoke-UVR.pth", fileSize: 126_782_699,
+    stems: ["Instrumental", "Vocals"],
+    downloadUrl: `${UVR_GH}/6_HP-Karaoke-UVR.pth`,
+  },
+  {
+    id: "mdx_kara", category: "karaoke", architecture: "mdx_net", source: "official",
+    name: { zh: "UVR MDX-NET Karaoke", en: "UVR MDX-NET Karaoke", ja: "UVR MDX-NET Karaoke" },
+    description: { zh: "主输出是主音Vocals，伴奏+和声在第二口（与KARA_2主副相反）；原生ONNX免转换", en: "First port is the LEAD vocal; instrumental+backing on the second (opposite of KARA_2). Native ONNX, no conversion needed", ja: "第1ポートがリードVocals、伴奏+コーラスは第2ポート（KARA_2と主従が逆）。ONNXネイティブで変換不要" },
+    filename: "UVR_MDXNET_KARA.onnx", fileSize: 29_704_436,
+    // TRUE order — opposite of mdx_kara_2: port 0 = lead vocal, port 1 = instrumental+backing.
+    stems: ["Vocals", "Instrumental"],
+    downloadUrl: `${UVR_GH}/UVR_MDXNET_KARA.onnx`,
+  },
+  {
+    id: "mdx_kara_2", category: "karaoke", architecture: "mdx_net", source: "official",
+    name: { zh: "UVR MDX-NET Karaoke 2", en: "UVR MDX-NET Karaoke 2", ja: "UVR MDX-NET Karaoke 2" },
+    description: { zh: "直接输出卡拉OK轨（伴奏+和声），主音在第二口；社区常用两步法：先跑人声分离，再用它把人声stem切成主音/和声", en: "Outputs the karaoke track (instrumental+backing) first, lead vocal on the second port. Common 2-pass: separate vocals first, then split the vocal stem into lead/backing with this", ja: "カラオケトラック（伴奏+コーラス）を第1ポートに出力、リードは第2ポート。先にボーカル分離→これでリード/コーラス分割の2段階処理が定番" },
+    filename: "UVR_MDXNET_KARA_2.onnx", fileSize: 52_786_726,
+    stems: ["Instrumental", "Vocals"],
+    downloadUrl: `${UVR_GH}/UVR_MDXNET_KARA_2.onnx`,
   },
 
   // ════════════════════════════════════════
@@ -409,7 +508,7 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "955717e8-8726e21a.th", fileSize: 84_000_000,
     stems: ["Drums", "Bass", "Other", "Vocals"],
     downloadUrl: `${FB_CDN}/955717e8-8726e21a.th`,
-    configUrl: `${GH_DEMUCS}/htdemucs.yaml`,
+    configUrl: `${UVR_GH}/htdemucs.yaml`,
   },
   {
     id: "htdemucs_6s", category: "multistem", architecture: "htdemucs", source: "official",
@@ -421,7 +520,7 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "5c90dfd2-34c22ccb.th", fileSize: 55_000_000,
     stems: ["Drums", "Bass", "Other", "Vocals", "Guitar", "Piano"],
     downloadUrl: `${FB_CDN}/5c90dfd2-34c22ccb.th`,
-    configUrl: `${GH_DEMUCS}/htdemucs_6s.yaml`,
+    configUrl: `${UVR_GH}/htdemucs_6s.yaml`,
   },
   {
     id: "hdemucs_mmi", category: "multistem", architecture: "htdemucs", source: "official",
@@ -430,7 +529,7 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "75fc33f5-1941ce65.th", fileSize: 167_000_000,
     stems: ["Drums", "Bass", "Other", "Vocals"],
     downloadUrl: `${FB_CDN}/75fc33f5-1941ce65.th`,
-    configUrl: `${GH_DEMUCS}/hdemucs_mmi.yaml`,
+    configUrl: `${UVR_GH}/hdemucs_mmi.yaml`,
   },
   {
     id: "mdx23c_drumsep", category: "multistem", architecture: "mdx23c", source: "community",
@@ -488,6 +587,14 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     stems: ["Other", "Drums+Bass"], sdrScore: 10.53,
     downloadUrl: `${MSST}/model_bs_roformer_ep_937_sdr_10.5309.ckpt`,
     configUrl: `${GH_CFG}/model_bs_roformer_ep_937_sdr_10.5309.yaml`,
+  },
+  {
+    id: "vr_17hp_wind", category: "special", architecture: "uvr_vr", source: "official",
+    name: { zh: "17_HP 管乐提取 (VR)", en: "17_HP Wind Inst (VR)", ja: "17_HP 管楽器抽出 (VR)" },
+    description: { zh: "提取长笛/萨克斯等管乐：Woodwinds口是管乐本体，No Woodwinds是其余伴奏", en: "Extracts flutes/sax and other wind instruments: Woodwinds port is the winds, No Woodwinds the rest", ja: "フルート/サックス等の管楽器を抽出：Woodwindsが管楽器本体、No Woodwindsが残り" },
+    filename: "17_HP-Wind_Inst-UVR.pth", fileSize: 223_661_285,
+    stems: ["No Woodwinds", "Woodwinds"],
+    downloadUrl: `${UVR_GH}/17_HP-Wind_Inst-UVR.pth`,
   },
 ];
 

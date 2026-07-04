@@ -321,6 +321,11 @@ async function executeNode(
         // every model to it and silently coarsen mdx23c/htdemucs (whose real default is 4).
         ...(params.numOverlap !== undefined ? { numOverlap: params.numOverlap as number } : {}),
         ...(params.batch !== undefined ? { batch: params.batch as number } : {}),
+        // uvr_vr-only knobs: OMIT when unset so Rust keeps its own defaults (aggression 5,
+        // post-process off, threshold 0.2). Other archs never set them.
+        ...(params.aggression !== undefined ? { aggression: params.aggression as number } : {}),
+        ...(params.postProcess !== undefined ? { postProcess: params.postProcess as boolean } : {}),
+        ...(params.postProcessThreshold !== undefined ? { postProcessThreshold: params.postProcessThreshold as number } : {}),
         precision: (params.precision as string | undefined)
           ?? (arch !== undefined ? MSST_DEFAULT_PRECISION[arch] : undefined)
           ?? "fp32", // arch "unknown"/unresolvable → fp32 (Rust auto-uses fp16 if it's the only file)

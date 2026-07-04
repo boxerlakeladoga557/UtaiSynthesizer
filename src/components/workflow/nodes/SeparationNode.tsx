@@ -142,24 +142,29 @@ function SepParams({ arch, params, onChange, lang, showPrecision }: {
   const normalize = (params.normalize as boolean) ?? false;
   const useTta = (params.useTta as boolean) ?? false;
   const shifts = (params.shifts as number) ?? 0;
+  const aggression = (params.aggression as number) ?? 5;
+  const postProcess = (params.postProcess as boolean) ?? false;
   const isSpectral = arch === "bs_roformer" || arch === "mel_band_roformer" || arch === "mdx23c";
 
   return (
     <div className="sep-params">
-      <div className="sep-param-row">
-        <label title={t18({ zh: "重叠窗口数，越大越精细也越慢（MSST num_overlap）", en: "Overlap windows — higher = finer & slower (MSST num_overlap)", ja: "オーバーラップ数 — 大きいほど高精度・低速（MSST num_overlap）" }, lang)}>
-          {t18({ zh: "重叠次数", en: "Overlap", ja: "オーバーラップ" }, lang)}
-        </label>
-        <span className="sep-overlap nodrag">
-          <input
-            className="sep-overlap-range nodrag"
-            type="range" min={2} max={8} step={1} value={numOverlap}
-            onPointerDown={(e) => e.stopPropagation()}
-            onChange={(e) => onChange({ numOverlap: parseInt(e.target.value, 10) })}
-          />
-          <span className="sep-overlap-val">{numOverlap}</span>
-        </span>
-      </div>
+      {/* VR has no overlap-add — its window stride is fixed, so the slider would be a lie. */}
+      {arch !== "uvr_vr" && (
+        <div className="sep-param-row">
+          <label title={t18({ zh: "重叠窗口数，越大越精细也越慢（MSST num_overlap）", en: "Overlap windows — higher = finer & slower (MSST num_overlap)", ja: "オーバーラップ数 — 大きいほど高精度・低速（MSST num_overlap）" }, lang)}>
+            {t18({ zh: "重叠次数", en: "Overlap", ja: "オーバーラップ" }, lang)}
+          </label>
+          <span className="sep-overlap nodrag">
+            <input
+              className="sep-overlap-range nodrag"
+              type="range" min={2} max={8} step={1} value={numOverlap}
+              onPointerDown={(e) => e.stopPropagation()}
+              onChange={(e) => onChange({ numOverlap: parseInt(e.target.value, 10) })}
+            />
+            <span className="sep-overlap-val">{numOverlap}</span>
+          </span>
+        </div>
+      )}
 
       {showPrecision && (
         <div className="sep-param-row">
@@ -176,12 +181,13 @@ function SepParams({ arch, params, onChange, lang, showPrecision }: {
         </div>
       )}
 
-      {isSpectral && (
+      {/* uvr_vr also batches (dynamic-batch windows, Rust default 4); mdx_net does not. */}
+      {(isSpectral || arch === "uvr_vr") && (
         <div className="sep-param-row">
           <label title={t18({ zh: "批大小：一次喂多个 chunk 给 GPU（需重导出的新模型；旧模型自动按 1 跑）。显存不够会报错，调低即可", en: "Batch size — feed several chunks to the GPU at once (needs a re-exported model; old models run at 1). Lower it on out-of-memory", ja: "バッチサイズ — 複数チャンクを同時に GPU へ（再エクスポート済みモデルが必要。旧モデルは 1 で動作）。VRAM 不足なら下げてください" }, lang)}>
             {t18({ zh: "批大小", en: "Batch", ja: "バッチ" }, lang)}
           </label>
-          <input type="number" min={1} max={16} step={1} value={(params.batch as number) ?? 1}
+          <input type="number" min={1} max={16} step={1} value={(params.batch as number) ?? (arch === "uvr_vr" ? 4 : 1)}
             onChange={(e) => onChange({ batch: Math.max(1, Math.min(16, parseInt(e.target.value) || 1)) })} />
         </div>
       )}
@@ -203,6 +209,47 @@ function SepParams({ arch, params, onChange, lang, showPrecision }: {
         <input type="checkbox" checked={useTta}
           onChange={(e) => onChange({ useTta: e.target.checked })} />
       </div>
+
+      {arch === "uvr_vr" && (
+        <div className="sep-param-row">
+          <label title={t18({ zh: "主输出提取强度，UVR同款参数；人声/伴奏类默认5，数值过大可能发闷", en: "Extraction intensity for the primary stem — same parameter as UVR; default 5 for vocal/instrumental models, too high can sound muffled", ja: "主出力の抽出強度、UVRと同じパラメータ。ボーカル/伴奏系は既定5、上げすぎると籠った音に" }, lang)}>
+            {t18({ zh: "强度", en: "Aggression", ja: "強度" }, lang)}
+          </label>
+          <span className="sep-overlap nodrag">
+            <input
+              className="sep-overlap-range nodrag"
+              type="range" min={-100} max={100} step={5} value={aggression}
+              onPointerDown={(e) => e.stopPropagation()}
+              onChange={(e) => onChange({ aggression: parseInt(e.target.value, 10) })}
+            />
+            <span className="sep-overlap-val">{aggression}</span>
+          </span>
+        </div>
+      )}
+
+      {arch === "uvr_vr" && (
+        <div className="sep-param-row">
+          <label title={t18({ zh: "UVR的merge_artifacts后处理：抑制主输出中的残留伪影，个别歌曲有奇效，默认关", en: "UVR's merge_artifacts post-processing: suppresses residual artifacts in the primary stem — works wonders on some songs, off by default", ja: "UVRのmerge_artifacts後処理：主出力の残留アーティファクトを抑制。曲によっては劇的に効く、既定はオフ" }, lang)}>
+            {t18({ zh: "后处理", en: "Post-process", ja: "後処理" }, lang)}
+          </label>
+          <input type="checkbox" checked={postProcess}
+            onChange={(e) => onChange({ postProcess: e.target.checked })} />
+        </div>
+      )}
+
+      {arch === "uvr_vr" && postProcess && (
+        <div className="sep-param-row">
+          <label>{t18({ zh: "阈值", en: "Threshold", ja: "しきい値" }, lang)}</label>
+          <select
+            value={String((params.postProcessThreshold as number) ?? 0.2)}
+            onChange={(e) => onChange({ postProcessThreshold: parseFloat(e.target.value) })}
+          >
+            <option value="0.1">0.1</option>
+            <option value="0.2">0.2</option>
+            <option value="0.3">0.3</option>
+          </select>
+        </div>
+      )}
 
       {arch === "htdemucs" && (
         <div className="sep-param-row">
