@@ -1,208 +1,383 @@
+//! RVC inference — faithful port of the ORIGINAL pipeline
+//! (D:\MyDev\RVC\RVC20240604Nvidia\infer\modules\vc\pipeline.py, Pipeline.pipeline + vc):
+//!   16 kHz mono → butter(5,48,'high') filtfilt → opt_ts silence-seek chunking (fp32
+//!   config: x_pad=1 x_query=6 x_center=38 x_max=41) → per chunk: ContentVec (50 fps) →
+//!   optional KNN retrieval → optional L2 norm (our extra) → 2x nearest upsample →
+//!   protect blend → ONNX (new converter signature with explicit rnd) → trim t_pad_tgt →
+//!   concat → rms mix → optional output resample.
+//!
+//! DOCUMENTED deviations from the original (rationale in the task spec / code):
+//!   - resampling is scipy-exact resample_poly (original: ffmpeg swr at load time)
+//!   - audio stays f32 after the (f64) filtfilt — the original carries float64 to the
+//!     encoder input where it casts to f32 anyway; difference is fp32 noise floor
+//!   - KNN is EXACT brute-force top-8 (original: faiss IVF nprobe=1, approximate) with a
+//!     1e-9 squared-distance clamp (original NaNs on an exact match)
+//!   - rnd noise is an explicit graph input, seeded from options.seed and mixed with the
+//!     chunk index (original: unseeded torch.randn inside net_g.infer)
+//!   - NO int16 quantization/normalize at the end — we stay f32 for the DAW
+//!   - f0_to_coarse rounds half-away-from-zero (original np.rint = half-to-even); only
+//!     differs on exact .5 mel boundaries, measure-zero on real f0
+
+use ndarray::{s, Array2};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use rand_distr::StandardNormal;
 use std::path::Path;
 
-use ndarray::{Array1, Array2};
-
 use super::engine::{InputTensor, OnnxEngine};
-use super::{apply_pitch_shift, ConvertOptions, SynthesisResult};
+use super::features::{
+    change_rms, contentvec_extract, highpass_48hz_16k, knn_blend, l2_normalize_rows,
+    reflect_pad_np, resample, upsample_2x_nearest, KnnIndex,
+};
+use super::{RvcOptions, SynthesisResult};
+use crate::audio::AudioBuffer;
 use crate::{Result, UtaiError};
 
-const TOP_K: usize = 8;
+const SR: usize = 16000;
+const WINDOW: usize = 160;
+// fp32 config values (config.py: x_pad/x_query/x_center/x_max = 1/6/38/41 when not half)
+const X_PAD: usize = 1;
+const X_QUERY: usize = 6;
+const X_CENTER: usize = 38;
+const X_MAX: usize = 41;
 
+/// RVC retrieval index loaded from .npy [N, dim] — raw vectors + precomputed |v|²
+/// (the old cosine-normalized copy is gone: faiss semantics are squared-L2, and dropping
+/// the copy halves index RAM).
 pub struct RvcIndex {
-    raw: Array2<f32>,
-    normalized: Array2<f32>,
+    pub knn: KnnIndex,
 }
 
 impl RvcIndex {
     pub fn load(path: &Path) -> Result<Self> {
-        let raw: Array2<f32> = ndarray_npy::read_npy(path)
-            .map_err(|e| UtaiError::Model(format!("Failed to load index '{}': {}", path.display(), e)))?;
-
-        let mut normalized = raw.clone();
-        l2_normalize_rows(&mut normalized);
-
-        tracing::info!("Loaded RVC index: {} vectors x {} dim", raw.nrows(), raw.ncols());
-        Ok(Self { raw, normalized })
+        let raw: Array2<f32> = ndarray_npy::read_npy(path).map_err(|e| {
+            UtaiError::Model(format!("加载检索索引失败 '{}': {}", path.display(), e))
+        })?;
+        tracing::info!(
+            "Loaded RVC index: {} vectors x {} dim",
+            raw.nrows(),
+            raw.ncols()
+        );
+        Ok(Self {
+            knn: KnnIndex::new(raw),
+        })
     }
 }
 
-pub fn infer(
-    engine: &OnnxEngine,
-    session_id: &str,
-    hubert_features: &Array2<f32>,
-    f0: &[f32],
-    options: &ConvertOptions,
-    index: Option<&RvcIndex>,
-    sample_rate: u32,
+/// Session handles + model facts the pipeline needs (all resolved by the command layer).
+pub struct RvcModel<'a> {
+    pub engine: &'a OnnxEngine,
+    pub voice_session: &'a str,
+    pub contentvec_session: &'a str,
+    pub rmvpe_session: &'a str,
+    pub mel_filters: &'a Array2<f32>,
+    pub index: Option<&'a RvcIndex>,
+    pub sample_rate: u32,
+    pub features_dim: usize,
+    /// inter_channels of the rnd input (sidecar "noise.rnd_input"[1]; 192 for v1/v2).
+    pub noise_channels: usize,
+    /// Minimum frame count the exported graph accepts (sidecar "min_frames", 12 for RVC).
+    /// Chunks always carry ≥ 2 s of pad context (≥ ~200 frames), so this only trips on
+    /// degenerate inputs — guarded with a clear error rather than padding.
+    pub min_frames: usize,
+}
+
+pub fn run_pipeline(
+    m: &RvcModel,
+    audio: &AudioBuffer,
+    options: &RvcOptions,
+    progress: &dyn Fn(f32),
 ) -> Result<SynthesisResult> {
-    let mut features = if options.index_ratio > 0.0 {
-        if let Some(idx) = index {
-            apply_index_retrieval(hubert_features, idx, options.index_ratio)
-        } else {
-            hubert_features.clone()
-        }
-    } else {
-        hubert_features.clone()
-    };
-
-    if options.l2_normalize {
-        l2_normalize_rows(&mut features);
+    if audio.samples.is_empty() {
+        return Err(UtaiError::Audio("输入音频为空".into()));
     }
-    let f0_shifted = apply_pitch_shift(f0, options.f0_shift);
+    progress(0.03);
+    if m.sample_rate % 100 != 0 {
+        return Err(UtaiError::Model(format!(
+            "模型采样率 {} 不是 100 的倍数，无法对齐 100fps 帧栅格",
+            m.sample_rate
+        )));
+    }
 
-    let t = features.shape()[0];
+    // ── input: mono → 16 kHz → 48 Hz high-pass (filtfilt) ──
+    let mono = crate::audio::resample::to_mono(audio);
+    let wav16k = resample(&mono.samples, mono.sample_rate, SR as u32);
+    let audio_f = highpass_48hz_16k(&wav16k)?;
 
-    let phone_data: Vec<f32> = features.iter().copied().collect();
-    let phone = InputTensor::F32 {
-        data: phone_data,
-        shape: vec![1, t as i64, 768],
-    };
+    let t_pad = SR * X_PAD;
+    let t_pad_tgt = m.sample_rate as usize * X_PAD;
+    let t_pad2 = t_pad * 2;
+    let t_query = SR * X_QUERY;
+    let t_center = SR * X_CENTER;
+    let t_max = SR * X_MAX;
 
-    let phone_lengths = InputTensor::I64 {
-        data: vec![t as i64],
-        shape: vec![1],
-    };
+    // ── opt_ts: silence-seek cut points (original lines 319-333) ──
+    // audio_pad = pad(audio, window//2, 'reflect'); audio_sum[j] = Σ_{i<160}|audio_pad[j+i]|
+    // (len == len(audio)); every t_center, cut at the min-|sum| sample within ±t_query.
+    let mut opt_ts: Vec<usize> = Vec::new();
+    if audio_f.len() + WINDOW > t_max {
+        let apad = reflect_pad_np(&audio_f, WINDOW / 2, WINDOW / 2);
+        // rolling |x| sum via f64 prefix sums (original adds 160 shifted f64 arrays; only
+        // the argmin of a near-silent region consumes this — summation order is immaterial)
+        let mut prefix = vec![0.0f64; apad.len() + 1];
+        for (i, &v) in apad.iter().enumerate() {
+            prefix[i + 1] = prefix[i] + v.abs() as f64;
+        }
+        let audio_sum: Vec<f64> = (0..audio_f.len())
+            .map(|j| prefix[j + WINDOW] - prefix[j])
+            .collect();
+        let mut t = t_center;
+        while t < audio_f.len() {
+            let lo = t - t_query;
+            let hi = (t + t_query).min(audio_sum.len());
+            let mut best = (f64::INFINITY, lo);
+            for (j, &v) in audio_sum[lo..hi].iter().enumerate() {
+                if v < best.0 {
+                    best = (v, lo + j); // strict < keeps the FIRST minimum (np.where[0][0])
+                }
+            }
+            opt_ts.push(best.1);
+            t += t_center;
+        }
+    }
 
-    let pitch_data: Vec<i64> = f0_shifted.iter().map(|&x| f0_to_coarse(x)).collect();
-    let pitch = InputTensor::I64 {
-        data: pitch_data,
-        shape: vec![1, t as i64],
-    };
+    // ── full-signal pad + f0 (RMVPE @100fps on the padded signal) ──
+    let audio_pad = reflect_pad_np(&audio_f, t_pad, t_pad);
+    let p_len = audio_pad.len() / WINDOW;
 
-    let pitchf = InputTensor::F32 {
-        data: f0_shifted.clone(),
-        shape: vec![1, t as i64],
-    };
+    let mut f0 = super::f0::rmvpe_detect(
+        m.engine,
+        m.rmvpe_session,
+        m.mel_filters,
+        &audio_pad,
+        super::f0::RVC_RMVPE_THRESHOLD,
+    )?;
+    // f0 *= 2^(f0_up_key/12) — applied to the raw Hz track BEFORE coarse quantization
+    // (unvoiced zeros stay zero under the multiply, like the original)
+    let ratio = 2.0f32.powf(options.f0_shift / 12.0);
+    f0.iter_mut().for_each(|v| *v *= ratio);
+    if f0.len() < p_len {
+        return Err(UtaiError::Inference(format!(
+            "f0 帧数不足：{} < p_len {}",
+            f0.len(),
+            p_len
+        )));
+    }
+    let pitchf: Vec<f32> = f0[..p_len].to_vec();
+    let pitch: Vec<i64> = pitchf.iter().map(|&v| f0_to_coarse(v)).collect();
+    progress(0.2); // f0 (the one whole-signal RMVPE pass) done
 
-    let sid = InputTensor::I64 {
-        data: vec![options.speaker_id.unwrap_or(0) as i64],
-        shape: vec![1],
-    };
+    // ── chunk loop (original lines 371-441) ──
+    // f0 (0.2) → chunks span [0.2, 0.95] → tail + post (0.95 → 1.0)
+    let total_chunks = (opt_ts.len() + 1) as f32;
+    let sid = options.speaker_id.unwrap_or(0) as i64;
+    let mut audio_opt: Vec<f32> = Vec::new();
+    let mut s_ix = 0usize;
+    let mut chunk_idx: u64 = 0;
+    for &ot in &opt_ts {
+        let t = ot / WINDOW * WINDOW;
+        // Clamp to buffer length: Python's `audio_pad[s : t+t_pad2+window]` TRUNCATES, but Rust
+        // slicing PANICS. When the last silence-seek cut lands in the final partial <WINDOW window
+        // (song ~3-6s past a t_center multiple, ending on a quiet passage, L not a WINDOW multiple),
+        // t+t_pad2+WINDOW can exceed audio_pad.len(). vc_chunk re-derives p_len from the (shorter)
+        // chunk, so a truncated tail chunk is handled correctly — matching the original.
+        let chunk = &audio_pad[s_ix..(t + t_pad2 + WINDOW).min(audio_pad.len())];
+        let pl = s_ix / WINDOW;
+        let ph = (t + t_pad2) / WINDOW;
+        let out = vc_chunk(m, chunk, &pitch[pl..ph], &pitchf[pl..ph], sid, options, chunk_idx)?;
+        append_trimmed(&mut audio_opt, &out, t_pad_tgt)?;
+        s_ix = t;
+        chunk_idx += 1;
+        progress(0.2 + 0.75 * (chunk_idx as f32 / total_chunks));
+    }
+    // final chunk: audio_pad[t:] with the remaining pitch tail (t=None → whole signal)
+    let chunk = &audio_pad[s_ix..];
+    let out = vc_chunk(
+        m,
+        chunk,
+        &pitch[s_ix / WINDOW..],
+        &pitchf[s_ix / WINDOW..],
+        sid,
+        options,
+        chunk_idx,
+    )?;
+    append_trimmed(&mut audio_opt, &out, t_pad_tgt)?;
 
-    let noise_scale = InputTensor::F32 {
-        data: vec![1.0 - options.protect_voiceless],
-        shape: vec![1],
-    };
+    // ── rms mix (original: change_rms(audio, 16000, audio_opt, tgt_sr, rate) if rate != 1) ──
+    if options.rms_mix_rate != 1.0 {
+        change_rms(&audio_f, SR as u32, &mut audio_opt, m.sample_rate, options.rms_mix_rate);
+    }
 
-    let inputs = vec![
-        ("phone", phone),
-        ("phone_lengths", phone_lengths),
-        ("pitch", pitch),
-        ("pitchf", pitchf),
-        ("sid", sid),
-        ("noise_scale", noise_scale),
-    ];
-
-    let outputs = engine.run(session_id, inputs)?;
-    let audio = outputs
-        .into_iter()
-        .next()
-        .ok_or_else(|| UtaiError::Inference("RVC model returned no output tensors".into()))?;
+    // ── optional output resample (original guard: tgt_sr != resample_sr >= 16000) ──
+    let mut final_sr = m.sample_rate;
+    if options.resample_sr >= 16000 && options.resample_sr != m.sample_rate {
+        audio_opt = resample(&audio_opt, m.sample_rate, options.resample_sr);
+        final_sr = options.resample_sr;
+    }
+    // NO int16 quantization (original's audio_max/max_int16 normalize skipped — we stay f32).
+    progress(1.0);
 
     Ok(SynthesisResult {
-        audio,
-        sample_rate,
+        audio: audio_opt,
+        sample_rate: final_sr,
     })
 }
 
-fn f0_to_coarse(f0: f32) -> i64 {
+fn append_trimmed(dst: &mut Vec<f32>, out: &[f32], t_pad_tgt: usize) -> Result<()> {
+    if out.len() <= 2 * t_pad_tgt {
+        return Err(UtaiError::Inference(
+            "音频片段过短：模型输出不足以裁掉前后填充".into(),
+        ));
+    }
+    dst.extend_from_slice(&out[t_pad_tgt..out.len() - t_pad_tgt]);
+    Ok(())
+}
+
+/// Pipeline.vc port: one padded chunk → model audio (UNtrimmed; caller strips t_pad_tgt).
+fn vc_chunk(
+    m: &RvcModel,
+    chunk: &[f32],
+    pitch: &[i64],
+    pitchf: &[f32],
+    sid: i64,
+    options: &RvcOptions,
+    chunk_idx: u64,
+) -> Result<Vec<f32>> {
+    // ContentVec @ 50 fps
+    let mut feats = contentvec_extract(m.engine, m.contentvec_session, chunk, m.features_dim)?;
+    // feats0 clone happens BEFORE retrieval (original line 221-222)
+    let feats0 = if options.protect < 0.5 {
+        Some(feats.clone())
+    } else {
+        None
+    };
+    if options.index_ratio > 0.0 {
+        if let Some(index) = m.index {
+            feats = knn_blend(&feats, &index.knn, options.index_ratio);
+        }
+    }
+    // our extra option — AFTER retrieval, applied to the blended features only
+    if options.l2_normalize {
+        l2_normalize_rows(&mut feats);
+    }
+    // 2x nearest upsample 50 → 100 fps (both copies, original lines 247-251)
+    let feats = upsample_2x_nearest(&feats);
+    let feats0 = feats0.map(|f| upsample_2x_nearest(&f));
+
+    // p_len = min(chunk_len//window, feats_T) (feats_T is < chunk_len//window in practice);
+    // also bounded by the caller's pitch slice for safety.
+    let mut p_len = chunk.len() / WINDOW;
+    if feats.nrows() < p_len {
+        p_len = feats.nrows();
+    }
+    let p_len = p_len.min(pitch.len());
+    if p_len < m.min_frames {
+        return Err(UtaiError::Inference(format!(
+            "音频片段过短：帧数 {} 小于模型最小帧数 {}",
+            p_len, m.min_frames
+        )));
+    }
+    let pitch = &pitch[..p_len];
+    let pitchf = &pitchf[..p_len];
+    let mut feats = feats.slice(s![..p_len, ..]).to_owned();
+
+    // protect blend: pitchff = (pitchf < 1 ? protect : 1); feats = feats·w + feats0·(1-w)
+    // (original sets 1 where >0 THEN protect where <1 — net effect: <1 → protect)
+    if let Some(f0s) = feats0 {
+        let f0s = f0s.slice(s![..p_len, ..]);
+        for (i, mut row) in feats.rows_mut().into_iter().enumerate() {
+            let w = if pitchf[i] < 1.0 { options.protect } else { 1.0 };
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = *v * w + f0s[[i, j]] * (1.0 - w);
+            }
+        }
+    }
+
+    // rnd: N(0,1)·noise_scale, [1, inter_channels, T]. Seeded; the chunk index is mixed in
+    // so chunks get independent (but reproducible) noise like the original's fresh randn.
+    let mut rng = chunk_rng(options.seed, chunk_idx);
+    let rnd: Vec<f32> = (0..m.noise_channels * p_len)
+        .map(|_| {
+            let n: f32 = rng.sample(StandardNormal);
+            n * options.noise_scale
+        })
+        .collect();
+
+    let t = p_len as i64;
+    let phone_data: Vec<f32> = feats.iter().copied().collect();
+    let inputs = vec![
+        (
+            "phone",
+            InputTensor::F32 {
+                data: phone_data,
+                shape: vec![1, t, m.features_dim as i64],
+            },
+        ),
+        (
+            "phone_lengths",
+            InputTensor::I64 {
+                data: vec![t],
+                shape: vec![1],
+            },
+        ),
+        (
+            "pitch",
+            InputTensor::I64 {
+                data: pitch.to_vec(),
+                shape: vec![1, t],
+            },
+        ),
+        (
+            "pitchf",
+            InputTensor::F32 {
+                data: pitchf.to_vec(),
+                shape: vec![1, t],
+            },
+        ),
+        (
+            "sid",
+            InputTensor::I64 {
+                data: vec![sid],
+                shape: vec![1],
+            },
+        ),
+        (
+            "rnd",
+            InputTensor::F32 {
+                data: rnd,
+                shape: vec![1, m.noise_channels as i64, t],
+            },
+        ),
+    ];
+
+    let outputs = m.engine.run(m.voice_session, inputs)?;
+    outputs
+        .into_iter()
+        .next()
+        .ok_or_else(|| UtaiError::Inference("RVC 模型没有返回输出".into()))
+}
+
+/// Deterministic per-chunk RNG: user seed splitmixed with the chunk index.
+fn chunk_rng(seed: u64, chunk_idx: u64) -> StdRng {
+    StdRng::seed_from_u64(seed ^ chunk_idx.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+/// RVC f0 → coarse 1..255 (pipeline.py get_f0 mel-scale quantization).
+/// Formula verified against the original; kept from the previous implementation
+/// (tests below are the original verification set).
+pub fn f0_to_coarse(f0: f32) -> i64 {
     let f0_mel = 1127.0_f32 * (1.0 + f0 / 700.0).ln();
     if f0_mel <= 0.0 {
         return 1;
     }
-    // Original RVC normalizes mel range [f0_min=50Hz, f0_max=1100Hz] → [1, 255]
-    // f0_mel_min = 1127 * ln(1 + 50/700) ≈ 77.74
-    // f0_mel_max = 1127 * ln(1 + 1100/700) ≈ 1064.42
+    // f0_mel_min = 1127*ln(1+50/700) ≈ 77.74, f0_mel_max = 1127*ln(1+1100/700) ≈ 1064.42
     let normalized = (f0_mel - 77.74) / (1064.42 - 77.74) * 254.0 + 1.0;
     (normalized.round() as i64).clamp(1, 255)
-}
-
-fn l2_normalize_rows(features: &mut Array2<f32>) {
-    for mut row in features.rows_mut() {
-        let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-        row.iter_mut().for_each(|x| *x /= norm);
-    }
-}
-
-/// Brute-force top-K KNN retrieval with cosine similarity.
-///
-/// For each frame in `features`, finds the K nearest neighbors in the index,
-/// then returns a weighted blend of the original features and the retrieved vectors.
-fn apply_index_retrieval(
-    features: &Array2<f32>,
-    index: &RvcIndex,
-    ratio: f32,
-) -> Array2<f32> {
-    let t = features.nrows();
-    let dim = features.ncols();
-    let n = index.raw.nrows();
-
-    if n == 0 || dim != index.raw.ncols() {
-        return features.clone();
-    }
-
-    let mut query_norm = features.clone();
-    l2_normalize_rows(&mut query_norm);
-
-    // similarity: [T, N] = query_norm @ index_norm.T
-    let similarity = query_norm.dot(&index.normalized.t());
-
-    let mut result = Array2::zeros((t, dim));
-
-    for frame in 0..t {
-        let sim_row = similarity.row(frame);
-
-        let top_k = top_k_indices(sim_row.as_slice().unwrap(), TOP_K.min(n));
-
-        let mut weight_sum = 0.0f32;
-        let mut retrieved = Array1::zeros(dim);
-
-        for &(idx, score) in &top_k {
-            let w = score.max(0.0);
-            retrieved += &(&index.raw.row(idx) * w);
-            weight_sum += w;
-        }
-
-        if weight_sum > 1e-12 {
-            retrieved /= weight_sum;
-        }
-
-        let orig = features.row(frame);
-        for j in 0..dim {
-            result[[frame, j]] = orig[j] * (1.0 - ratio) + retrieved[j] * ratio;
-        }
-    }
-
-    result
-}
-
-/// Returns top-K indices with their similarity scores, sorted descending.
-fn top_k_indices(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
-    use std::cmp::Ordering;
-
-    // Min-heap of size K: (score, index). Keeps the K largest scores.
-    let mut heap: Vec<(usize, f32)> = Vec::with_capacity(k + 1);
-
-    for (i, &score) in scores.iter().enumerate() {
-        if heap.len() < k {
-            heap.push((i, score));
-            if heap.len() == k {
-                heap.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-            }
-        } else if score > heap[0].1 {
-            heap[0] = (i, score);
-            heap.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-        }
-    }
-
-    heap.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-    heap
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::array;
 
     #[test]
     fn f0_to_coarse_matches_original_rvc() {
@@ -224,59 +399,20 @@ mod tests {
     }
 
     #[test]
-    fn l2_normalize_produces_unit_vectors() {
-        let mut features = array![[3.0, 4.0], [0.0, 5.0], [1.0, 0.0]];
-        l2_normalize_rows(&mut features);
-
-        for row in features.rows() {
-            let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
-            assert!((norm - 1.0).abs() < 1e-6, "Row norm should be 1.0, got {}", norm);
-        }
-
-        // [3, 4] → [0.6, 0.8]
-        assert!((features[[0, 0]] - 0.6).abs() < 1e-6);
-        assert!((features[[0, 1]] - 0.8).abs() < 1e-6);
-    }
-
-    #[test]
-    fn top_k_finds_largest() {
-        let scores = vec![0.1, 0.9, 0.5, 0.8, 0.3, 0.7];
-        let result = top_k_indices(&scores, 3);
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0].0, 1); // 0.9
-        assert_eq!(result[1].0, 3); // 0.8
-        assert_eq!(result[2].0, 5); // 0.7
-    }
-
-    #[test]
-    fn top_k_handles_small_input() {
-        let scores = vec![0.5, 0.3];
-        let result = top_k_indices(&scores, 8);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].0, 0);
-        assert_eq!(result[1].0, 1);
-    }
-
-    #[test]
-    fn index_retrieval_blends_correctly() {
-        // 2 index vectors, 2-dim for simplicity
-        let raw = array![[1.0, 0.0], [0.0, 1.0]];
-        let mut normalized = raw.clone();
-        l2_normalize_rows(&mut normalized);
-        let index = RvcIndex { raw, normalized };
-
-        // Query: [1, 0] should match index[0] perfectly
-        let query = array![[1.0, 0.0]];
-        let result = apply_index_retrieval(&query, &index, 1.0);
-
-        // ratio=1.0 → fully retrieved → should be close to [1, 0] (the nearest neighbor)
-        assert!((result[[0, 0]] - 1.0).abs() < 0.1, "Expected ~1.0, got {}", result[[0, 0]]);
-        assert!(result[[0, 1]].abs() < 0.1, "Expected ~0.0, got {}", result[[0, 1]]);
-
-        // ratio=0.0 → fully original
-        let result0 = apply_index_retrieval(&query, &index, 0.0);
-        // ratio=0 is handled by the caller (skips retrieval), but if called:
-        // (1-0)*orig + 0*retrieved = orig
-        assert!((result0[[0, 0]] - 1.0).abs() < 1e-6);
+    fn chunk_rng_is_deterministic_and_chunk_distinct() {
+        let a: Vec<f32> = {
+            let mut r = chunk_rng(42, 0);
+            (0..8).map(|_| r.sample(StandardNormal)).collect()
+        };
+        let a2: Vec<f32> = {
+            let mut r = chunk_rng(42, 0);
+            (0..8).map(|_| r.sample(StandardNormal)).collect()
+        };
+        let b: Vec<f32> = {
+            let mut r = chunk_rng(42, 1);
+            (0..8).map(|_| r.sample(StandardNormal)).collect()
+        };
+        assert_eq!(a, a2, "same seed+chunk must reproduce");
+        assert_ne!(a, b, "different chunks must differ");
     }
 }

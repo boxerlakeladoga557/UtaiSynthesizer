@@ -23,10 +23,11 @@ const MAX_CACHED_SESSIONS: usize = 4;
 
 pub struct OnnxEngine {
     sessions: RwLock<HashMap<String, LoadedSession>>,
-    /// key → model path, KEPT even after a session is LRU-evicted, so `run()` can REBUILD a session a
-    /// consumer still holds. The cache is shared by voices + the F0 model + MSST, so eviction of a key
-    /// another layer still points at must NOT hard-fail with "Session not found".
-    paths: RwLock<HashMap<String, PathBuf>>,
+    /// key → load spec (path, mem_pattern, device override), KEPT even after a session is
+    /// LRU-evicted so `run()` can REBUILD a session a consumer still holds with the SAME options.
+    /// The cache is shared by voices + the F0/aux models + MSST, so eviction of a key another layer
+    /// still points at must NOT hard-fail with "Session not found".
+    paths: RwLock<HashMap<String, LoadSpec>>,
     device: RwLock<DeviceConfig>,
     clock: AtomicU64,
     /// Wall-clock of the last inference, for idle-release: a background sweeper frees the cached sessions
@@ -48,6 +49,16 @@ impl Drop for InFlightGuard<'_> {
         *self.0.last_activity.lock() = Instant::now();
         self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// How a session was loaded — enough to rebuild it identically after LRU eviction.
+#[derive(Clone)]
+struct LoadSpec {
+    path: PathBuf,
+    mem_pattern: bool,
+    /// Force a specific EP for this session (aux feature extractors → CPU to keep them off VRAM),
+    /// or None to follow the global device preference.
+    device: Option<DeviceConfig>,
 }
 
 struct LoadedSession {
@@ -131,7 +142,34 @@ impl OnnxEngine {
     ///
     /// Returns a stable cache key (used as the session id by `run`). A second call for the
     /// same (path, device) returns the cached session with no reload.
+    /// Load with memory-pattern ENABLED (default; correct for static-shape models — MSST chunks).
     pub fn load_model(&self, path: &PathBuf) -> Result<String> {
+        self.load_model_opts(path, true, None)
+    }
+
+    /// Load with explicit memory-pattern control, following the global device. Dynamic-shape
+    /// models (voice: per-chunk T varies) pass `mem_pattern=false`.
+    pub fn load_model_with(&self, path: &PathBuf, mem_pattern: bool) -> Result<String> {
+        self.load_model_opts(path, mem_pattern, None)
+    }
+
+    /// Load on a FORCED device (e.g. aux feature extractors on CPU to keep them off VRAM), or
+    /// `device_override = None` to follow the global preference.
+    pub fn load_model_on(
+        &self,
+        path: &PathBuf,
+        mem_pattern: bool,
+        device_override: DeviceConfig,
+    ) -> Result<String> {
+        self.load_model_opts(path, mem_pattern, Some(device_override))
+    }
+
+    fn load_model_opts(
+        &self,
+        path: &PathBuf,
+        mem_pattern: bool,
+        device_override: Option<DeviceConfig>,
+    ) -> Result<String> {
         *self.last_activity.lock() = Instant::now(); // loading counts as activity (don't release mid-load)
         if !path.exists() {
             return Err(UtaiError::Inference(format!(
@@ -140,11 +178,21 @@ impl OnnxEngine {
             )));
         }
 
-        let device = self.device.read().clone();
+        // Effective device = the per-session override, else the global preference.
+        let device = device_override
+            .clone()
+            .unwrap_or_else(|| self.device.read().clone());
         let key = Self::make_key(path, &device);
         let tick = self.clock.fetch_add(1, Ordering::Relaxed);
-        // Remember the path under this key (idempotent) so an evicted session can be rebuilt by run().
-        self.paths.write().insert(key.clone(), path.clone());
+        // Remember the full spec under this key so an evicted session rebuilds identically.
+        self.paths.write().insert(
+            key.clone(),
+            LoadSpec {
+                path: path.clone(),
+                mem_pattern,
+                device: device_override,
+            },
+        );
 
         // Cache hit → reuse, no reload.
         if let Some(loaded) = self.sessions.read().get(&key) {
@@ -155,7 +203,7 @@ impl OnnxEngine {
 
         // Miss → build outside the write lock (commit_from_file is the slow part).
         tracing::info!("Building ONNX session: {} (device={:?})", path.display(), device);
-        let (session, actual_device) = build_session(path, &device)?;
+        let (session, actual_device) = build_session(path, &device, mem_pattern)?;
 
         let mut sessions = self.sessions.write();
         // Another thread may have built the same model while we were compiling.
@@ -272,18 +320,20 @@ impl OnnxEngine {
         // Reload-on-miss: the shared LRU cache may have evicted a session a consumer still holds.
         // Rebuild it from the remembered path (same key, same device) instead of hard-failing.
         if !self.sessions.read().contains_key(session_id) {
-            let path = self.paths.read().get(session_id).cloned();
-            if let Some(path) = path {
+            let spec = self.paths.read().get(session_id).cloned();
+            if let Some(spec) = spec {
                 // A device switch mid-job orphans the old-device key: load_model would rebuild under
                 // the CURRENT device's key, never this one. Fail with a clear message instead of the
-                // cryptic "Session not found".
-                if Self::make_key(&path, &self.device.read()) != session_id {
+                // cryptic "Session not found". (Forced-device sessions — aux on CPU — are immune:
+                // their effective device never depends on the global preference.)
+                let effective = spec.device.clone().unwrap_or_else(|| self.device.read().clone());
+                if Self::make_key(&spec.path, &effective) != session_id {
                     return Err(UtaiError::Inference(
                         "Device preference changed while a job was running — re-run the job".to_string(),
                     ));
                 }
-                tracing::info!("ONNX session evicted — reloading: {}", path.display());
-                self.load_model(&path)?;
+                tracing::info!("ONNX session evicted — reloading: {}", spec.path.display());
+                self.load_model_opts(&spec.path, spec.mem_pattern, spec.device)?;
             }
         }
         let sessions = self.sessions.read();
@@ -330,17 +380,42 @@ impl OnnxEngine {
     }
 }
 
-fn base_builder() -> Result<ort::session::builder::SessionBuilder> {
-    Session::builder()
+fn base_builder(mem_pattern: bool) -> Result<ort::session::builder::SessionBuilder> {
+    let builder = Session::builder()
         .map_err(|e| UtaiError::Inference(format!("Session builder: {}", e)))?
         .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-        .map_err(|e| UtaiError::Inference(format!("Optimization: {}", e)))
+        .map_err(|e| UtaiError::Inference(format!("Optimization: {}", e)))?;
+    if !mem_pattern {
+        // Dynamic-shape models (voice: T varies per chunk / per song) make ORT's memory-pattern
+        // planner reserve for the largest-seen shape and HOLD it — the runtime log showed 249 MB
+        // reserved for an 82 MB tensor ("block in memory pattern size … fall back to default"),
+        // ×many tensors ×3 big sessions = the VRAM exhaustion the user hit. Disabling only changes
+        // ALLOCATION strategy (never numerics; MSST md5 gate unaffected). MSST keeps it ON — fixed
+        // chunk length = static shapes, exactly where the pattern helps.
+        return builder
+            .with_memory_pattern(false)
+            .map_err(|e| UtaiError::Inference(format!("Disable mem pattern: {}", e)));
+    }
+    Ok(builder)
 }
 
 fn commit(mut builder: ort::session::builder::SessionBuilder, path: &Path) -> Result<Session> {
-    builder
-        .commit_from_file(path)
-        .map_err(|e| UtaiError::Inference(format!("Load model '{}': {}", path.display(), e)))
+    // ORT's CreateSession squeezes the path through the process ACP on Windows — any character
+    // outside the active codepage (e.g. 东雪莲 on a cp932 system) fails with "No mapping for the
+    // Unicode character". Non-ASCII paths therefore load via memory; ASCII paths keep the
+    // file route (mmap-friendly, and the entire MSST catalog is ASCII-named).
+    let ascii_path = path.to_str().map(|s| s.is_ascii()).unwrap_or(false);
+    if ascii_path {
+        builder
+            .commit_from_file(path)
+            .map_err(|e| UtaiError::Inference(format!("Load model '{}': {}", path.display(), e)))
+    } else {
+        let bytes = std::fs::read(path)
+            .map_err(|e| UtaiError::Inference(format!("Read model '{}': {}", path.display(), e)))?;
+        builder
+            .commit_from_memory(&bytes)
+            .map_err(|e| UtaiError::Inference(format!("Load model '{}': {}", path.display(), e)))
+    }
 }
 
 /// CUDA execution provider with TF32 enabled (~1.5–2.5x on Ampere+ tensor cores). NOTE: this single
@@ -370,14 +445,14 @@ fn cuda_ep(device_id: Option<i32>) -> ort::ep::CUDA {
     ep
 }
 
-fn build_session(path: &PathBuf, device: &DeviceConfig) -> Result<(Session, String)> {
+fn build_session(path: &PathBuf, device: &DeviceConfig, mem_pattern: bool) -> Result<(Session, String)> {
     // Auto resolves at runtime by probing each EP — handled separately so we can LOG the device
     // that actually ran (the old all-EPs-at-once registration could not report which one ORT picked).
     if matches!(device, DeviceConfig::Auto) {
-        return build_session_auto(path);
+        return build_session_auto(path, mem_pattern);
     }
 
-    let mut builder = base_builder()?;
+    let mut builder = base_builder(mem_pattern)?;
 
     let label = match device {
         DeviceConfig::Cpu => {
@@ -436,8 +511,8 @@ fn build_session(path: &PathBuf, device: &DeviceConfig) -> Result<(Session, Stri
 /// registration fast instead of silently dropping to CPU — that explicit failure is exactly what
 /// lets us report the true device. The chosen EP still gets ORT's per-op CPU fallback for any
 /// node it can't run.
-fn build_session_auto(path: &Path) -> Result<(Session, String)> {
-    let cuda = base_builder()
+fn build_session_auto(path: &Path, mem_pattern: bool) -> Result<(Session, String)> {
+    let cuda = base_builder(mem_pattern)
         .and_then(|b| {
             b.with_execution_providers([cuda_ep(None).build().error_on_failure()])
                 .map_err(|e| UtaiError::Inference(format!("CUDA EP: {}", e)))
@@ -453,7 +528,7 @@ fn build_session_auto(path: &Path) -> Result<(Session, String)> {
         Err(e) => tracing::debug!("ONNX device=Auto: CUDA unavailable ({e}); trying DirectML"),
     }
 
-    let dml = base_builder()
+    let dml = base_builder(mem_pattern)
         .and_then(|b| {
             b.with_execution_providers([ort::ep::DirectML::default().build().error_on_failure()])
                 .map_err(|e| UtaiError::Inference(format!("DirectML EP: {}", e)))
@@ -467,7 +542,7 @@ fn build_session_auto(path: &Path) -> Result<(Session, String)> {
         Err(e) => tracing::debug!("ONNX device=Auto: DirectML unavailable ({e}); falling back to CPU"),
     }
 
-    let builder = base_builder()?
+    let builder = base_builder(mem_pattern)?
         .with_execution_providers([ort::ep::CPU::default().build()])
         .map_err(|e| UtaiError::Inference(format!("CPU EP: {}", e)))?;
     let session = commit(builder, path)?;

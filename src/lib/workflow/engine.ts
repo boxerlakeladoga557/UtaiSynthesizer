@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { Segment, ProcessedOutput, Track } from "../../types/project";
 import type { Workflow } from "../../types/project";
 import { parseWorkflowGraph } from "./graph";
@@ -9,6 +10,7 @@ import { useAudioStore } from "../../store/audio";
 import { logToBackend } from "../log";
 import { DEFAULT_OUTPUT_GROUP } from "../constants";
 import { MSST_CATALOG, MSST_DEFAULT_PRECISION, type MsstArchitecture } from "../models/msst-catalog";
+import { RVC_DEFAULTS, SOVITS_DEFAULTS, buildVoiceOptions } from "./voiceDefaults";
 
 interface AudioFileInfo {
   duration_ms: number;
@@ -247,44 +249,43 @@ async function executeNode(
   const outputData = new Map<number, string>();
 
   switch (nodeType) {
-    case "rvc": {
-      const outputPath = `${cacheDir}/${nodeId}_rvc.wav`;
-      const result = await invoke<{ audio: number[]; sample_rate: number }>("run_rvc", {
-        voiceName: params.voiceName ?? "default",
-        modelPath: params.modelPath ?? "",
-        audioPath: primaryInput,
-        options: {
-          f0_shift: params.pitchShift ?? 0,
-          speaker_id: null,
-          index_ratio: params.indexRatio ?? 0.5,
-          protect_voiceless: params.protectVoiceless ?? 0.33,
-          l2_normalize: false,
-        },
-      });
-      await invoke("save_temp_audio", {
-        samples: result.audio,
-        sampleRate: result.sample_rate,
-        outputPath,
-      });
-      outputData.set(0, outputPath);
-      break;
-    }
-
+    case "rvc":
     case "sovits": {
-      const outputPath = `${cacheDir}/${nodeId}_sovits.wav`;
-      const result = await invoke<{ audio: number[]; sample_rate: number }>("run_sovits", {
-        voiceName: params.voiceName ?? "default",
-        modelPath: params.modelPath ?? "",
-        audioPath: primaryInput,
-        options: {
-          f0_shift: params.pitchShift ?? 0,
-          speaker_id: null,
-          index_ratio: 0,
-          protect_voiceless: 0.33,
-          l2_normalize: false,
+      const isRvc = nodeType === "rvc";
+      const voiceName = params.voiceName as string | undefined;
+      const modelPath = params.modelPath as string | undefined;
+      if (!voiceName || !modelPath) {
+        throw new Error(`${isRvc ? "RVC" : "SoVITS"} node has no voice model selected — import one in the resource manager`);
+      }
+      const outputPath = `${cacheDir}/${nodeId}_${nodeType}.wav`;
+      // Drive the node's (generic) progress bar off the Rust `voice-progress` events, filtered
+      // by nodeId. The listener is torn down in `finally` so a failed/cancelled run can't leak it.
+      const unlisten = await listen<{ node_id: string; progress: number }>(
+        "voice-progress",
+        (e) => {
+          if (e.payload.node_id === nodeId) {
+            useWorkflowStore.getState().setNodeProgress(segmentId, nodeId, e.payload.progress);
+          }
         },
-        shallowDiffusion: params.shallowDiffusion ?? false,
-      });
+      );
+      let result: { audio: number[]; sample_rate: number };
+      try {
+        // Options are EXACTLY the snake_case contract keys (voiceDefaults.ts, THE single source of
+        // truth): node params store them verbatim, defaults fill anything unset. No other invoke
+        // args — the legacy `shallowDiffusion` arg is gone (feature deferred by user decision).
+        result = await invoke<{ audio: number[]; sample_rate: number }>(
+          isRvc ? "run_rvc" : "run_sovits",
+          {
+            voiceName,
+            modelPath,
+            audioPath: primaryInput,
+            nodeId,
+            options: buildVoiceOptions(isRvc ? RVC_DEFAULTS : SOVITS_DEFAULTS, params),
+          },
+        );
+      } finally {
+        unlisten();
+      }
       await invoke("save_temp_audio", {
         samples: result.audio,
         sampleRate: result.sample_rate,

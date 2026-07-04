@@ -2,6 +2,7 @@ import { useCallback, useEffect } from "react";
 import { type NodeProps } from "@xyflow/react";
 import { NodeShell } from "./NodeShell";
 import { useNodeParams } from "./useNodeParams";
+import { ParamSlider } from "./ParamSlider";
 import { useMsstModelStore } from "../../../store/msst-models";
 import {
   MSST_CATALOG,
@@ -154,20 +155,12 @@ function SepParams({ arch, params, onChange, lang, showPrecision, installedNumOv
     <div className="sep-params">
       {/* VR has no overlap-add — its window stride is fixed, so the slider would be a lie. */}
       {arch !== "uvr_vr" && (
-        <div className="sep-param-row">
-          <label title={t18({ zh: "重叠窗口数，越大越精细也越慢（MSST num_overlap）", en: "Overlap windows — higher = finer & slower (MSST num_overlap)", ja: "オーバーラップ数 — 大きいほど高精度・低速（MSST num_overlap）" }, lang)}>
-            {t18({ zh: "重叠次数", en: "Overlap", ja: "オーバーラップ" }, lang)}
-          </label>
-          <span className="sep-overlap nodrag">
-            <input
-              className="sep-overlap-range nodrag"
-              type="range" min={2} max={8} step={1} value={numOverlap}
-              onPointerDown={(e) => e.stopPropagation()}
-              onChange={(e) => onChange({ numOverlap: parseInt(e.target.value, 10) })}
-            />
-            <span className="sep-overlap-val">{numOverlap}</span>
-          </span>
-        </div>
+        <ParamSlider
+          label={t18({ zh: "重叠次数", en: "Overlap", ja: "オーバーラップ" }, lang)}
+          title={t18({ zh: "重叠窗口数，越大越精细也越慢（MSST num_overlap）", en: "Overlap windows — higher = finer & slower (MSST num_overlap)", ja: "オーバーラップ数 — 大きいほど高精度・低速（MSST num_overlap）" }, lang)}
+          min={2} max={8} step={1} value={numOverlap}
+          onChange={(v) => onChange({ numOverlap: v })}
+        />
       )}
 
       {showPrecision && (
@@ -215,20 +208,12 @@ function SepParams({ arch, params, onChange, lang, showPrecision, installedNumOv
       </div>
 
       {arch === "uvr_vr" && (
-        <div className="sep-param-row">
-          <label title={t18({ zh: "主输出提取强度，UVR同款参数；人声/伴奏类默认5，数值过大可能发闷", en: "Extraction intensity for the primary stem — same parameter as UVR; default 5 for vocal/instrumental models, too high can sound muffled", ja: "主出力の抽出強度、UVRと同じパラメータ。ボーカル/伴奏系は既定5、上げすぎると籠った音に" }, lang)}>
-            {t18({ zh: "强度", en: "Aggression", ja: "強度" }, lang)}
-          </label>
-          <span className="sep-overlap nodrag">
-            <input
-              className="sep-overlap-range nodrag"
-              type="range" min={-100} max={100} step={5} value={aggression}
-              onPointerDown={(e) => e.stopPropagation()}
-              onChange={(e) => onChange({ aggression: parseInt(e.target.value, 10) })}
-            />
-            <span className="sep-overlap-val">{aggression}</span>
-          </span>
-        </div>
+        <ParamSlider
+          label={t18({ zh: "强度", en: "Aggression", ja: "強度" }, lang)}
+          title={t18({ zh: "主输出提取强度，UVR同款参数；人声/伴奏类默认5，数值过大可能发闷", en: "Extraction intensity for the primary stem — same parameter as UVR; default 5 for vocal/instrumental models, too high can sound muffled", ja: "主出力の抽出強度、UVRと同じパラメータ。ボーカル/伴奏系は既定5、上げすぎると籠った音に" }, lang)}
+          min={-100} max={100} step={5} value={aggression}
+          onChange={(v) => onChange({ aggression: v })}
+        />
       )}
 
       {arch === "uvr_vr" && (

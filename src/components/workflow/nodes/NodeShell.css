@@ -118,6 +118,16 @@
   border-color: #ff4466 !important;
 }
 
+.wf-node-pct {
+  font-size: 8px;
+  font-family: var(--font-mono);
+  color: var(--node-color, var(--accent-primary));
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
 .wf-node-pulse {
   width: 6px;
   height: 6px;
@@ -286,6 +296,17 @@
   box-shadow: 0 0 5px var(--accent-primary);
 }
 
+/* Disabled slider (e.g. cluster/index ratio when the model ships no asset) — dim, no pointer. */
+.sep-overlap .sep-overlap-range:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.sep-overlap .sep-overlap-range:disabled::-webkit-slider-thumb {
+  background: var(--text-muted);
+  box-shadow: none;
+}
+
 .sep-overlap-val {
   font-size: 10px;
   font-family: var(--font-mono);
@@ -308,6 +329,41 @@
   background: var(--bg-base);
   border: 1px solid var(--border-subtle);
   color: var(--text-primary);
+}
+
+/* ── Voice nodes (RVC / SoVITS) — form controls reuse the sep-* classes; only meta/empty are new ── */
+
+.voice-model-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 9px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.voice-no-model {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.voice-manage-btn {
+  background: none;
+  border: 1px solid var(--border-subtle);
+  border-radius: 0;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+
+.voice-manage-btn:hover {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
 }
 
 /* ── Effects stack ── */

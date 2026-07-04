@@ -1,8 +1,9 @@
 import { useEffect, useState, useCallback } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useTranslation } from "react-i18next";
 import { useMsstModelStore, setupDownloadListener } from "../../store/msst-models";
+import { useAppStore } from "../../store/app";
 import {
   MSST_CATALOG,
   ALL_CATEGORIES,
@@ -19,20 +20,16 @@ import {
   type MirrorSource,
 } from "../../lib/models/msst-catalog";
 import { useDraggable } from "../../lib/useDraggable";
+import {
+  useVoiceModelStore,
+  voiceVersionBadge,
+  voiceSpeakerOptions,
+  formatSampleRateKhz,
+  type VoiceType,
+} from "../../store/voice-models";
 import "./MsstModelManager.css";
 
 type TopTab = "separation" | "voice";
-type VoiceType = "rvc" | "sovits";
-
-interface VoiceModelEntry {
-  name: string;
-  model_type: string;
-  format: string;
-  path: string;
-  sample_rate: number;
-  index_path: string | null;
-  avatar_path: string | null;
-}
 
 export function MsstModelManager({ onClose }: { onClose: () => void }) {
   const { i18n } = useTranslation();
@@ -284,9 +281,16 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
   }, [browse, lang]);
 
   const handleBrowseIndex = useCallback(async () => {
-    const p = await browse(lang === "zh" ? "选择索引文件 (.index)" : "Select index file (.index)", ["index", "npy"]);
+    // RVC: FAISS .index / pre-extracted .npy. SoVITS: cluster kmeans .pt / feature-retrieval
+    // .pkl / pre-converted .npy — the backend routes by model type + file extension.
+    const isRvcPick = voiceType === "rvc";
+    const title = isRvcPick
+      ? (lang === "zh" ? "选择索引文件 (.index)" : "Select index file (.index)")
+      : (lang === "zh" ? "选择聚类/检索模型 (.pt / .pkl)" : "Select cluster/retrieval model (.pt / .pkl)");
+    const exts = isRvcPick ? ["index", "npy"] : ["pt", "pkl", "pickle", "npy"];
+    const p = await browse(title, exts);
     if (p) setIndexPath(p);
-  }, [browse, lang]);
+  }, [browse, lang, voiceType]);
 
   const handleBrowseAvatar = useCallback(async () => {
     const p = await browse(lang === "zh" ? "选择角色头图" : "Select character avatar", ["png", "jpg", "jpeg", "bmp", "webp"]);
@@ -298,13 +302,16 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
     setImporting(true);
     setErr("");
     try {
-      await invoke("import_model", {
+      const outcome = await invoke<{ entry: unknown; warnings: string[] }>("import_model", {
         name: modelName,
         path: modelPath,
         modelType: voiceType,
         indexPath: indexPath || null,
         avatarPath: avatarPath || null,
       });
+      for (const w of outcome?.warnings ?? []) {
+        useAppStore.getState().showToast(w, "info");
+      }
       onDone();
     } catch (e) {
       setErr(String(e));
@@ -318,6 +325,7 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
       title: { zh: `导入 ${voiceType.toUpperCase()} 模型`, en: `Import ${voiceType.toUpperCase()} Model`, ja: `${voiceType.toUpperCase()} モデル取り込み` },
       model: { zh: "模型文件 (.pth)", en: "Model file (.pth)", ja: "モデルファイル (.pth)" },
       index: { zh: "索引文件 (.index)  — 可选", en: "Index file (.index) — optional", ja: "インデックス (.index) — 任意" },
+      cluster: { zh: "聚类/检索模型 (.pt / .pkl)  — 可选", en: "Cluster/retrieval model (.pt / .pkl) — optional", ja: "クラスタ/検索モデル (.pt / .pkl) — 任意" },
       avatar: { zh: "角色头图 — 可选", en: "Character avatar — optional", ja: "キャラクター画像 — 任意" },
       name: { zh: "模型名称", en: "Model name", ja: "モデル名" },
       import: { zh: "导入", en: "Import", ja: "取り込み" },
@@ -344,15 +352,13 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
           </div>
         </div>
 
-        {isRvc && (
-          <div className="rm-import-field">
-            <label>{Z("index")}</label>
-            <div className="rm-import-row">
-              <input type="text" readOnly value={indexPath} placeholder="..." className="rm-import-path" />
-              <button onClick={handleBrowseIndex}>{Z("browseBtn")}</button>
-            </div>
+        <div className="rm-import-field">
+          <label>{isRvc ? Z("index") : Z("cluster")}</label>
+          <div className="rm-import-row">
+            <input type="text" readOnly value={indexPath} placeholder="..." className="rm-import-path" />
+            <button onClick={handleBrowseIndex}>{Z("browseBtn")}</button>
           </div>
-        )}
+        </div>
 
         <div className="rm-import-field">
           <label>{Z("avatar")}</label>
@@ -429,7 +435,7 @@ function VoiceAvatar({ path, name, onSet }: { path: string | null; name: string;
   if (path) {
     return (
       <div className="rm-voice-avatar" onClick={onSet} title={name}>
-        <img src={`https://asset.localhost/${path.replace(/\\/g, "/")}`} alt={name} />
+        <img src={convertFileSrc(path)} alt={name} />
       </div>
     );
   }
@@ -442,29 +448,23 @@ function VoiceAvatar({ path, name, onSet }: { path: string | null; name: string;
 
 function VoiceModelsTab({ lang }: { lang: string }) {
   const [voiceType, setVoiceType] = useState<VoiceType>("rvc");
-  const [models, setModels] = useState<VoiceModelEntry[]>([]);
   const [showImport, setShowImport] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+  // Shared store — the SAME list the RVC/SoVITS workflow nodes read (one source of truth).
+  const models = useVoiceModelStore((s) => s.models[voiceType]);
+  const voiceError = useVoiceModelStore((s) => s.error);
+  const { fetchModels, deleteModel, setAvatar, clearError } = useVoiceModelStore();
 
-  const fetchModels = useCallback(async () => {
-    try {
-      const list = await invoke<VoiceModelEntry[]>("list_models", { modelType: voiceType });
-      setModels(list);
-    } catch { setModels([]); }
-  }, [voiceType]);
-
-  useEffect(() => { fetchModels(); }, [fetchModels]);
+  useEffect(() => { void fetchModels(); }, [fetchModels]);
 
   const handleDelete = useCallback(async (name: string) => {
-    try {
-      await invoke("delete_model", { name });
-      setDeleteConfirm(null);
-      await fetchModels();
-    } catch (e) { useMsstModelStore.setState({ error: String(e) }); }
-  }, [fetchModels]);
+    await deleteModel(name); // errors land in voiceError
+    setDeleteConfirm(null);
+  }, [deleteModel]);
 
   return (
     <div className="rm-voice-tab">
+      {voiceError && <div className="msst-error" onClick={clearError}>{voiceError}</div>}
       <div className="msst-filter">
         <button className={voiceType === "rvc" ? "active" : ""} onClick={() => setVoiceType("rvc")}>RVC</button>
         <button className={voiceType === "sovits" ? "active" : ""} onClick={() => setVoiceType("sovits")}>SoVITS</button>
@@ -482,30 +482,45 @@ function VoiceModelsTab({ lang }: { lang: string }) {
               : `No ${voiceType.toUpperCase()} models`}
           </p>
         )}
-        {models.map((m) => (
-          <div key={m.name} className="rm-voice-item">
-            <VoiceAvatar path={m.avatar_path} name={m.name} onSet={async () => {
-              const file = await open({ title: lang === "zh" ? "选择角色头图" : "Select avatar", filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "bmp", "webp"] }] });
-              if (file) { await invoke("set_model_avatar", { name: m.name, avatarPath: file as string }); await fetchModels(); }
-            }} />
-            <div className="rm-voice-item-info">
-              <span className="rm-voice-item-name">{m.name}</span>
-              <span className="rm-voice-item-meta">
-                {m.format === "Onnx" ? <span className="msst-onnx-ok">ONNX</span> : <span>{m.format}</span>}
-                {m.index_path && <span className="msst-onnx-ok">IDX</span>}
-                {" "}{m.sample_rate / 1000}kHz
-              </span>
-            </div>
-            {deleteConfirm === m.name ? (
-              <div className="model-confirm-delete">
-                <button className="danger" onClick={() => handleDelete(m.name)}>{lang === "zh" ? "确认" : "OK"}</button>
-                <button onClick={() => setDeleteConfirm(null)}>{lang === "zh" ? "取消" : "Cancel"}</button>
+        {models.map((m) => {
+          const ver = voiceVersionBadge(m);
+          const speakerCount = voiceSpeakerOptions(m).length;
+          return (
+            <div key={m.name} className="rm-voice-item">
+              <VoiceAvatar path={m.avatar_path} name={m.name} onSet={async () => {
+                const file = await open({ title: lang === "zh" ? "选择角色头图" : "Select avatar", filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "bmp", "webp"] }] });
+                if (file) await setAvatar(m.name, file as string);
+              }} />
+              <div className="rm-voice-item-info">
+                <span className="rm-voice-item-name">{m.name}</span>
+                <span className="rm-voice-item-meta">
+                  {ver && <span className="ver-badge">{ver}</span>}
+                  {m.format === "Onnx" ? <span className="msst-onnx-ok">ONNX</span> : <span>{m.format}</span>}
+                  {m.index_path && (
+                    <span className="msst-onnx-ok" title={t18({ zh: "已附带检索/聚类文件", en: "Index/cluster asset present", ja: "インデックス/クラスタあり" }, lang)}>
+                      {voiceType === "rvc" ? "IDX" : t18({ zh: "聚类", en: "CLUSTER", ja: "クラスタ" }, lang)}
+                    </span>
+                  )}
+                  <span>{formatSampleRateKhz(m.sample_rate)}</span>
+                  {typeof m.config?.features_dim === "number" && (
+                    <span>{m.config.features_dim} {t18({ zh: "维", en: "dim", ja: "次元" }, lang)}</span>
+                  )}
+                  {speakerCount > 1 && (
+                    <span>{speakerCount} {t18({ zh: "说话人", en: "speakers", ja: "話者" }, lang)}</span>
+                  )}
+                </span>
               </div>
-            ) : (
-              <button className="model-delete-btn" onClick={() => setDeleteConfirm(m.name)}>{lang === "zh" ? "删除" : "Delete"}</button>
-            )}
-          </div>
-        ))}
+              {deleteConfirm === m.name ? (
+                <div className="model-confirm-delete">
+                  <button className="danger" onClick={() => handleDelete(m.name)}>{lang === "zh" ? "确认" : "OK"}</button>
+                  <button onClick={() => setDeleteConfirm(null)}>{lang === "zh" ? "取消" : "Cancel"}</button>
+                </div>
+              ) : (
+                <button className="model-delete-btn" onClick={() => setDeleteConfirm(m.name)}>{lang === "zh" ? "删除" : "Delete"}</button>
+              )}
+            </div>
+          );
+        })}
       </div>
 
       {showImport && (

@@ -21,6 +21,11 @@ uvr_vr/mdx_net take no --config: their params come from embedded registries
 keyed by UVR's tail-hash (architectures/uvr_vr.py, architectures/mdx_net.py);
 unknown hashes are refused, not guessed.
 
+sovits reads the so-vits config.json next to the .pth (or --config); missing
+config falls back to weight-shape inference with warnings. Cluster / feature-
+retrieval companion assets (.pt kmeans / .pkl faiss) convert via
+export_cluster.py, not this script.
+
 Separation types accept --precision fp32|fp16|both (default fp32). fp16 keeps
 the shared <stem>.json and writes <stem>.fp16.onnx (deleting the fp32 .onnx);
 both keeps both files. rvc/sovits ignore --precision. fp16 is numerically
@@ -37,8 +42,15 @@ from pathlib import Path
 
 import torch
 
-from architectures.rvc_v2 import build_from_checkpoint as build_rvc_v2
-from architectures.sovits_v4 import build_from_checkpoint as build_sovits_v4
+from architectures.rvc_v2 import (
+    build_from_checkpoint as build_rvc_v2,
+    sr2sr as RVC_SR2SR,
+)
+from architectures.sovits_v4 import (
+    build_from_checkpoint as build_sovits_v4,
+    load_sovits_config,
+    set_deterministic as sovits_set_deterministic,
+)
 from architectures.bs_roformer import (
     load_from_checkpoint as load_bs_roformer,
     detect_config,
@@ -73,42 +85,74 @@ SEPARATION_TYPES = {"bs_roformer", "mel_band_roformer", "mdx23c", "htdemucs",
 FP16_VERIFIED_TYPES = {"bs_roformer", "mel_band_roformer", "mdx23c", "htdemucs"}
 
 
-def convert_rvc(input_path: Path, output_path: Path):
-    """Convert RVC v2 .pth model to ONNX."""
+# The attention rel-pos branches bake at trace time for the generic long-T
+# path; the graph is then correct for every T >= window_size + 2 (= 12 for
+# RVC's window_size 10). RVC_EXPORT_T must stay well above that so the generic
+# path is the one baked; RVC_MIN_FRAMES is verified + gated by
+# verify/voice/gate1_rvc.py and documented in the sidecar json.
+RVC_EXPORT_T = 200
+RVC_MIN_FRAMES = 12
+RVC_WINDOW_SIZE = 10  # attentions.Encoder default; mirrors architectures/rvc_v2.py
+
+
+def convert_rvc(input_path: Path, output_path: Path, deterministic: bool = False):
+    """Convert RVC v1/v2 (f0) .pth model to ONNX.
+
+    Export signature (matches the official models_onnx contract):
+      phone[1,T,dim] f32, phone_lengths[1] i64, pitch[1,T] i64, pitchf[1,T] f32,
+      sid[1] i64, rnd[1,inter_channels,T] f32 -> audio[1,1,L].
+    rnd is the caller's N(0,1) noise ALREADY multiplied by noise_scale
+    (original default 0.66666); zeros -> deterministic z_p.
+    `deterministic` additionally zeroes SineGen's in-graph randomness
+    (gate builds only — shipping exports keep the original noise semantics).
+    """
     checkpoint = torch.load(str(input_path), map_location="cpu", weights_only=False)
 
     config = checkpoint.get("config")
-    if config is None:
-        print("ERROR: checkpoint has no 'config' key", file=sys.stderr)
+    if config is None or not isinstance(config, (list, tuple)) or len(config) < 18:
+        print("ERROR: checkpoint has no usable 'config' list", file=sys.stderr)
         sys.exit(1)
 
-    if isinstance(config, (list, tuple)):
-        sample_rate = config[17] if len(config) > 17 else 40000
-        n_speakers = config[15] if len(config) > 15 else 1
-    else:
-        sample_rate = config.get("sample_rate", 40000)
-        n_speakers = config.get("n_speakers", 1)
+    version = checkpoint.get("version", "v1")
+    if checkpoint.get("f0", 1) != 1:
+        # User-facing: RVC nof0 models have a different graph (no pitch inputs,
+        # plain HiFi-GAN dec) and are deliberately unsupported.
+        print("ERROR: 暂不支持无音高(nof0)的 RVC 模型", file=sys.stderr)
+        sys.exit(1)
 
-    model = build_rvc_v2(checkpoint)
+    # build_from_checkpoint re-validates version/f0/feature-dim and patches the
+    # speaker count from emb_g.weight (checkpoints lie about it).
+    model = build_rvc_v2(checkpoint, deterministic=deterministic)
 
-    seq_len = 50
-    phone = torch.randn(1, seq_len, 768)
-    phone_lengths = torch.tensor([seq_len], dtype=torch.long)
-    pitch = torch.randint(0, 256, (1, seq_len))
-    pitchf = torch.randn(1, seq_len)
-    sid = torch.zeros(1, dtype=torch.long)
-    noise_scale = torch.tensor([0.667], dtype=torch.float32)
+    features_dim = 256 if version == "v1" else 768
+    inter_channels = config[2]
+    sample_rate = config[-1]
+    if isinstance(sample_rate, str):
+        sample_rate = RVC_SR2SR[sample_rate]
+    n_speakers = int(checkpoint["weight"]["emb_g.weight"].shape[0])
+    upp = model.dec.upp  # samples per frame (= sample_rate // 100, 10 ms)
+
+    seq_len = RVC_EXPORT_T
+    phone = torch.randn(1, seq_len, features_dim)
+    phone_lengths = torch.tensor([seq_len], dtype=torch.int64)
+    pitch = torch.randint(1, 256, (1, seq_len), dtype=torch.int64)
+    # Plausible f0 contour with an unvoiced stretch (exercises the uv path).
+    pitchf = 150.0 + 100.0 * torch.rand(1, seq_len)
+    pitchf[:, 40:60] = 0.0
+    sid = torch.zeros(1, dtype=torch.int64)
+    rnd = torch.randn(1, inter_channels, seq_len)
 
     torch.onnx.export(
         model,
-        (phone, phone_lengths, pitch, pitchf, sid, noise_scale),
+        (phone, phone_lengths, pitch, pitchf, sid, rnd),
         str(output_path),
-        input_names=["phone", "phone_lengths", "pitch", "pitchf", "sid", "noise_scale"],
+        input_names=["phone", "phone_lengths", "pitch", "pitchf", "sid", "rnd"],
         output_names=["audio"],
         dynamic_axes={
             "phone": {1: "seq_len"},
             "pitch": {1: "seq_len"},
             "pitchf": {1: "seq_len"},
+            "rnd": {2: "seq_len"},
             "audio": {2: "audio_len"},
         },
         opset_version=17,
@@ -120,50 +164,129 @@ def convert_rvc(input_path: Path, output_path: Path):
     onnx_model = onnx.load(str(output_path))
     onnx.checker.check_model(onnx_model)
     print(f"ONNX check passed: {output_path}", file=sys.stderr)
+
+    # ORT sanity at the export T AND at a different T — the second run proves
+    # the trace stayed dynamic in seq_len (a baked graph fails right here at
+    # export time instead of at runtime in Rust).
+    import numpy as np
+    import onnxruntime as ort
+    sess = ort.InferenceSession(str(output_path))
+    for t in (seq_len, 137):
+        feeds = {
+            "phone": np.random.randn(1, t, features_dim).astype(np.float32),
+            "phone_lengths": np.array([t], dtype=np.int64),
+            "pitch": np.random.randint(1, 256, (1, t)).astype(np.int64),
+            "pitchf": (150.0 + 100.0 * np.random.rand(1, t)).astype(np.float32),
+            "sid": np.zeros(1, dtype=np.int64),
+            "rnd": np.random.randn(1, inter_channels, t).astype(np.float32),
+        }
+        audio = sess.run(None, feeds)[0]
+        if audio.shape != (1, 1, t * upp) or not np.isfinite(audio).all():
+            raise ValueError(
+                f"ORT sanity run failed at T={t}: shape {audio.shape} "
+                f"(expected (1, 1, {t * upp})), finite={np.isfinite(audio).all()}"
+            )
+        print(f"ORT sanity run passed: T={t} -> audio (1, 1, {t * upp})")
 
     config_path = output_path.with_suffix(".json")
     config_data = {
         "type": "rvc",
-        "version": "v2",
-        "sample_rate": sample_rate,
-        "features_dim": 768,
+        "version": version,
+        "features_dim": features_dim,
+        "sample_rate": int(sample_rate),
+        "hop_ms": 10,
         "n_speakers": n_speakers,
+        "noise": {
+            # rnd must be N(0,1) * noise_scale, shaped [1, inter_channels, T].
+            "rnd_input": [1, int(inter_channels), "T"],
+            "default_scale": 0.66666,
+        },
+        "inputs": ["phone", "phone_lengths", "pitch", "pitchf", "sid", "rnd"],
+        # Shortest supported input: the traced attention rel-pos branch is only
+        # valid for T >= window_size + 2 (gated in verify/voice/gate1_rvc.py).
+        "min_frames": RVC_MIN_FRAMES,
     }
     config_path.write_text(json.dumps(config_data, indent=2))
 
-    print(f"Converted RVC: {input_path} -> {output_path}")
+    print(f"Converted RVC {version}: {input_path} -> {output_path}"
+          + (" [deterministic gate build]" if deterministic else ""))
     print(f"Config saved: {config_path}")
-    print(f"Sample rate: {sample_rate}, Speakers: {n_speakers}")
+    print(f"Sample rate: {sample_rate}, Features: {features_dim}, "
+          f"Speakers: {n_speakers}")
 
 
-def convert_sovits(input_path: Path, output_path: Path):
-    """Convert SoVITS 4.0 .pth model to ONNX."""
+# SoVITS attention rel-pos branches bake at trace time exactly like RVC's;
+# window_size is 4 (vs RVC's 10), so the generic path is valid for every
+# T >= 6 (= min_frames in the sidecar, gated by verify/voice/gate1_sovits.py).
+SOVITS_EXPORT_T = 200
+SOVITS_NOISE_SCALE = 0.4  # original inference default (infer_tool.py noice_scale)
+
+
+def convert_sovits(input_path: Path, output_path: Path,
+                   config_json: Path = None, deterministic: bool = False):
+    """Convert SoVITS 4.0/4.1 .pth model to ONNX.
+
+    Export signature (official onnxexport formulation minus mel2ph/speaker-mix):
+      c[1,T,ssl_dim] f32 (ALREADY expanded to the f0 frame count — expansion
+      stays Rust-side), f0[1,T] f32 (Hz; f0_to_coarse runs in-graph),
+      uv[1,T] f32, noise[1,inter,T] f32, sid[1] i64
+      [, vol[1,T] f32 — IFF the model has vol_embedding]  -> audio[1,1,T*hop].
+    noise is the caller's N(0,1) ALREADY multiplied by noice_scale (original
+    default 0.4); zeros -> deterministic z_p.
+    `deterministic` additionally zeroes SineGen's in-graph randomness
+    (gate builds only — shipping exports keep the original noise semantics).
+
+    Reads the config.json next to the .pth (or --config); a missing config
+    falls back to weight-shape inference with warnings."""
     checkpoint = torch.load(str(input_path), map_location="cpu", weights_only=False)
 
-    if "model" not in checkpoint:
-        print("ERROR: checkpoint has no 'model' key", file=sys.stderr)
-        sys.exit(1)
+    config, config_src = load_sovits_config(input_path, config_json)
+    if config_src is not None:
+        print(f"Using config: {config_src}")
 
-    model = build_sovits_v4(checkpoint)
+    # build_from_checkpoint validates the 排期项 flags (depthwise/transformer
+    # flow/exotic encoders/vocoders), strict=True-loads, and returns the
+    # sidecar meta (weights are the truth for every tensor-shaped hyperparam).
+    model, meta = build_sovits_v4(checkpoint, config)
+    sovits_set_deterministic(model, deterministic)
 
-    seq_len = 50
-    c = torch.randn(1, seq_len, 256)
-    f0 = torch.abs(torch.randn(1, seq_len)) * 200 + 100
-    uv = (f0 > 150).long()
-    sid = torch.zeros(1, dtype=torch.long)
+    ssl_dim = meta["features_dim"]     # detected — NOT hardcoded (old 256 bug)
+    inter_channels = meta["inter_channels"]
+    hop_size = meta["hop_size"]
+    vol_embedding = meta["vol_embedding"]
+
+    seq_len = SOVITS_EXPORT_T
+    torch.manual_seed(20260704)
+    c = torch.randn(1, seq_len, ssl_dim)
+    # Plausible f0 contour with an unvoiced stretch (exercises the uv path).
+    f0 = 150.0 + 250.0 * torch.rand(1, seq_len)
+    f0[:, 40:60] = 0.0
+    uv = (f0 > 0).float()
+    noise = torch.randn(1, inter_channels, seq_len) * SOVITS_NOISE_SCALE
+    sid = torch.zeros(1, dtype=torch.int64)
+
+    input_names = ["c", "f0", "uv", "noise", "sid"]
+    dynamic_axes = {
+        "c": {1: "seq_len"},
+        "f0": {1: "seq_len"},
+        "uv": {1: "seq_len"},
+        "noise": {2: "seq_len"},
+        "audio": {2: "audio_len"},
+    }
+    inputs = (c, f0, uv, noise, sid)
+    if vol_embedding:
+        vol = torch.rand(1, seq_len) * 0.1
+        input_names.append("vol")
+        dynamic_axes["vol"] = {1: "seq_len"}
+        inputs = inputs + (vol,)
 
     torch.onnx.export(
         model,
-        (c, f0, uv, sid),
+        inputs,
         str(output_path),
-        input_names=["c", "f0", "uv", "sid"],
+        input_names=input_names,
         output_names=["audio"],
-        dynamic_axes={
-            "c": {1: "seq_len"},
-            "f0": {1: "seq_len"},
-            "uv": {1: "seq_len"},
-            "audio": {2: "audio_len"},
-        },
+        dynamic_axes=dynamic_axes,
         opset_version=17,
         do_constant_folding=True,
         dynamo=False,
@@ -174,23 +297,69 @@ def convert_sovits(input_path: Path, output_path: Path):
     onnx.checker.check_model(onnx_model)
     print(f"ONNX check passed: {output_path}", file=sys.stderr)
 
-    # Infer config from model
-    ssl_dim = checkpoint["model"]["pre.weight"].shape[1]
-    n_speakers = checkpoint["model"]["emb_g.weight"].shape[0]
+    # ORT sanity at the export T AND at a different T — the second run proves
+    # the trace stayed dynamic in seq_len.
+    import numpy as np
+    import onnxruntime as ort
+    # Load from BYTES, not path: the python onnxruntime build cannot open
+    # session paths containing Chinese characters on Windows (locale ACP
+    # issue, measured 2026-07-04) — and SoVITS model files routinely have
+    # Chinese names (feedback_v2_unicode_paths). Rust's ort crate uses proper
+    # wide-string paths and is unaffected.
+    sess = ort.InferenceSession(output_path.read_bytes())
+    for t in (seq_len, 137):
+        f0_np = (150.0 + 250.0 * np.random.rand(1, t)).astype(np.float32)
+        f0_np[:, t // 5:t // 5 + 10] = 0.0
+        feeds = {
+            "c": np.random.randn(1, t, ssl_dim).astype(np.float32),
+            "f0": f0_np,
+            "uv": (f0_np > 0).astype(np.float32),
+            "noise": (np.random.randn(1, inter_channels, t)
+                      * SOVITS_NOISE_SCALE).astype(np.float32),
+            "sid": np.zeros(1, dtype=np.int64),
+        }
+        if vol_embedding:
+            feeds["vol"] = (0.1 * np.random.rand(1, t)).astype(np.float32)
+        audio = sess.run(None, feeds)[0]
+        if audio.shape != (1, 1, t * hop_size) or not np.isfinite(audio).all():
+            raise ValueError(
+                f"ORT sanity run failed at T={t}: shape {audio.shape} "
+                f"(expected (1, 1, {t * hop_size})), finite={np.isfinite(audio).all()}"
+            )
+        print(f"ORT sanity run passed: T={t} -> audio (1, 1, {t * hop_size})")
 
     config_path = output_path.with_suffix(".json")
     config_data = {
         "type": "sovits",
-        "version": "4.0",
-        "sample_rate": 44100,
+        "version": meta["version"],
         "features_dim": ssl_dim,
-        "n_speakers": int(n_speakers),
+        "speech_encoder": meta["speech_encoder"],
+        "sample_rate": meta["sample_rate"],
+        "hop_size": hop_size,
+        "vol_embedding": vol_embedding,
+        "unit_interpolate_mode": meta["unit_interpolate_mode"],
+        "n_speakers": meta["n_speakers"],
+        "speakers": meta["speakers"],
+        "noise": {
+            # noise must be N(0,1) * noice_scale, shaped [1, inter_channels, T].
+            "noise_input": [1, inter_channels, "T"],
+            "default_scale": SOVITS_NOISE_SCALE,
+        },
+        "inputs": input_names,
+        # Shortest supported input: the traced attention rel-pos branch is only
+        # valid for T >= window_size + 2 (gated in verify/voice/gate1_sovits.py).
+        "min_frames": meta["min_frames"],
     }
-    config_path.write_text(json.dumps(config_data, indent=2))
+    # utf-8 + ensure_ascii=False: Chinese speaker names must survive verbatim.
+    config_path.write_text(json.dumps(config_data, indent=2, ensure_ascii=False),
+                           encoding="utf-8")
 
-    print(f"Converted SoVITS: {input_path} -> {output_path}")
+    print(f"Converted SoVITS {meta['version']}: {input_path} -> {output_path}"
+          + (" [deterministic gate build]" if deterministic else ""))
     print(f"Config saved: {config_path}")
-    print(f"Sample rate: 44100, SSL dim: {ssl_dim}, Speakers: {n_speakers}")
+    print(f"Sample rate: {meta['sample_rate']}, SSL dim: {ssl_dim} "
+          f"({meta['speech_encoder']}), Hop: {hop_size}, "
+          f"Speakers: {meta['n_speakers']}, vol_embedding: {vol_embedding}")
 
 
 def _inference_params_from_yaml(config_yaml, fallback_chunk: int, fallback_overlap: int):
@@ -732,12 +901,17 @@ def main():
     parser.add_argument("--config", type=str, default=None,
                         help="Optional MSST training YAML (STFT params for mel_band_roformer / "
                              "mdx23c; inference chunk_size/num_overlap; hyperparams + segment "
-                             "for htdemucs; stem labels for all separation models)")
+                             "for htdemucs; stem labels for all separation models). For sovits: "
+                             "path to the so-vits config.json (default: auto-detect next to "
+                             "the .pth)")
     parser.add_argument("--precision", type=str, default="fp32",
                         choices=["fp32", "fp16", "both"],
                         help="Separation types only (rvc/sovits ignore it). fp32: <stem>.onnx "
                              "as today. fp16: convert to <stem>.fp16.onnx and delete the fp32 "
                              ".onnx (the shared <stem>.json is kept). both: keep both files.")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="rvc/sovits only: zero SineGen's in-graph randomness for "
+                             "numerical gate builds. Shipping conversions must NOT use this.")
     args = parser.parse_args()
 
     # Refuse unverified archs BEFORE touching any file — the torch export is
@@ -757,9 +931,11 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if args.type == "rvc":
-        convert_rvc(input_path, output_path)
+        convert_rvc(input_path, output_path, deterministic=args.deterministic)
     elif args.type == "sovits":
-        convert_sovits(input_path, output_path)
+        config_json = Path(args.config) if args.config else None
+        convert_sovits(input_path, output_path, config_json,
+                       deterministic=args.deterministic)
     elif args.type == "bs_roformer":
         config_yaml = Path(args.config) if args.config else None
         convert_bs_roformer(input_path, output_path, config_yaml)

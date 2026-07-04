@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -23,7 +23,8 @@ impl TrainingSidecar {
             super::TrainingBackend::SoVits { .. } => "training/sovits/train.py",
         };
 
-        let mut child = Command::new(python_path)
+        // Shared python spawn hygiene (UTF-8 stdio + no console flash) — crate::util::python_command.
+        let mut child = crate::util::python_command(python_path)
             .arg(script)
             .arg("--config")
             .arg(&config_json)

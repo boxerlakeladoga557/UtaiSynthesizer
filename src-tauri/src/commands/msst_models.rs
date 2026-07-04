@@ -361,7 +361,8 @@ async fn run_converter(
 
     let onnx_path = model_path.with_extension("onnx");
 
-    let mut cmd = tokio::process::Command::new(&python);
+    // Shared python spawn hygiene (UTF-8 stdio + no console flash) — crate::util::python_command.
+    let mut cmd = tokio::process::Command::from(crate::util::python_command(&python));
     cmd.arg(&script)
         .arg("--input").arg(model_path)
         .arg("--output").arg(&onnx_path)
@@ -414,7 +415,7 @@ async fn run_fp16_converter(fp32_onnx: &Path, app_dir: &Path) -> Result<String, 
     let out_path = crate::separation::fp16_sibling(fp32_onnx);
     tracing::info!("Converting to fp16: {} -> {}", fp32_onnx.display(), out_path.display());
 
-    let output = tokio::process::Command::new(&python)
+    let output = tokio::process::Command::from(crate::util::python_command(&python))
         .arg(&script)
         .arg(fp32_onnx)
         .arg(&out_path)

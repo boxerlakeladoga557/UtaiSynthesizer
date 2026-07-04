@@ -198,6 +198,7 @@ pub fn init_ort_runtime(app_dir: &std::path::Path) {
             match ort::init_from(path) {
                 Ok(builder) => {
                     builder.commit();
+                    quiet_ort_logging();
                     tracing::info!("ORT runtime loaded successfully");
                     return;
                 }
@@ -210,6 +211,19 @@ pub fn init_ort_runtime(app_dir: &std::path::Path) {
 
     tracing::warn!("No local ORT DLL found, trying system PATH...");
     ort::init().commit();
+    quiet_ort_logging();
+}
+
+/// Silence ORT's per-op VERBOSE logging AT THE SOURCE. The `ort` crate's tracing bridge creates
+/// the ORT environment hardcoded at `ORT_LOGGING_LEVEL_VERBOSE`, so ORT invokes the Rust log
+/// callback for EVERY tensor allocation ("block in memory pattern…") — thousands per inference,
+/// crossing the FFI boundary + formatting a string each time even when the subscriber later drops
+/// it. Raising the env level to Warning makes ORT skip the callback entirely for verbose/info
+/// messages (real warnings + errors still surface). Belt-and-suspenders with the file-log filter.
+fn quiet_ort_logging() {
+    if let Ok(env) = ort::environment::current() {
+        env.set_log_level(ort::logging::LogLevel::Warning);
+    }
 }
 
 /// Read the saved device string ("cuda"/"directml"/"cpu"/"auto") from config.json, if any.
@@ -392,17 +406,38 @@ fn dir_mtime_and_size(dir: &std::path::Path) -> (std::time::SystemTime, u64) {
     (newest, size)
 }
 
+/// App root = the directory holding `converter/`. Resolved from the EXECUTABLE's location first
+/// (stable regardless of launch context: a release exe sits next to converter/, a dev exe in
+/// src-tauri/target/debug walks up to the repo root), with the old CWD probe as fallback. The
+/// final fallback is the exe dir — NOT the CWD — so the data/models root can never silently move
+/// with whatever directory the app happened to be launched from.
 fn resolve_app_dir() -> std::path::PathBuf {
+    let has_converter = |d: &std::path::Path| d.join("converter").join("convert.py").exists();
+
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    if let Some(dir) = &exe_dir {
+        let mut cur = Some(dir.as_path());
+        while let Some(d) = cur {
+            if has_converter(d) {
+                return d.to_path_buf();
+            }
+            cur = d.parent();
+        }
+    }
+
     let cwd = std::env::current_dir().unwrap_or_default();
-    if cwd.join("converter").join("convert.py").exists() {
+    if has_converter(&cwd) {
         return cwd;
     }
     if let Some(parent) = cwd.parent() {
-        if parent.join("converter").join("convert.py").exists() {
+        if has_converter(parent) {
             return parent.to_path_buf();
         }
     }
-    cwd
+
+    exe_dir.unwrap_or(cwd)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -421,6 +456,16 @@ pub fn run() {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "utai=info".into());
 
+    // The FILE log MUST be filtered too. Without a filter it captures EVERY target at EVERY
+    // level — including ORT's per-tensor-allocation VERBOSE/TRACE (`execution_frame.cc` "block
+    // in memory pattern…" fires thousands of times per inference). Unfiltered, a single voice
+    // run wrote 80k+ lines that (a) flooded the log file and (b) backed up in the non-blocking
+    // appender's in-RAM buffer to multi-GB, dragging inference to a crawl. utai stays at debug
+    // for post-crash forensics; ort/symphonia/everything else only surfaces WARN+ (real problems,
+    // never the per-op spam). RUST_LOG overrides both layers for deep debugging.
+    let file_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "warn,utai=debug".into());
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -429,7 +474,8 @@ pub fn run() {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(non_blocking)
-                .with_ansi(false),
+                .with_ansi(false)
+                .with_filter(file_filter),
         )
         .with(logging::BufferLayer::new(Arc::clone(&log_buffer)))
         .init();
@@ -497,6 +543,12 @@ pub fn run() {
                     }
                     cleanup_cache_on_startup(&cd);
                 });
+            }
+            // Model avatars render via the asset protocol (asset.localhost). The models dir is
+            // user-movable (data-root setting), so the static tauri.conf.json scope can't know it —
+            // extend the scope at runtime once the real dir is resolved.
+            if let Err(e) = app.asset_protocol_scope().allow_directory(&models_dir, true) {
+                tracing::warn!("Failed to add models dir to asset protocol scope: {}", e);
             }
             let state = Arc::new(AppState::new(app_dir_early, cache_dir, models_dir, Arc::clone(&log_buffer)));
             commands::settings::load_and_apply_config(&state);

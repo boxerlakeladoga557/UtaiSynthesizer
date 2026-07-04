@@ -88,6 +88,22 @@ a {
   box-shadow: var(--shadow-glow);
 }
 
+/* Small square tag for model version/asset badges (v1/v2/4.0/4.1, IDX...) — shared by the
+   workflow node meta rows and the resource manager. Square corners per house style. */
+.ver-badge {
+  display: inline-block;
+  font-size: 8px;
+  line-height: 12px;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: var(--accent-primary);
+  border: 1px solid var(--accent-primary);
+  border-radius: 0;
+  padding: 0 3px;
+  flex-shrink: 0;
+}
+
 /* === Common component styles === */
 button {
   cursor: pointer;

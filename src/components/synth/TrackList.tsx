@@ -4,6 +4,7 @@ import { useAppStore } from "../../store/app";
 import { useHistoryStore } from "../../store/history";
 import { useTranslation } from "react-i18next";
 import { open } from "@tauri-apps/plugin-dialog";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, TRACK_HEADER_HEIGHT, FADER_MIN_DB } from "../../lib/constants";
 import { computeTrackHeight, computeTrackYOffsets, computeTotalTracksHeight, findTrackAtY, getLanes, getLaneLayout, isLaneRowMuted, laneControlFor, type LaneGroupRun, type LaneMember } from "../../lib/trackLayout";
 import { laneLabelParts } from "../../lib/audio/laneOps";
@@ -430,7 +431,7 @@ function TrackItem({
         />
         {track.voiceModelAvatar && (
           <div className="track-avatar">
-            <img src={`https://asset.localhost/${track.voiceModelAvatar.replace(/\\/g, "/")}`} alt="" />
+            <img src={convertFileSrc(track.voiceModelAvatar)} alt="" />
           </div>
         )}
         <div className="track-info">

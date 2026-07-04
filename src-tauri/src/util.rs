@@ -26,6 +26,26 @@ pub fn find_python(venv_dir: &Path, app_dir: &Path) -> PathBuf {
 /// `0x08000000` repeated at every spawn site.
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Build a `std::process::Command` for a bundled Python tool with the shared spawn hygiene applied.
+/// Single source of truth for EVERY python spawn (converter, index extractor, training):
+///   - `PYTHONIOENCODING=utf-8` + `PYTHONUTF8=1`: a PIPED stdout/stderr on Windows defaults to the
+///     ANSI codepage, so one CJK character in a `print()` raises UnicodeEncodeError AFTER the tool
+///     already wrote its artifacts — the spawn "fails" with the files on disk (phantom import).
+///   - `CREATE_NO_WINDOW`: no console flash.
+/// Async call sites convert with `tokio::process::Command::from(python_command(...))` — the flags
+/// and envs carry over.
+pub fn python_command(python: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(python);
+    cmd.env("PYTHONIOENCODING", "utf-8");
+    cmd.env("PYTHONUTF8", "1");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// Extract every `.dll` entry whose archive path satisfies `matches` from `zip_path` into `dest_dir`
 /// (flattened to its basename). Single source for the CUDA-runtime downloader's nupkg + wheel DLL
 /// extraction — previously `extract_nupkg_dlls` / `extract_wheel_dlls`, byte-identical except for

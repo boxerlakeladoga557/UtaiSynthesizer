@@ -51,6 +51,9 @@ export function NodeShell({ nodeId, label, icon, color, inputs = 1, outputs = 1,
         <span className="wf-node-icon">{icon}</span>
         <span className="wf-node-label">{label}</span>
         <div className="wf-node-header-spacer" />
+        {status === "running" && progress > 0 && (
+          <span className="wf-node-pct">{Math.round(progress * 100)}%</span>
+        )}
         {status === "running" && <span className="wf-node-pulse" />}
         {status === "completed" && <span className="wf-node-done">OK</span>}
         {status === "error" && <span className="wf-node-err" title={error}>!!</span>}

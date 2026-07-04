@@ -2,14 +2,24 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::State;
 
-use crate::models::{ModelEntry, ModelType};
+use crate::models::{ImportOutcome, ModelEntry, ModelType};
 use crate::AppState;
+
+fn parse_voice_type(model_type: &str) -> Option<ModelType> {
+    match model_type {
+        "rvc" => Some(ModelType::Rvc),
+        "sovits" => Some(ModelType::SoVits),
+        _ => None,
+    }
+}
 
 #[tauri::command]
 pub async fn list_models(
     state: State<'_, Arc<AppState>>,
     model_type: Option<String>,
 ) -> Result<Vec<ModelEntry>, String> {
+    // Explicit rescan (not just the registry's lazy one): the manager UI calls this after
+    // imports/deletes and must reflect on-disk reality.
     state.models.scan().map_err(|e| e.to_string())?;
 
     match model_type.as_deref() {
@@ -22,6 +32,8 @@ pub async fn list_models(
     }
 }
 
+/// Returns the created entry PLUS non-fatal warnings (failed index conversion, synthesized
+/// sidecar config, avatar problems) — the frontend must surface these, not just "success".
 #[tauri::command]
 pub async fn import_model(
     state: State<'_, Arc<AppState>>,
@@ -30,18 +42,26 @@ pub async fn import_model(
     model_type: String,
     index_path: Option<String>,
     avatar_path: Option<String>,
-) -> Result<ModelEntry, String> {
-    let mt = match model_type.as_str() {
-        "rvc" => ModelType::Rvc,
-        "sovits" => ModelType::SoVits,
-        _ => return Err(format!("Unsupported model type: {}", model_type)),
-    };
+) -> Result<ImportOutcome, String> {
+    let mt = parse_voice_type(&model_type)
+        .ok_or_else(|| format!("Unsupported model type: {}", model_type))?;
+
+    // A same-name re-import REPLACES the model on disk — drop any live inference session first,
+    // or it would keep serving the stale ONNX (and leak the old RvcIndex RAM).
+    state.inference.unload_voice(&name);
 
     let idx = index_path.map(PathBuf::from);
     let avatar = avatar_path.map(PathBuf::from);
     state
         .models
-        .import_pth(&name, &PathBuf::from(path), mt, &state.app_dir, idx.as_ref(), avatar.as_ref())
+        .import_file(
+            &name,
+            &PathBuf::from(path),
+            mt,
+            &state.app_dir,
+            idx.as_deref(),
+            avatar.as_deref(),
+        )
         .map_err(|e| {
             tracing::error!("Model import failed: {}", e);
             e.to_string()
@@ -66,6 +86,9 @@ pub async fn delete_model(
     state: State<'_, Arc<AppState>>,
     name: String,
 ) -> Result<(), String> {
+    // Unload BEFORE removing files: a loaded session would keep serving the deleted model (and
+    // on Windows can hold the .onnx file open, blocking removal).
+    state.inference.unload_voice(&name);
     state.models.delete(&name).map_err(|e| e.to_string())
 }
 
@@ -75,10 +98,8 @@ pub async fn check_model_exists(
     name: String,
     model_type: String,
 ) -> Result<bool, String> {
-    let mt = match model_type.as_str() {
-        "rvc" => ModelType::Rvc,
-        "sovits" => ModelType::SoVits,
-        _ => return Ok(false),
-    };
-    Ok(state.models.exists(&name, &mt))
+    match parse_voice_type(&model_type) {
+        Some(mt) => Ok(state.models.exists(&name, &mt)),
+        None => Ok(false),
+    }
 }

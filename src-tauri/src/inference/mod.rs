@@ -1,5 +1,6 @@
 pub mod engine;
 pub mod f0;
+pub mod features;
 pub mod nsf_hifigan;
 pub mod rvc;
 pub mod s2h;
@@ -7,47 +8,65 @@ pub mod sovits;
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::Result;
 
-pub struct InferenceManager {
-    pub engine: engine::OnnxEngine,
-    loaded_voices: RwLock<HashMap<String, LoadedVoice>>,
-    cached_f0_session: RwLock<Option<(PathBuf, String)>>,
-}
-
-#[derive(Clone, Debug)]
-pub enum VoiceBackendType {
-    Rvc,
-    SoVits { shallow_diffusion: bool },
-}
-
-struct LoadedVoice {
-    backend_type: VoiceBackendType,
-    _model_path: PathBuf,
-    session_id: String,
-    sample_rate: u32,
-    index: Option<rvc::RvcIndex>,
-}
-
+/// Wire-contract options for run_rvc — mirrored 1:1 by src\lib\workflow\voiceDefaults.ts
+/// (THE frontend source of truth). Struct-level serde default: any absent key falls back
+/// to the Default impl below.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ConvertOptions {
+#[serde(default)]
+pub struct RvcOptions {
     pub f0_shift: f32,
     pub speaker_id: Option<u32>,
     pub index_ratio: f32,
-    pub protect_voiceless: f32,
+    pub protect: f32,
+    pub noise_scale: f32,
+    pub rms_mix_rate: f32,
     pub l2_normalize: bool,
+    pub resample_sr: u32,
+    pub seed: u64,
 }
 
-impl Default for ConvertOptions {
+impl Default for RvcOptions {
     fn default() -> Self {
         Self {
             f0_shift: 0.0,
             speaker_id: None,
-            index_ratio: 0.6,
-            protect_voiceless: 0.33,
+            index_ratio: 0.75,
+            protect: 0.33,
+            noise_scale: 0.66666,
+            rms_mix_rate: 0.25,
             l2_normalize: false,
+            resample_sr: 0,
+            seed: 0,
+        }
+    }
+}
+
+/// Wire-contract options for run_sovits (voiceDefaults.ts mirror).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SovitsOptions {
+    pub f0_shift: f32,
+    pub speaker_id: Option<u32>,
+    pub noise_scale: f32,
+    pub cluster_ratio: f32,
+    pub loudness_envelope: f32,
+    pub seed: u64,
+}
+
+impl Default for SovitsOptions {
+    fn default() -> Self {
+        Self {
+            f0_shift: 0.0,
+            speaker_id: None,
+            noise_scale: 0.4,
+            cluster_ratio: 0.0,
+            loudness_envelope: 1.0,
+            seed: 0,
         }
     }
 }
@@ -58,28 +77,87 @@ pub struct SynthesisResult {
     pub sample_rate: u32,
 }
 
+#[derive(Clone, Debug)]
+pub enum VoiceBackendType {
+    Rvc,
+    SoVits,
+}
+
+struct LoadedVoice {
+    _backend_type: VoiceBackendType,
+    _model_path: PathBuf,
+    session_id: String,
+    sample_rate: u32,
+    index: Option<Arc<rvc::RvcIndex>>,
+}
+
+/// Cheap cloneable view of a loaded voice for the pipelines.
+pub struct VoiceHandle {
+    pub session_id: String,
+    pub sample_rate: u32,
+    pub index: Option<Arc<rvc::RvcIndex>>,
+}
+
+pub struct InferenceManager {
+    pub engine: engine::OnnxEngine,
+    /// Voice sessions keyed by VOICE NAME — model delete/reimport calls unload_voice(name).
+    loaded_voices: RwLock<HashMap<String, LoadedVoice>>,
+    /// Aux model sessions (ContentVec variants, RMVPE) keyed by path — the generalization
+    /// of the old single cached_f0_session slot.
+    aux_sessions: RwLock<HashMap<PathBuf, String>>,
+    /// Small .npy cache (RMVPE mel filters, so-vits cluster assets) keyed by path.
+    npy_cache: RwLock<HashMap<PathBuf, Arc<ndarray::Array2<f32>>>>,
+}
+
 impl InferenceManager {
     pub fn new() -> Self {
         Self {
             engine: engine::OnnxEngine::new(),
             loaded_voices: RwLock::new(HashMap::new()),
-            cached_f0_session: RwLock::new(None),
+            aux_sessions: RwLock::new(HashMap::new()),
+            npy_cache: RwLock::new(HashMap::new()),
         }
     }
 
-    pub fn ensure_f0_loaded(&self, f0_model_path: &PathBuf) -> Result<String> {
+    /// Load (or reuse) an aux ONNX session (ContentVec / RMVPE) cached by path.
+    pub fn ensure_aux_loaded(&self, path: &Path) -> Result<String> {
         {
-            let cached = self.cached_f0_session.read();
-            if let Some((path, sid)) = cached.as_ref() {
-                if path == f0_model_path && self.engine.is_loaded(sid) {
+            let cached = self.aux_sessions.read();
+            if let Some(sid) = cached.get(path) {
+                if self.engine.is_loaded(sid) {
                     return Ok(sid.clone());
                 }
             }
         }
-        let sid = self.engine.load_model(f0_model_path)?;
-        *self.cached_f0_session.write() = Some((f0_model_path.clone(), sid.clone()));
-        tracing::info!("F0 model cached: {}", f0_model_path.display());
+        // Aux feature extractors (ContentVec / RMVPE) run on CPU: they're one-shot passes over the
+        // WHOLE (up to full-song) signal, whose fp32 activations are the dominant VRAM consumer —
+        // a 2-min song peaked ~9 GB with them on GPU. On CPU their RAM is unbounded-enough (32 GB)
+        // and numerically they're MORE faithful than the TF32 GPU path (the E2E gate ran on CPU).
+        // The voice synthesizer (the per-chunk hot loop) stays on the global device (GPU). Also
+        // mem_pattern OFF — varying-length inputs would make the pattern planner over-reserve.
+        let sid = self
+            .engine
+            .load_model_on(&path.to_path_buf(), false, engine::DeviceConfig::Cpu)?;
+        self.aux_sessions
+            .write()
+            .insert(path.to_path_buf(), sid.clone());
+        tracing::info!("Aux model cached: {}", path.display());
         Ok(sid)
+    }
+
+    /// Load a .npy as Array2<f32>, cached by path (mel filters / cluster assets).
+    pub fn load_npy(&self, path: &Path) -> Result<Arc<ndarray::Array2<f32>>> {
+        if let Some(arr) = self.npy_cache.read().get(path) {
+            return Ok(arr.clone());
+        }
+        let arr: ndarray::Array2<f32> = ndarray_npy::read_npy(path).map_err(|e| {
+            crate::UtaiError::Model(format!("加载 npy 失败 '{}': {}", path.display(), e))
+        })?;
+        let arr = Arc::new(arr);
+        self.npy_cache
+            .write()
+            .insert(path.to_path_buf(), arr.clone());
+        Ok(arr)
     }
 
     pub fn is_voice_loaded(&self, name: &str) -> bool {
@@ -103,12 +181,14 @@ impl InferenceManager {
             return Ok(());
         }
         self.unload_voice(name);
-        let session_id = self.engine.load_model(model_path)?;
+        // mem_pattern OFF: voice models run per-chunk with varying T (RVC) / whole-segment T
+        // (SoVITS) — dynamic shapes where ORT's memory pattern over-reserves VRAM.
+        let session_id = self.engine.load_model_with(model_path, false)?;
 
         let index = match (&backend_type, index_path) {
             (VoiceBackendType::Rvc, Some(path)) if path.exists() => {
                 match rvc::RvcIndex::load(path) {
-                    Ok(idx) => Some(idx),
+                    Ok(idx) => Some(Arc::new(idx)),
                     Err(e) => {
                         tracing::warn!("Failed to load index, continuing without: {}", e);
                         None
@@ -119,7 +199,7 @@ impl InferenceManager {
         };
 
         let voice = LoadedVoice {
-            backend_type,
+            _backend_type: backend_type,
             _model_path: model_path.clone(),
             session_id,
             sample_rate,
@@ -129,34 +209,16 @@ impl InferenceManager {
         Ok(())
     }
 
-    pub fn convert(
-        &self,
-        voice_name: &str,
-        features: &ndarray::Array2<f32>,
-        f0: &[f32],
-        options: &ConvertOptions,
-    ) -> Result<SynthesisResult> {
+    pub fn voice_handle(&self, name: &str) -> Result<VoiceHandle> {
         let voices = self.loaded_voices.read();
-        let voice = voices
-            .get(voice_name)
-            .ok_or_else(|| crate::UtaiError::Inference(format!("Voice '{}' not loaded", voice_name)))?;
-
-        match &voice.backend_type {
-            VoiceBackendType::Rvc => {
-                rvc::infer(&self.engine, &voice.session_id, features, f0, options, voice.index.as_ref(), voice.sample_rate)
-            }
-            VoiceBackendType::SoVits { shallow_diffusion } => {
-                sovits::infer(
-                    &self.engine,
-                    &voice.session_id,
-                    features,
-                    f0,
-                    options,
-                    *shallow_diffusion,
-                    voice.sample_rate,
-                )
-            }
-        }
+        let voice = voices.get(name).ok_or_else(|| {
+            crate::UtaiError::Inference(format!("模型 '{}' 尚未加载", name))
+        })?;
+        Ok(VoiceHandle {
+            session_id: voice.session_id.clone(),
+            sample_rate: voice.sample_rate,
+            index: voice.index.clone(),
+        })
     }
 
     pub fn unload_voice(&self, name: &str) {
@@ -164,15 +226,8 @@ impl InferenceManager {
         if let Some(voice) = voices.remove(name) {
             self.engine.unload_model(&voice.session_id);
         }
+        // Model files may be replaced on reimport — drop cached npy assets (cheap reloads)
+        // so a stale cluster index / retrieval asset can't outlive its file.
+        self.npy_cache.write().clear();
     }
-}
-
-pub fn apply_pitch_shift(f0: &[f32], semitones: f32) -> Vec<f32> {
-    if semitones.abs() < 0.001 {
-        return f0.to_vec();
-    }
-    let ratio = 2.0f32.powf(semitones / 12.0);
-    f0.iter()
-        .map(|&x| if x > 0.0 { x * ratio } else { 0.0 })
-        .collect()
 }

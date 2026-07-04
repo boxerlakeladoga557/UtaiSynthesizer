@@ -1,44 +1,39 @@
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::Path;
 
 use super::ModelType;
 use crate::{Result, UtaiError};
 
+/// Prefer stderr for the error detail, but fall back to stdout — convert.py prints some
+/// failures (e.g. unsupported checkpoint layouts) to stdout before exiting non-zero.
+fn spawn_error_detail(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.trim().is_empty() {
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    } else {
+        stderr.trim().to_string()
+    }
+}
+
+/// Convert a `.pth` checkpoint to ONNX at EXACTLY `onnx_path` — the caller owns the naming
+/// (registry keys every artifact on the user-chosen model name, NOT the source file stem).
+/// The converter writes the sidecar `.json` next to the output.
 pub fn convert_pth_to_onnx(
-    pth_path: &PathBuf,
-    models_dir: &PathBuf,
+    pth_path: &Path,
+    onnx_path: &Path,
     model_type: &ModelType,
-    app_dir: &PathBuf,
-) -> Result<PathBuf> {
-    let subdir = match model_type {
-        ModelType::Rvc => "rvc",
-        ModelType::SoVits => "sovits",
-        ModelType::S2H => "s2h",
-        ModelType::F0 => "f0",
-        ModelType::NsfHifigan => "nsf_hifigan",
-    };
-
-    let output_dir = models_dir.join(subdir);
-    std::fs::create_dir_all(&output_dir)?;
-
-    let stem = pth_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let onnx_path = output_dir.join(format!("{}.onnx", stem));
-
+    app_dir: &Path,
+) -> Result<()> {
     let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
     let script = app_dir.join("converter").join("convert.py");
 
-    let output = Command::new(&python)
+    let output = crate::util::python_command(&python)
         .arg(&script)
         .arg("--input")
         .arg(pth_path)
         .arg("--output")
-        .arg(&onnx_path)
+        .arg(onnx_path)
         .arg("--type")
-        .arg(subdir)
+        .arg(super::type_subdir(model_type))
         .output()
         .map_err(|e| {
             UtaiError::Model(format!(
@@ -49,10 +44,9 @@ pub fn convert_pth_to_onnx(
         })?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(UtaiError::Model(format!(
             "Conversion failed: {}",
-            stderr.trim()
+            spawn_error_detail(&output)
         )));
     }
 
@@ -67,14 +61,14 @@ pub fn convert_pth_to_onnx(
         pth_path.display(),
         onnx_path.display()
     );
-    Ok(onnx_path)
+    Ok(())
 }
 
 pub fn convert_index_to_npy(
-    index_path: &PathBuf,
-    output_path: &PathBuf,
-    app_dir: &PathBuf,
-) -> Result<PathBuf> {
+    index_path: &Path,
+    output_path: &Path,
+    app_dir: &Path,
+) -> Result<()> {
     let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
     let script = app_dir.join("converter").join("extract_index.py");
 
@@ -85,7 +79,7 @@ pub fn convert_index_to_npy(
         )));
     }
 
-    let output = Command::new(&python)
+    let output = crate::util::python_command(&python)
         .arg(&script)
         .arg("--input")
         .arg(index_path)
@@ -101,10 +95,9 @@ pub fn convert_index_to_npy(
         })?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(UtaiError::Model(format!(
             "Index extraction failed: {}",
-            stderr.trim()
+            spawn_error_detail(&output)
         )));
     }
 
@@ -119,7 +112,47 @@ pub fn convert_index_to_npy(
         index_path.display(),
         output_path.display()
     );
-    Ok(output_path.clone())
+    Ok(())
+}
+
+/// so-vits-svc companion assets: cluster kmeans .pt / feature-retrieval .pkl →
+/// per-speaker .npy files in `outdir` (converter/export_cluster.py naming:
+/// `<speaker_name>.centers.npy` / `<speaker_id>.index_vectors.npy` — exactly what the
+/// SoVITS inference pipeline probes for).
+pub fn convert_cluster_assets(input: &Path, outdir: &Path, app_dir: &Path) -> Result<()> {
+    let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
+    let script = app_dir.join("converter").join("export_cluster.py");
+
+    if !script.exists() {
+        return Err(UtaiError::Model(format!(
+            "Cluster converter not found: {}",
+            script.display()
+        )));
+    }
+    std::fs::create_dir_all(outdir)?;
+
+    let output = crate::util::python_command(&python)
+        .arg(&script)
+        .arg("--input")
+        .arg(input)
+        .arg("--outdir")
+        .arg(outdir)
+        .output()
+        .map_err(|e| {
+            UtaiError::Model(format!(
+                "Failed to run cluster converter (python={}): {}",
+                python.display(),
+                e
+            ))
+        })?;
+
+    if !output.status.success() {
+        return Err(UtaiError::Model(format!(
+            "Cluster conversion failed: {}",
+            spawn_error_detail(&output)
+        )));
+    }
+    Ok(())
 }
 
 // find_converter_python moved to crate::util::find_python (shared with commands/msst_models.rs).
