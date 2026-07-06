@@ -925,8 +925,12 @@ def build_from_checkpoint(checkpoint, config=None):
     # infer_tool.py: unit_interpolate_mode defaults to 'left' when absent
     unit_interpolate_mode = data_cfg.get("unit_interpolate_mode", "left")
 
-    is_41 = (speech_encoder == "vec768l12" or vol_embedding
-             or (config is not None and "speech_encoder" in model_cfg))
+    # version badge = ContentVec-space / ecosystem compatibility, NOT which code
+    # trained it: vec256l9 without vol_embedding is weight-isomorphic to old 4.0
+    # checkpoints (4.1-Stable trains them too — incl. our own trainer, whose
+    # config always carries a speech_encoder key, so keying on that key's mere
+    # presence mislabeled every trained 4.0 model as 4.1)
+    is_41 = speech_encoder == "vec768l12" or vol_embedding
     version = "4.1" if is_41 else "4.0"
 
     segment_size = (config.get("train", {}).get("segment_size", 10240) // hop_size

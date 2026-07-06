@@ -70,7 +70,7 @@ export interface TrainingSnapshot {
 
 export interface TrainingFormConfig {
   modelName: string;
-  backend: "rvc";
+  backend: "rvc" | "sovits";
   version: "v1" | "v2";
   sampleRate: "32k" | "40k" | "48k";
   totalEpoch: number;
@@ -82,6 +82,23 @@ export interface TrainingFormConfig {
   fp16: boolean;
   gpu: number;
   forceCpu: boolean;
+  // ---- SoVITS (44.1kHz fixed; separate fields so switching cards never
+  // clobbers the RVC values with SoVITS-scaled ones) ----
+  sovitsVersion: "4.1" | "4.0";
+  sovitsTotalEpoch: number;
+  sovitsBatchSize: number;
+  /** ckpt/eval cadence in global steps (upstream eval_interval) */
+  sovitsSaveEverySteps: number;
+  /** G_/D_ checkpoints kept on disk (upstream keep_ckpts) */
+  sovitsKeepCkpts: number;
+  sovitsFp16: boolean;
+  /** 响度嵌入 — 4.1 only (couples vol_embedding + vol_aug like upstream --vol_aug) */
+  sovitsVolEmbedding: boolean;
+  /** resample 响度归一 — upstream default ON, ours OFF (lossy per upstream README) */
+  sovitsLoudnorm: boolean;
+  /** kmeans cluster centers instead of the retrieval matrix */
+  sovitsKmeans: boolean;
+  sovitsAllInMem: boolean;
 }
 
 const IDLE_SNAPSHOT: TrainingSnapshot = {
@@ -111,6 +128,16 @@ const DEFAULT_CONFIG: TrainingFormConfig = {
   fp16: true,
   gpu: 0,
   forceCpu: false,
+  sovitsVersion: "4.1",
+  sovitsTotalEpoch: 1000,
+  sovitsBatchSize: 6,
+  sovitsSaveEverySteps: 800,
+  sovitsKeepCkpts: 3,
+  sovitsFp16: false,
+  sovitsVolEmbedding: true,
+  sovitsLoudnorm: false,
+  sovitsKmeans: false,
+  sovitsAllInMem: false,
 };
 
 /** Client-side mirror of the Rust history cap: thin to half when exceeded. */
@@ -134,6 +161,9 @@ interface TrainingStoreState {
   start: (fresh: boolean) => Promise<void>;
   stop: () => Promise<void>;
   forceStop: () => Promise<void>;
+  /** Clear the finished run's display state (snapshot + curve) back to idle.
+   *  Files are untouched — the workspace stays resumable. */
+  resetRun: () => Promise<void>;
 }
 
 export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
@@ -194,26 +224,47 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
     const { config, dataset } = get();
     set({ starting: true });
     try {
-      await invoke("start_training", {
-        request: {
-          model_name: config.modelName.trim(),
-          backend: config.backend,
-          version: config.version,
-          sample_rate: config.sampleRate,
-          dataset_files: dataset.map((f) => f.path),
-          total_epoch: config.totalEpoch,
-          batch_size: config.batchSize,
-          save_every_epoch: config.saveEveryEpoch,
-          save_every_weights: config.saveEveryWeights,
-          keep_only_latest: config.keepOnlyLatest,
-          cache_gpu: config.cacheGpu,
-          fp16: config.fp16,
-          gpu: config.gpu,
-          force_cpu: config.forceCpu,
-          spk_id: 0,
-          fresh,
-        },
-      });
+      const base = {
+        model_name: config.modelName.trim(),
+        backend: config.backend,
+        dataset_files: dataset.map((f) => f.path),
+        gpu: config.gpu,
+        force_cpu: config.forceCpu,
+        spk_id: 0,
+        fresh,
+      };
+      const request =
+        config.backend === "rvc"
+          ? {
+              ...base,
+              version: config.version,
+              sample_rate: config.sampleRate,
+              total_epoch: config.totalEpoch,
+              batch_size: config.batchSize,
+              save_every_epoch: config.saveEveryEpoch,
+              save_every_weights: config.saveEveryWeights,
+              keep_only_latest: config.keepOnlyLatest,
+              cache_gpu: config.cacheGpu,
+              fp16: config.fp16,
+            }
+          : {
+              ...base,
+              version: config.sovitsVersion,
+              sample_rate: "44k",
+              total_epoch: config.sovitsTotalEpoch,
+              batch_size: config.sovitsBatchSize,
+              save_every_steps: config.sovitsSaveEverySteps,
+              keep_ckpts: config.sovitsKeepCkpts,
+              fp16: config.sovitsFp16,
+              // 响度嵌入 is a 4.1 feature — the 4.0 card trains ecosystem-
+              // compatible checkpoints, so it stays structurally off there
+              vol_embedding:
+                config.sovitsVersion === "4.1" ? config.sovitsVolEmbedding : false,
+              loudnorm: config.sovitsLoudnorm,
+              kmeans: config.sovitsKmeans,
+              all_in_mem: config.sovitsAllInMem,
+            };
+      await invoke("start_training", { request });
       set({ wizard: 4, history: [] });
       useAppStore.getState().showToast(i18n.t("training.started"), "info");
       await get().refresh();
@@ -237,6 +288,16 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
   forceStop: async () => {
     try {
       await invoke("force_stop_training");
+    } catch (e) {
+      useAppStore.getState().showToast(String(e), "error");
+    }
+  },
+
+  resetRun: async () => {
+    try {
+      await invoke("reset_training_display");
+      // only clear locally once the backend agreed (it refuses while running)
+      set({ snapshot: IDLE_SNAPSHOT, history: [], snapshotAt: Date.now() });
     } catch (e) {
       useAppStore.getState().showToast(String(e), "error");
     }

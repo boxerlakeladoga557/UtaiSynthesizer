@@ -9,7 +9,7 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { readFile } from "@tauri-apps/plugin-fs";
+import { exists, readFile } from "@tauri-apps/plugin-fs";
 import { useAppStore } from "../../store/app";
 import {
   setupTrainingListeners,
@@ -18,10 +18,16 @@ import {
 } from "../../store/training";
 import { useVoiceModelStore } from "../../store/voice-models";
 import { AUDIO_EXT_RE, AUDIO_EXTENSIONS } from "../../lib/constants";
+import { Dropdown } from "../common/Dropdown";
 import { LossChart, type LossChartHandle } from "./LossChart";
 import "./TrainingPage.css";
 
-const STAGE_ORDER = ["import", "slice", "f0", "feature", "index", "filelist", "train_prep"];
+/** Preprocessing stage sequence per backend (stage names come from the sidecar
+ *  protocol; these arrays only order/tick the checklist display). */
+const STAGE_ORDERS: Record<string, string[]> = {
+  rvc: ["import", "slice", "f0", "feature", "index", "filelist", "train_prep"],
+  sovits: ["import", "slice", "filelist", "extract", "index", "train_prep"],
+};
 
 function fmtDur(totalSecs: number): string {
   const s = Math.max(0, Math.floor(totalSecs));
@@ -466,34 +472,68 @@ function TargetStep() {
   const { t } = useTranslation();
   const { config, updateConfig, setWizard } = useTrainingStore();
   const [exists, setExists] = useState(false);
+  // card switches re-check with the new backend — a slower older invoke must
+  // not overwrite the newer answer
+  const checkSeq = useRef(0);
 
   const checkName = async (name: string) => {
+    const mySeq = ++checkSeq.current;
     if (!name.trim()) {
       setExists(false);
       return;
     }
+    let found = false;
     try {
-      setExists(
-        await invoke<boolean>("check_model_exists", {
-          name: name.trim(),
-          modelType: "rvc",
-        }),
-      );
+      found = await invoke<boolean>("check_model_exists", {
+        name: name.trim(),
+        modelType: useTrainingStore.getState().config.backend,
+      });
     } catch {
-      setExists(false);
+      found = false;
     }
+    if (mySeq === checkSeq.current) setExists(found);
   };
+
+  const cards = [
+    {
+      key: "rvc",
+      active: config.backend === "rvc",
+      pick: () => updateConfig({ backend: "rvc" as const }),
+      name: t("training.backendRvc"),
+      desc: t("training.backendRvcDesc"),
+    },
+    {
+      key: "sovits41",
+      active: config.backend === "sovits" && config.sovitsVersion === "4.1",
+      pick: () => updateConfig({ backend: "sovits" as const, sovitsVersion: "4.1" as const }),
+      name: t("training.backendSovits41"),
+      desc: t("training.backendSovits41Desc"),
+    },
+    {
+      key: "sovits40",
+      active: config.backend === "sovits" && config.sovitsVersion === "4.0",
+      pick: () => updateConfig({ backend: "sovits" as const, sovitsVersion: "4.0" as const }),
+      name: t("training.backendSovits40"),
+      desc: t("training.backendSovits40Desc"),
+    },
+  ];
 
   return (
     <div className="training-target-step">
       <div className="training-backend-cards">
-        <button
-          className={`training-backend-card ${config.backend === "rvc" ? "active" : ""}`}
-          onClick={() => updateConfig({ backend: "rvc" })}
-        >
-          <span className="training-backend-name">{t("training.backendRvc")}</span>
-          <span className="training-backend-desc">{t("training.backendRvcDesc")}</span>
-        </button>
+        {cards.map((c) => (
+          <button
+            key={c.key}
+            className={`training-backend-card ${c.active ? "active" : ""}`}
+            onClick={() => {
+              c.pick();
+              void checkName(config.modelName);
+            }}
+          >
+            <span className="training-backend-name">{c.name}</span>
+            <span className="training-backend-desc">{c.desc}</span>
+          </button>
+        ))}
       </div>
       <div className="training-hint">{t("training.comingSoon")}</div>
 
@@ -524,7 +564,10 @@ function TargetStep() {
 
 /* ---------------------------------- step 3: params ---------------------------------- */
 
-/** Number field with themed square ▲/▼ steppers (native spinner hidden in CSS). */
+/** Number field with themed square ▲/▼ steppers (native spinner hidden in CSS).
+ *  Typing goes through a DRAFT: clamping only on blur/steppers — a clamp on
+ *  every keystroke makes values below `min` untypeable (typing "100" with
+ *  min=50 would clamp the leading "1" to 50). In-range keystrokes commit live. */
 function NumberField({
   value,
   min,
@@ -538,10 +581,18 @@ function NumberField({
   step?: number;
   onChange: (v: number) => void;
 }) {
+  const [draft, setDraft] = useState<string | null>(null);
   const clamp = (v: number) => Math.max(min, Math.min(max, v));
-  const commit = (raw: string) => {
-    const n = parseInt(raw, 10);
-    if (Number.isFinite(n)) onChange(clamp(n));
+  const commitDraft = () => {
+    if (draft !== null) {
+      const n = parseInt(draft, 10);
+      if (Number.isFinite(n)) onChange(clamp(n));
+    }
+    setDraft(null);
+  };
+  const stepBy = (d: number) => {
+    setDraft(null);
+    onChange(clamp(value + d));
   };
   return (
     <div className="training-number">
@@ -549,22 +600,22 @@ function NumberField({
         type="number"
         min={min}
         max={max}
-        value={value}
-        onChange={(e) => commit(e.target.value)}
+        value={draft ?? value}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          const n = parseInt(e.target.value, 10);
+          if (Number.isFinite(n) && n >= min && n <= max) onChange(n);
+        }}
+        onBlur={commitDraft}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commitDraft();
+        }}
       />
       <div className="training-number-steps">
-        <button
-          type="button"
-          tabIndex={-1}
-          onClick={() => onChange(clamp(value + step))}
-        >
+        <button type="button" tabIndex={-1} onClick={() => stepBy(step)}>
           ▲
         </button>
-        <button
-          type="button"
-          tabIndex={-1}
-          onClick={() => onChange(clamp(value - step))}
-        >
+        <button type="button" tabIndex={-1} onClick={() => stepBy(-step)}>
           ▼
         </button>
       </div>
@@ -602,68 +653,123 @@ function ParamsStep() {
     })();
   }, []);
 
+  const sovits = config.backend === "sovits";
+
+  const gpuRow = gpus.length > 0 && !config.forceCpu && (
+    <div className="training-form-row">
+      <label>{t("training.gpu")}</label>
+      <Dropdown
+        value={config.gpu}
+        options={gpus.map((g, i) => ({ value: i, label: g }))}
+        onChange={(v) => updateConfig({ gpu: v })}
+      />
+    </div>
+  );
+
+  const forceCpuRow = cudaOk && (
+    <label className="training-check-row">
+      <input
+        type="checkbox"
+        checked={config.forceCpu}
+        onChange={(e) => updateConfig({ forceCpu: e.target.checked })}
+      />
+      {t("training.forceCpu")}
+    </label>
+  );
+
   return (
     <div className="training-params-step">
-      <div className="training-form-grid">
-        <div className="training-form-row">
-          <label>{t("training.version")}</label>
-          <select
-            value={config.version}
-            onChange={(e) => updateConfig({ version: e.target.value as "v1" | "v2" })}
-          >
-            <option value="v2">v2</option>
-            <option value="v1">v1</option>
-          </select>
-        </div>
-        <div className="training-form-row">
-          <label>{t("training.sampleRate")}</label>
-          <select
-            value={config.sampleRate}
-            onChange={(e) =>
-              updateConfig({ sampleRate: e.target.value as "32k" | "40k" | "48k" })
-            }
-          >
-            <option value="48k">48k</option>
-            <option value="40k">40k</option>
-            <option value="32k">32k</option>
-          </select>
-        </div>
-        <div className="training-form-row">
-          <label>{t("training.totalEpoch")}</label>
-          <NumberField
-            min={1}
-            max={10000}
-            value={config.totalEpoch}
-            onChange={(v) => updateConfig({ totalEpoch: v })}
-          />
-        </div>
-        <div className="training-form-row">
-          <label>{t("training.batchSize")}</label>
-          <NumberField
-            min={1}
-            max={64}
-            value={config.batchSize}
-            onChange={(v) => updateConfig({ batchSize: v })}
-          />
-        </div>
-        {gpus.length > 0 && !config.forceCpu && (
+      {!sovits ? (
+        <div className="training-form-grid">
           <div className="training-form-row">
-            <label>{t("training.gpu")}</label>
-            <select
-              value={config.gpu}
-              onChange={(e) => updateConfig({ gpu: parseInt(e.target.value, 10) || 0 })}
-            >
-              {gpus.map((g, i) => (
-                <option key={i} value={i}>
-                  {g}
-                </option>
-              ))}
-            </select>
+            <label>{t("training.version")}</label>
+            <Dropdown
+              value={config.version}
+              options={[
+                { value: "v2", label: "v2" },
+                { value: "v1", label: "v1" },
+              ]}
+              onChange={(v) => updateConfig({ version: v })}
+            />
           </div>
-        )}
-      </div>
+          <div className="training-form-row">
+            <label>{t("training.sampleRate")}</label>
+            <Dropdown
+              value={config.sampleRate}
+              options={[
+                { value: "48k", label: "48k" },
+                { value: "40k", label: "40k" },
+                { value: "32k", label: "32k" },
+              ]}
+              onChange={(v) => updateConfig({ sampleRate: v })}
+            />
+          </div>
+          <div className="training-form-row">
+            <label>{t("training.totalEpoch")}</label>
+            <NumberField
+              min={1}
+              max={10000}
+              value={config.totalEpoch}
+              onChange={(v) => updateConfig({ totalEpoch: v })}
+            />
+          </div>
+          <div className="training-form-row">
+            <label>{t("training.batchSize")}</label>
+            <NumberField
+              min={1}
+              max={64}
+              value={config.batchSize}
+              onChange={(v) => updateConfig({ batchSize: v })}
+            />
+          </div>
+          {gpuRow}
+        </div>
+      ) : (
+        <div className="training-form-grid">
+          <div className="training-form-row">
+            <label>{t("training.totalEpoch")}</label>
+            <NumberField
+              min={1}
+              max={100000}
+              value={config.sovitsTotalEpoch}
+              onChange={(v) => updateConfig({ sovitsTotalEpoch: v })}
+            />
+          </div>
+          <div className="training-form-row">
+            <label>{t("training.batchSize")}</label>
+            <NumberField
+              min={1}
+              max={64}
+              value={config.sovitsBatchSize}
+              onChange={(v) => updateConfig({ sovitsBatchSize: v })}
+            />
+          </div>
+          <div className="training-form-row">
+            <label>{t("training.saveEverySteps")}</label>
+            <NumberField
+              min={50}
+              max={20000}
+              step={50}
+              value={config.sovitsSaveEverySteps}
+              onChange={(v) => updateConfig({ sovitsSaveEverySteps: v })}
+            />
+          </div>
+          <div className="training-form-row">
+            <label>{t("training.keepCkpts")}</label>
+            <NumberField
+              min={1}
+              max={50}
+              value={config.sovitsKeepCkpts}
+              onChange={(v) => updateConfig({ sovitsKeepCkpts: v })}
+            />
+          </div>
+          {gpuRow}
+        </div>
+      )}
 
-      <div className="training-fixed-note">{t("training.fixedNote")}</div>
+      <div className="training-fixed-note">
+        {sovits ? t("training.sovitsFixedNote") : t("training.fixedNote")}
+      </div>
 
       <button
         className="training-advanced-toggle"
@@ -671,60 +777,99 @@ function ParamsStep() {
       >
         {showAdvanced ? "▼" : "▶"} {t("training.advanced")}
       </button>
-      {showAdvanced && (
-        <div className="training-form-grid">
-          <div className="training-form-row">
-            <label>{t("training.saveEvery")}</label>
-            <NumberField
-              min={1}
-              max={1000}
-              value={config.saveEveryEpoch}
-              onChange={(v) => updateConfig({ saveEveryEpoch: v })}
-            />
+      {showAdvanced &&
+        (!sovits ? (
+          <div className="training-form-grid">
+            <div className="training-form-row">
+              <label>{t("training.saveEvery")}</label>
+              <NumberField
+                min={1}
+                max={1000}
+                value={config.saveEveryEpoch}
+                onChange={(v) => updateConfig({ saveEveryEpoch: v })}
+              />
+            </div>
+            <label className="training-check-row">
+              <input
+                type="checkbox"
+                checked={config.saveEveryWeights}
+                onChange={(e) => updateConfig({ saveEveryWeights: e.target.checked })}
+              />
+              {t("training.saveWeights")}
+            </label>
+            <label className="training-check-row">
+              <input
+                type="checkbox"
+                checked={config.keepOnlyLatest}
+                onChange={(e) => updateConfig({ keepOnlyLatest: e.target.checked })}
+              />
+              {t("training.keepLatest")}
+            </label>
+            <label className="training-check-row">
+              <input
+                type="checkbox"
+                checked={config.cacheGpu}
+                onChange={(e) => updateConfig({ cacheGpu: e.target.checked })}
+              />
+              {t("training.cacheGpu")}
+            </label>
+            <label className="training-check-row">
+              <input
+                type="checkbox"
+                checked={config.fp16}
+                onChange={(e) => updateConfig({ fp16: e.target.checked })}
+              />
+              {t("training.fp16")}
+            </label>
+            {forceCpuRow}
           </div>
-          <label className="training-check-row">
-            <input
-              type="checkbox"
-              checked={config.saveEveryWeights}
-              onChange={(e) => updateConfig({ saveEveryWeights: e.target.checked })}
-            />
-            {t("training.saveWeights")}
-          </label>
-          <label className="training-check-row">
-            <input
-              type="checkbox"
-              checked={config.keepOnlyLatest}
-              onChange={(e) => updateConfig({ keepOnlyLatest: e.target.checked })}
-            />
-            {t("training.keepLatest")}
-          </label>
-          <label className="training-check-row">
-            <input
-              type="checkbox"
-              checked={config.cacheGpu}
-              onChange={(e) => updateConfig({ cacheGpu: e.target.checked })}
-            />
-            {t("training.cacheGpu")}
-          </label>
-          <label className="training-check-row">
-            <input
-              type="checkbox"
-              checked={config.fp16}
-              onChange={(e) => updateConfig({ fp16: e.target.checked })}
-            />
-            {t("training.fp16")}
-          </label>
-          <label className="training-check-row">
-            <input
-              type="checkbox"
-              checked={config.forceCpu}
-              disabled={!cudaOk}
-              onChange={(e) => updateConfig({ forceCpu: e.target.checked })}
-            />
-            {t("training.forceCpu")}
-          </label>
-        </div>
-      )}
+        ) : (
+          <div className="training-form-grid">
+            {config.sovitsVersion === "4.1" && (
+              <label className="training-check-row">
+                <input
+                  type="checkbox"
+                  checked={config.sovitsVolEmbedding}
+                  onChange={(e) => updateConfig({ sovitsVolEmbedding: e.target.checked })}
+                />
+                {t("training.volEmbedding")}
+              </label>
+            )}
+            <label className="training-check-row">
+              <input
+                type="checkbox"
+                checked={config.sovitsKmeans}
+                onChange={(e) => updateConfig({ sovitsKmeans: e.target.checked })}
+              />
+              {t("training.kmeansOpt")}
+            </label>
+            <label className="training-check-row">
+              <input
+                type="checkbox"
+                checked={config.sovitsLoudnorm}
+                onChange={(e) => updateConfig({ sovitsLoudnorm: e.target.checked })}
+              />
+              {t("training.loudnorm")}
+            </label>
+            <label className="training-check-row">
+              <input
+                type="checkbox"
+                checked={config.sovitsFp16}
+                onChange={(e) => updateConfig({ sovitsFp16: e.target.checked })}
+              />
+              {t("training.fp16")}
+            </label>
+            <label className="training-check-row">
+              <input
+                type="checkbox"
+                checked={config.sovitsAllInMem}
+                onChange={(e) => updateConfig({ sovitsAllInMem: e.target.checked })}
+              />
+              {t("training.allInMem")}
+            </label>
+            {forceCpuRow}
+          </div>
+        ))}
 
       <div className="training-step-nav">
         <button className="training-btn primary" onClick={() => setWizard(4)}>
@@ -751,6 +896,7 @@ function RunStep() {
     start,
     stop,
     forceStop,
+    resetRun,
   } = useTrainingStore();
   const chartRef = useRef<LossChartHandle>(null);
   const [, forceTick] = useState(0);
@@ -785,7 +931,7 @@ function RunStep() {
     try {
       exists = await invoke<boolean>("check_model_exists", {
         name,
-        modelType: "rvc",
+        modelType: config.backend,
       });
     } catch {
       exists = false;
@@ -849,10 +995,16 @@ function RunStep() {
   };
 
   const importCkpt = async (ckpt: CkptInfo) => {
+    // sovits periodics are step-cadenced (several per epoch) — an epoch-keyed
+    // suggestion would collide and silently replace the previous import
+    const tag =
+      ckpt.kind === "best"
+        ? "best"
+        : snapshot.backend === "sovits"
+          ? `s${ckpt.step}`
+          : `e${ckpt.epoch}`;
     const suggested =
-      ckpt.kind === "final"
-        ? snapshot.model_name
-        : `${snapshot.model_name}_${ckpt.kind === "best" ? "best" : `e${ckpt.epoch}`}`;
+      ckpt.kind === "final" ? snapshot.model_name : `${snapshot.model_name}_${tag}`;
     const name = await showConfirm({
       title: t("training.import"),
       body: t("training.importName"),
@@ -867,12 +1019,31 @@ function RunStep() {
     });
     if (!name || name === "__cancel") return;
     const summaryIndex = (snapshot.summary as { index?: string } | null)?.index;
+    // fallbacks for runs without a summary (e.g. force-stopped): rvc keeps its
+    // historical total_fea.npy; sovits probes the workspace cluster assets
+    // (built before training, so they exist even for early stops)
+    let indexPath = summaryIndex;
+    if (!indexPath) {
+      if (snapshot.backend === "rvc") {
+        indexPath = `${snapshot.workspace}\\total_fea.npy`;
+      } else {
+        for (const cand of [
+          `${snapshot.workspace}\\cluster\\kmeans_10000.pt`,
+          `${snapshot.workspace}\\cluster\\0.index_vectors.npy`,
+        ]) {
+          if (await exists(cand)) {
+            indexPath = cand;
+            break;
+          }
+        }
+      }
+    }
     try {
       await invoke("import_model", {
         name,
         path: ckpt.path,
-        modelType: "rvc",
-        indexPath: summaryIndex ?? `${snapshot.workspace}\\total_fea.npy`,
+        modelType: snapshot.backend,
+        indexPath,
       });
       await useVoiceModelStore.getState().fetchModels();
       showToast(t("training.imported", { name }), "success");
@@ -886,8 +1057,18 @@ function RunStep() {
     return (
       <div className="training-run-step">
         <div className="training-run-summary-line">
-          {config.modelName || "—"} · RVC {config.version} · {config.sampleRate} ·{" "}
-          {t("training.totalEpoch")} {config.totalEpoch} · batch {config.batchSize}
+          {config.backend === "rvc" ? (
+            <>
+              {config.modelName || "—"} · RVC {config.version} · {config.sampleRate} ·{" "}
+              {t("training.totalEpoch")} {config.totalEpoch} · batch {config.batchSize}
+            </>
+          ) : (
+            <>
+              {config.modelName || "—"} · SoVITS {config.sovitsVersion} · 44.1k ·{" "}
+              {t("training.totalEpoch")} {config.sovitsTotalEpoch} · batch{" "}
+              {config.sovitsBatchSize}
+            </>
+          )}
         </div>
         <button
           className="training-btn primary training-start-btn"
@@ -904,13 +1085,12 @@ function RunStep() {
 
   return (
     <div className="training-run-step">
-      {/* preprocessing stages */}
+      {/* preprocessing stages (ordered by the LIVE run's backend) */}
       {!trainingStarted && running && (
         <div className="training-stages">
-          {STAGE_ORDER.map((stage) => {
+          {(STAGE_ORDERS[snapshot.backend] ?? STAGE_ORDERS.rvc!).map((stage, idx, order) => {
             const cur = snapshot.stage;
-            const curIdx = cur ? STAGE_ORDER.indexOf(cur.stage) : -1;
-            const idx = STAGE_ORDER.indexOf(stage);
+            const curIdx = cur ? order.indexOf(cur.stage) : -1;
             const state = idx < curIdx ? "done" : idx === curIdx ? "active" : "pending";
             return (
               <div key={stage} className={`training-stage-row ${state}`}>
@@ -1044,7 +1224,9 @@ function RunStep() {
         </div>
       )}
 
-      {/* a finished run must not be a dead end — start the next one right here */}
+      {/* a finished run must not be a dead end — start the next one right here.
+          清空结果 clears only the DISPLAY (snapshot + curve); the workspace and
+          its checkpoints stay resumable */}
       {(snapshot.state === "completed" ||
         snapshot.state === "stopped" ||
         snapshot.state === "error") && (
@@ -1055,6 +1237,14 @@ function RunStep() {
             onClick={() => void onStart()}
           >
             {t("training.start")}
+          </button>
+          <button
+            className="training-btn"
+            disabled={starting}
+            title={t("training.clearResultTip")}
+            onClick={() => void resetRun()}
+          >
+            {t("training.clearResult")}
           </button>
         </div>
       )}

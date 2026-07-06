@@ -27,6 +27,15 @@ const PAD_R = 10;
 const PAD_T = 8;
 const PAD_B = 18;
 
+/** Compact step tick (1.1k / 11k / 1.2M): the exact step count lives in the
+ *  monitor row above — a full number centered on the right edge clips. */
+function fmtStepTick(n: number): string {
+  if (n < 1000) return String(n);
+  const [div, suffix] = n < 1e6 ? [1000, "k"] : [1e6, "M"];
+  const v = n / div;
+  return (v >= 100 ? v.toFixed(0) : v.toFixed(1).replace(/\.0$/, "")) + suffix;
+}
+
 export const LossChart = forwardRef<
   LossChartHandle,
   { history: StepPoint[]; bestStep?: number | null; height?: number }
@@ -117,11 +126,14 @@ export const LossChart = forwardRef<
       ctx.stroke();
       ctx.fillText(v >= 100 ? v.toFixed(0) : v.toFixed(1), 4, y + 3);
     }
-    // x labels
+    // x labels — compact ticks; the last one is right-aligned to the canvas
+    // edge (centering it on x1 pushed half the text out of frame)
     ctx.textAlign = "center";
-    for (const step of [x0, Math.round((x0 + x1) / 2), x1]) {
-      ctx.fillText(String(step), xOf(step), height - 5);
+    for (const step of [x0, Math.round((x0 + x1) / 2)]) {
+      ctx.fillText(fmtStepTick(step), xOf(step), height - 5);
     }
+    ctx.textAlign = "right";
+    ctx.fillText(fmtStepTick(x1), width - 2, height - 5);
     ctx.textAlign = "left";
 
     // per-pixel bucket average, then polyline

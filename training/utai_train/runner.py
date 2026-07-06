@@ -38,6 +38,10 @@ def main():
             from .rvc import pipeline
 
             pipeline.run(cfg, reporter, stop)
+        elif backend == "sovits":
+            from .sovits import pipeline
+
+            pipeline.run(cfg, reporter, stop)
         else:
             raise RuntimeError("未知训练后端: %s" % backend)
     except StopRequested:

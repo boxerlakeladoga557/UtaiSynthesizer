@@ -616,6 +616,7 @@ pub fn run() {
             commands::training::force_stop_training,
             commands::training::get_training_status,
             commands::training::get_training_history,
+            commands::training::reset_training_display,
             commands::training::check_training_workspace,
             commands::models::list_models,
             commands::models::import_model,

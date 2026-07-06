@@ -14,12 +14,11 @@ optional: spk_id(0), seed(1234), per(3.7), fp16(true), save_every_epoch(5),
   save_every_weights(true), keep_only_latest(true), cache_gpu(false),
   pretrain_g(""), pretrain_d(""), gpu (handled by runner via CUDA_VISIBLE_DEVICES)
 """
-import hashlib
 import logging
 import os
-import shutil
 
 from . import train_utils as utils
+from ..cache import dataset_fingerprint, invalidate_extract_caches
 from .extract_f0 import extract_f0
 from .extract_feature import extract_features
 from .filelist import build_filelist_and_config
@@ -31,41 +30,8 @@ logger = logging.getLogger(__name__)
 
 SR_MAP = {"32k": 32000, "40k": 40000, "48k": 48000}
 
-
-def _dataset_fingerprint(dataset_dir):
-    """Content identity of the imported dataset (name + size + head/tail sample).
-    The f0/feature caches are keyed by SLICE FILE NAME — after a dataset change the
-    re-sliced wavs reuse the same names with different content, so stale cache
-    entries would silently mismatch. Fingerprint change → wipe those caches."""
-    h = hashlib.blake2b(digest_size=16)
-    for name in sorted(os.listdir(dataset_dir)):
-        p = os.path.join(dataset_dir, name)
-        st = os.stat(p)
-        h.update(name.encode("utf-8"))
-        h.update(str(st.st_size).encode())
-        with open(p, "rb") as f:
-            h.update(f.read(65536))
-            if st.st_size > 131072:
-                f.seek(-65536, 2)
-                h.update(f.read(65536))
-    return h.hexdigest()
-
-
-def _invalidate_extract_caches(exp_dir, fingerprint):
-    fp_file = os.path.join(exp_dir, "dataset.fingerprint")
-    old = None
-    if os.path.exists(fp_file):
-        with open(fp_file, encoding="utf-8") as f:
-            old = f.read().strip()
-    if old != fingerprint:
-        if old is not None:
-            logger.info("dataset changed — clearing stale f0/feature caches")
-        for sub in ("2a_f0", "2b-f0nsf", "3_feature256", "3_feature768"):
-            d = os.path.join(exp_dir, sub)
-            if os.path.isdir(d):
-                shutil.rmtree(d)
-    with open(fp_file, "w", encoding="utf-8") as f:
-        f.write(fingerprint)
+# f0/feature caches are keyed by slice file name — see utai_train/cache.py
+EXTRACT_CACHE_SUBDIRS = ("2a_f0", "2b-f0nsf", "3_feature256", "3_feature768")
 
 
 def run(cfg, reporter, stop):
@@ -84,7 +50,9 @@ def run(cfg, reporter, stop):
     fp16 = bool(cfg.get("fp16", True)) and torch.cuda.is_available()
     ffmpeg = assets["ffmpeg"]
 
-    _invalidate_extract_caches(exp_dir, _dataset_fingerprint(cfg["dataset_dir"]))
+    invalidate_extract_caches(
+        exp_dir, dataset_fingerprint(cfg["dataset_dir"]), EXTRACT_CACHE_SUBDIRS
+    )
 
     preprocess_trainset(
         cfg["dataset_dir"],

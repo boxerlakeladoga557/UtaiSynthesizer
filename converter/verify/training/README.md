@@ -1,7 +1,8 @@
 # 训练链验证关卡（①b，S37 起）
 
 方法论同 `converter/verify/README.md`：**参照物永远是原版仓库的真实执行，绝不自证**。
-本目录覆盖 RVC 训练链的两道关卡（SoVITS/扩散/声码器各阶段落地时在此追加）。
+本目录覆盖 RVC 训练链（关卡0/1）与 SoVITS 训练链（gate0_sovits_* / gate1_sovits_*，
+见文末章节）；扩散/声码器各阶段落地时在此追加。
 
 原版参照：`D:\MyDev\RVC\RVC20240604Nvidia`（20240604 NVIDIA 整合包，自带 runtime =
 python3.9 + torch 2.0.0+cu118 + fairseq 0.12.2 + librosa 0.9.1）。
@@ -95,3 +96,101 @@ training\.venv\Scripts\python.exe converter\verify\training\gate1_compare.py
 - 检索库在特征提取后立即生成（原版在训练完成后）——早停也必有 index。
 - best 快照 = loss_mel 的 EMA(~100 step) 启发式（GAN 无验证集，见训练页 UI 标注）；
   ckpt 原子写；停止旗标每 step 检查。
+
+---
+
+# SoVITS 训练关卡（S38 起，gate0_sovits_* / gate1_sovits_*）
+
+原版参照：`D:\MyDev\so-vits-svc\so-vits-svc`（4.1-Stable @ 730930d，代码零改动）。
+**「原版时代环境」= RVC 整合包 runtime**（python3.9 + torch 2.0.0 + torchaudio
+2.0.1+cpu + fairseq 0.12.2 + librosa 0.9.1）—— so-vits requirements 自己钉的就是
+librosa==0.9.1 / fairseq==0.12.2，与 RVC 整合包同代；so-vits 伴生 venv 是半空的
+（无 fairseq/librosa），fairseq 无 Windows wheel，此 runtime 是本机唯一能真跑
+原版预处理的环境。中间产物在 `D:\MyDev\TESTING\utai-v2-testing\sovits_*`。
+
+⚠️ **rmvpe 是两个血统**：`aux/rmvpe.pt` = RVC 版（裸 state_dict 的 E2E）；so-vits
+vendored 的是 yxlllc/RMVPE 分支（E2E0，多 60 个 `unet.tf.*` 键，`{'model': sd}`
+包装）→ 训练资产 `data/models/training/sovits/rmvpe.pt`（yxlllc release 230917 的
+model.pt）。两个文件**不可互换**（本关卡首跑就是被这个炸出来的）。
+
+## 关卡0 —— 预处理对拍
+
+```
+# ① 切片（双方共同输入；上游无切片器，README 指定同款 openvpi 工具）：
+training\.venv\Scripts\python.exe converter\verify\training\gate0_sovits_prepare.py
+# ② 原版侧（RVC runtime 原样跑 resample/flist/hubert_f0 + vencoder oracle，CPU fp32）：
+D:\MyDev\RVC\RVC20240604Nvidia\runtime\python.exe converter\verify\training\gate0_sovits_orig.py
+# ③ 我方侧 + C1 + 对拍：
+training\.venv\Scripts\python.exe converter\verify\training\gate0_sovits_run_ours.py
+D:\MyDev\RVC\RVC20240604Nvidia\runtime\python.exe converter\verify\training\gate0_sovits_c_resample.py
+training\.venv\Scripts\python.exe converter\verify\training\gate0_sovits_compare.py
+```
+
+原版侧 harness 补丁（零数值影响，脚本头注释登记）：loguru 桩、ProcessPoolExecutor
+→串行内联（runpy __main__ 无法被 spawn unpickle）、repo configs 快照/恢复、
+pretrain/rmvpe.pt 补入（双方同一权重文件）。
+
+**S38 实测读数（2026-07-05，全 PASS；gate 数据 = 3×60s 切出 33 切片）：**
+
+| 层 | 项 | 读数 |
+|---|---|---|
+| C1 | resample 链代码轴（双方 librosa 0.9.1） | **逐位 0**（33/33 文件） |
+| C2 | ContentVec 768（同16k输入，onnx vs 真 fairseq fp32 CPU） | max 1.99e-4，min cos 0.99999984 |
+| C2 | ContentVec 256（同上） | max 7.4e-5，min cos 0.99999991 |
+| C3 | f0 定审（同44k输入，双方 fp32 CPU，torch 2.0↔2.5 轴） | **0/12389 帧超 0.5Hz、0 uv 翻转、max 0.6mHz** |
+| C4/C5 | spec / vol 定审（同44k输入，torch 2.0↔2.5 轴） | **逐位 0.0 / 0.0** |
+| A | 44k wav（librosa 0.9.1 kaiser_best vs 0.11 soxr_hq 轴） | min SNR 52.3 dB |
+| A | soft / spec / vol（输入轴叠加） | cos 0.987 / 55.6 dB / 94.6 dB |
+| A | f0 浊帧判据 | 浊帧 0.67% 超 0.5Hz，uv 翻转 0.15% |
+
+### 关卡0 钉死的数值轴/度量备忘
+1. **A 层 f0 必须只判双浊帧**：so-vits 后处理在清音区做线性插值填充，uv 边界帧随
+   输入(-52dB)漂移一帧即把锚点差扩散到整段清音区（全帧口径虚高到 9.3%，浊帧口径
+   0.67% —— 与 RVC A 层 0.75% 同级）。C3 已证同输入下代码 0 帧差。
+2. spec/vol 在 torch 2.0 vs 2.5 之间**逐位一致**（CPU fp32 的 stft/unfold 未变）。
+
+## 关卡1 —— 训练等价（逐 step loss 轨迹 vs 原版 train.py）
+
+```
+training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_prepare.py
+training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_run_orig.py
+training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_run_ours.py ^
+    > D:\MyDev\TESTING\utai-v2-testing\gate1_sovits_ours_steps.jsonl
+training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_compare.py
+```
+
+同一份关卡0 我方预处理产物（filelist 绝对路径双方直读）+ 同 seed(1234) + 同底模
+(vec768 G_0/D_0) + **双方 fp32 CPU + 同一个 torch(2.5.1)**（我们 venv 跑原版
+train.py 未改文件 —— 隔离代码轴，RVC 关卡1 同款）。原版侧 shim（只动执行环境：
+faiss 桩 / Tensor·Module.cuda→恒等 / DDP 剥 device_ids / 绕过 mp.spawn 直调
+run(0,1,hps) / gloo env + USE_LIBUV=0）。config: all_in_mem=true（双方
+num_workers=0）、vol_embedding+vol_aug=true（覆盖响度增强随机路径）、log_interval=1。
+
+**S38 实测读数（全 PASS，16/16 step 对齐）：**
+
+| 分量 | max 相对差 | mean 相对差 |
+|---|---|---|
+| loss/g/total | 1.6e-8 | 5.8e-9 |
+| loss/d/total | 1.7e-7 | 9.7e-8 |
+| loss/g/fm | 1.6e-7 | 6.2e-8 |
+| loss/g/mel | 2.4e-8 | 1.0e-8 |
+| loss/g/kl | 1.7e-7 | 7.5e-8 |
+| loss/g/lf0 | 2.4e-4 | 6.9e-5 |
+
+lf0 的 2.4e-4 是相对量纲效应：lf0 值域小（~1e-2），绝对差 ~1e-6 与其他分量同级；
+g_total（包含 lf0，值域 ~40）1.6e-8 证明合成完整。so-vits **没有** RVC 的
+mel>75/kl>9 显示夹取（TB 记原始值），对拍脚本无 clamp。
+
+### SoVITS 关卡复跑注意
+- 关卡1 前置依赖关卡0 我方产物（sovits_ours 的 filelists/config/特征）。
+- 原版侧 gate1 在 so-vits repo 里留下 `logs/gate1_sovits/`（gitignore 外目录，
+  复跑由 prepare 清理重建；repo 代码零改动）。
+- SoVITS 训练侧 vendored 有意偏离（全部登记在对应文件头）：预处理串行化 / 切片
+  统一用 slicer2（上游要求用户手切，同款工具同默认参数）/ 响度归一默认关（上游
+  默认开但其 README 自认损音质；关卡里双方都开）/ ContentVec 用项目 onnx /
+  filelist 种子化 shuffle + UTF-8（上游 locale 写 UTF-8 读 = CJK mojibake 雷修复）/
+  rmvpe 每 run 构造一次（上游每文件重载 180MB）/ kmeans 用上游 use_minibatch 代码
+  路径（默认全量 KMeans 万级中心不可行）且 n_clusters 截到行数 / DataLoader
+  persistent_workers（Windows spawn 每 epoch 重启 worker 之灾）/ 停止旗标逐 step /
+  ckpt 原子写 / best=EMA(mel) / 完训补存 latest G/D + release 导出
+  （compress_model 语义：去 enc_q + fp16）。

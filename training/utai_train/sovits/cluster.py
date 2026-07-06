@@ -1,0 +1,111 @@
+# Retrieval / kmeans assets from the extracted ContentVec features. Runs right
+# after extraction (before training) so an early stop still leaves a usable
+# index — same by-construction policy as the RVC trainer.
+#
+# Retrieval (default): the app's runtime KNN (inference/features.rs) does exact
+# brute-force search over a raw [N, dim] f32 matrix — mathematically what the
+# upstream faiss "IVF,Flat" index stores and what its inference reads back via
+# reconstruct_n. We skip faiss (RVC index_npy precedent) and emit the matrix
+# directly under the file name contract of converter/export_cluster.py:
+# <speaker_id>.index_vectors.npy. Preserved from upstream utils.train_index:
+# sorted-name concat of *.wav.soft.pt ([1,dim,T] -> [T,dim]), row shuffle,
+# >2e5 rows -> MiniBatchKMeans down to 10000 centers. Deviation: seeded shuffle.
+#
+# Kmeans (optional): upstream cluster/train_cluster.py output format, one dict
+# per speaker {"n_features_in_", "_n_threads", "cluster_centers_"} saved as
+# kmeans_10000.pt keyed by SPEAKER NAME. The import chain feeds this .pt to
+# converter/export_cluster.py which owns the <safe_name>.centers.npy naming —
+# no second copy of the sanitize rules here. Deviations: uses the upstream
+# use_minibatch code path (MiniBatchKMeans batch_size=4096 max_iter=80; the
+# upstream default full KMeans over 10000 clusters is intractable on real
+# datasets), n_clusters clamped to the row count (upstream errors out when a
+# small dataset has fewer rows than clusters).
+import logging
+import os
+import traceback
+
+import numpy as np
+import torch
+
+logger = logging.getLogger(__name__)
+
+N_CLUSTERS = 10000
+
+
+def _load_features(spk_dir, stop):
+    names = [n for n in sorted(os.listdir(spk_dir)) if n.endswith(".wav.soft.pt")]
+    if not names:
+        raise RuntimeError("特征目录为空，无法构建检索/聚类库")
+    mats = []
+    for name in names:
+        stop.check()
+        phone = torch.load(os.path.join(spk_dir, name), map_location="cpu")
+        mats.append(phone[0].transpose(-1, -2).numpy())  # [T, dim]
+    return np.concatenate(mats, 0)
+
+
+def build_retrieval(exp_dir, spk_dir, seed, reporter, stop, n_cpu=None):
+    reporter.stage("index", message="构建检索特征库")
+    big_npy = _load_features(spk_dir, stop)
+
+    big_npy_idx = np.arange(big_npy.shape[0])
+    np.random.RandomState(seed).shuffle(big_npy_idx)
+    big_npy = big_npy[big_npy_idx]
+
+    if big_npy.shape[0] > 2e5:
+        reporter.stage(
+            "index", message="特征量 %s 行，KMeans 压缩到 10000 中心" % big_npy.shape[0]
+        )
+        try:
+            from sklearn.cluster import MiniBatchKMeans
+
+            big_npy = (
+                MiniBatchKMeans(
+                    n_clusters=N_CLUSTERS,
+                    batch_size=256 * (n_cpu or os.cpu_count() or 4),
+                    compute_labels=False,
+                    init="random",
+                )
+                .fit(big_npy)
+                .cluster_centers_
+            )
+        except Exception:
+            logger.error("kmeans failed, keeping raw matrix\n%s", traceback.format_exc())
+
+    big_npy = np.ascontiguousarray(big_npy.astype(np.float32))
+    cluster_dir = os.path.join(exp_dir, "cluster")
+    os.makedirs(cluster_dir, exist_ok=True)
+    # speaker id 0 — single-speaker training; file name contract of export_cluster.py
+    out_path = os.path.join(cluster_dir, "0.index_vectors.npy")
+    np.save(out_path, big_npy, allow_pickle=False)
+    logger.info("retrieval matrix saved: %s rows -> %s", big_npy.shape[0], out_path)
+    reporter.stage("index", done=1, total=1)
+    return out_path, int(big_npy.shape[0])
+
+
+def build_kmeans(exp_dir, spk_dir, speaker_name, reporter, stop):
+    reporter.stage("index", message="训练聚类中心 (kmeans)")
+    from sklearn.cluster import MiniBatchKMeans
+
+    features = _load_features(spk_dir, stop).astype(np.float32)
+    stop.check()
+    n_clusters = min(N_CLUSTERS, features.shape[0])
+    kmeans = MiniBatchKMeans(
+        n_clusters=n_clusters, verbose=False, batch_size=4096, max_iter=80
+    ).fit(features)
+    ckpt = {
+        speaker_name: {
+            "n_features_in_": kmeans.n_features_in_,
+            "_n_threads": kmeans._n_threads,
+            "cluster_centers_": kmeans.cluster_centers_,
+        }
+    }
+    cluster_dir = os.path.join(exp_dir, "cluster")
+    os.makedirs(cluster_dir, exist_ok=True)
+    out_path = os.path.join(cluster_dir, "kmeans_%d.pt" % N_CLUSTERS)
+    tmp = out_path + ".tmp"
+    torch.save(ckpt, tmp)
+    os.replace(tmp, out_path)
+    logger.info("kmeans centers saved: %s x %s -> %s", n_clusters, features.shape[1], out_path)
+    reporter.stage("index", done=1, total=1)
+    return out_path, int(n_clusters)

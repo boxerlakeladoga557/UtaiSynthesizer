@@ -32,13 +32,21 @@ fn d_true() -> bool {
 fn d_save_every() -> u32 {
     5
 }
+fn d_save_steps() -> u32 {
+    800
+}
+fn d_keep_ckpts() -> u32 {
+    3
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartTrainingRequest {
     pub model_name: String,
-    pub backend: String, // "rvc" (sovits / diffusion / vocoder land in later phases)
-    pub version: String, // "v1" | "v2"
-    pub sample_rate: String, // "32k" | "40k" | "48k"
+    pub backend: String, // "rvc" | "sovits" (diffusion / vocoder land in later phases)
+    /// rvc: "v1" | "v2" — sovits: "4.1" | "4.0"
+    pub version: String,
+    /// rvc: "32k" | "40k" | "48k" — sovits: fixed "44k"
+    pub sample_rate: String,
     pub dataset_files: Vec<String>,
     pub total_epoch: u32,
     pub batch_size: u32,
@@ -61,6 +69,25 @@ pub struct StartTrainingRequest {
     /// true = 重训 (wipe the workspace), false = 续训 (resume from latest ckpt)
     #[serde(default)]
     pub fresh: bool,
+    // ---- SoVITS-only knobs (ignored by the rvc backend) ----
+    /// 响度嵌入 (couples train.vol_aug + model.vol_embedding, like upstream --vol_aug)
+    #[serde(default)]
+    pub vol_embedding: bool,
+    /// resample 响度归一 (upstream default ON; ours OFF — lossy per upstream README)
+    #[serde(default)]
+    pub loudnorm: bool,
+    /// 聚类中心 (kmeans) instead of the default retrieval matrix
+    #[serde(default)]
+    pub kmeans: bool,
+    /// ckpt/eval cadence in global steps (upstream eval_interval)
+    #[serde(default = "d_save_steps")]
+    pub save_every_steps: u32,
+    /// how many G_/D_ checkpoints to keep (upstream keep_ckpts; *_0.pth exempt)
+    #[serde(default = "d_keep_ckpts")]
+    pub keep_ckpts: u32,
+    /// cache the whole dataset in RAM (upstream all_in_mem)
+    #[serde(default)]
+    pub all_in_mem: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -200,6 +227,23 @@ impl TrainingManager {
         self.inner.history.lock().clone()
     }
 
+    /// Reset the DISPLAY state of a finished run back to idle (snapshot, loss
+    /// history, stderr ring). Purely cosmetic — workspace files/checkpoints are
+    /// untouched and the run stays resumable. Refused while a run is live.
+    pub fn reset_display(&self) -> Result<()> {
+        if self.is_active() {
+            return Err(UtaiError::Training("训练进行中，无法清空结果".into()));
+        }
+        *self.inner.snapshot.lock() = TrainingSnapshot {
+            state: "idle".into(),
+            ..Default::default()
+        };
+        self.inner.history.lock().clear();
+        self.inner.stderr_ring.lock().clear();
+        *self.inner.started_at.lock() = None;
+        Ok(())
+    }
+
     /// Graceful stop: create the flag file; the sidecar saves + finalizes at the
     /// next safe boundary and reports `done(stopped)` through the protocol. If the
     /// run hasn't reached its workspace yet (validation window), fall back to abort.
@@ -267,20 +311,41 @@ impl TrainingManager {
         self.inner.abort.store(false, Ordering::SeqCst);
         *self.inner.stop_file.lock() = None;
 
-        if req.backend != "rvc" {
-            return Err(UtaiError::Training(format!(
-                "训练后端「{}」尚未实现（当前仅 RVC）",
-                req.backend
-            )));
+        match req.backend.as_str() {
+            "rvc" => {
+                if !matches!(req.version.as_str(), "v1" | "v2") {
+                    return Err(UtaiError::Training(format!("非法 RVC 版本 {}", req.version)));
+                }
+                if !matches!(req.sample_rate.as_str(), "32k" | "40k" | "48k") {
+                    return Err(UtaiError::Training(format!("非法采样率 {}", req.sample_rate)));
+                }
+            }
+            "sovits" => {
+                if !matches!(req.version.as_str(), "4.1" | "4.0") {
+                    return Err(UtaiError::Training(format!(
+                        "非法 SoVITS 版本 {}",
+                        req.version
+                    )));
+                }
+                if req.sample_rate != "44k" {
+                    return Err(UtaiError::Training(format!(
+                        "SoVITS 训练固定 44.1kHz（收到 {}）",
+                        req.sample_rate
+                    )));
+                }
+            }
+            other => {
+                return Err(UtaiError::Training(format!(
+                    "训练后端「{}」尚未实现（当前支持 RVC / SoVITS）",
+                    other
+                )));
+            }
         }
         if req.model_name.trim().is_empty() {
             return Err(UtaiError::Training("模型名不能为空".into()));
         }
         if req.dataset_files.is_empty() {
             return Err(UtaiError::Training("请先导入训练数据".into()));
-        }
-        if !matches!(req.sample_rate.as_str(), "32k" | "40k" | "48k") {
-            return Err(UtaiError::Training(format!("非法采样率 {}", req.sample_rate)));
         }
         for f in &req.dataset_files {
             if !Path::new(f).is_file() {
@@ -290,21 +355,50 @@ impl TrainingManager {
 
         // ---- resolve + verify every asset up front (loud, specific errors) ----
         let aux_dir = data_dir.join("models").join("aux");
-        let contentvec = aux_dir.join(if req.version == "v1" {
+        // one-ContentVec-space principle: the training extractor must be the same
+        // aux graph inference uses — rvc v1 / sovits 4.0 = 256l9, rvc v2 / sovits
+        // 4.1 = 768l12
+        let use_256 = matches!(
+            (req.backend.as_str(), req.version.as_str()),
+            ("rvc", "v1") | ("sovits", "4.0")
+        );
+        let contentvec = aux_dir.join(if use_256 {
             "contentvec_256l9.onnx"
         } else {
             "contentvec_768l12.onnx"
         });
-        let rmvpe_pt = aux_dir.join("rmvpe.pt");
-        let pretrain_dir = data_dir.join("models").join("training").join("rvc").join(
-            if req.version == "v1" {
-                "pretrained"
-            } else {
-                "pretrained_v2"
-            },
-        );
-        let pretrain_g = pretrain_dir.join(format!("f0G{}.pth", req.sample_rate));
-        let pretrain_d = pretrain_dir.join(format!("f0D{}.pth", req.sample_rate));
+        // rmvpe is TWO different lineages: aux/rmvpe.pt = RVC's raw-state-dict E2E;
+        // so-vits vendors the yxlllc/RMVPE fork (E2E0, +unet.tf.* layers, wrapped
+        // as {'model': sd}) — the files are NOT interchangeable
+        let rmvpe_pt = if req.backend == "sovits" {
+            data_dir
+                .join("models")
+                .join("training")
+                .join("sovits")
+                .join("rmvpe.pt")
+        } else {
+            aux_dir.join("rmvpe.pt")
+        };
+        let (pretrain_g, pretrain_d) = if req.backend == "rvc" {
+            let pretrain_dir = data_dir.join("models").join("training").join("rvc").join(
+                if req.version == "v1" {
+                    "pretrained"
+                } else {
+                    "pretrained_v2"
+                },
+            );
+            (
+                pretrain_dir.join(format!("f0G{}.pth", req.sample_rate)),
+                pretrain_dir.join(format!("f0D{}.pth", req.sample_rate)),
+            )
+        } else {
+            let pretrain_dir = data_dir
+                .join("models")
+                .join("training")
+                .join("sovits")
+                .join(if req.version == "4.0" { "vec256" } else { "vec768" });
+            (pretrain_dir.join("G_0.pth"), pretrain_dir.join("D_0.pth"))
+        };
         let ffmpeg = crate::audio::find_ffmpeg()
             .ok_or_else(|| UtaiError::Training("找不到 ffmpeg.exe（训练预处理需要）".into()))?;
         for (label, p) in [
@@ -330,15 +424,26 @@ impl TrainingManager {
         }
         std::fs::create_dir_all(&workspace)?;
 
-        // resume-parameter guard: version/sample_rate are baked into the workspace
-        // artifacts (slices, features, config.json) — changing them on a resume
-        // would mismatch (48k wavs vs 40k hps) or silently degrade to retrain
+        // resume-parameter guard: version/sample_rate (and for sovits the
+        // vol_embedding switch — it changes the model architecture AND the wire
+        // inputs) are baked into the workspace artifacts — changing them on a
+        // resume would mismatch or silently degrade to retrain
         let manifest_path = workspace.join("run_manifest.json");
         if !req.fresh && manifest_path.exists() {
             let old: serde_json::Value = serde_json::from_str(
                 &std::fs::read_to_string(&manifest_path).unwrap_or_default(),
             )
             .unwrap_or_default();
+            // the workspace is keyed by model NAME only — a same-named run of the
+            // OTHER backend must not silently "resume" into (or misread) this
+            // workspace; retrain (fresh=true) wipes it above with user consent
+            let old_backend = old["backend"].as_str().unwrap_or("");
+            if !old_backend.is_empty() && old_backend != req.backend {
+                return Err(UtaiError::Training(format!(
+                    "同名训练工作区属于另一后端（原 {}，现 {}）：请换一个模型名，或选择重训（将清空原工作区）",
+                    old_backend, req.backend
+                )));
+            }
             let old_ver = old["version"].as_str().unwrap_or("");
             let old_sr = old["sample_rate"].as_str().unwrap_or("");
             if (!old_ver.is_empty() && old_ver != req.version)
@@ -349,14 +454,27 @@ impl TrainingManager {
                     old_ver, old_sr, req.version, req.sample_rate
                 )));
             }
+            if req.backend == "sovits" {
+                if let Some(old_vol) = old["vol_embedding"].as_bool() {
+                    if old_vol != req.vol_embedding {
+                        return Err(UtaiError::Training(format!(
+                            "续训参数与原工作区不一致（响度嵌入 原{} 现{}）：该开关决定模型结构，续训必须沿用，或选择重训",
+                            if old_vol { "开" } else { "关" },
+                            if req.vol_embedding { "开" } else { "关" }
+                        )));
+                    }
+                }
+            }
         }
-        std::fs::write(
-            &manifest_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": req.version,
-                "sample_rate": req.sample_rate,
-            }))?,
-        )?;
+        let mut manifest = serde_json::json!({
+            "backend": req.backend,
+            "version": req.version,
+            "sample_rate": req.sample_rate,
+        });
+        if req.backend == "sovits" {
+            manifest["vol_embedding"] = serde_json::json!(req.vol_embedding);
+        }
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
 
         let stop_file = workspace.join("stop.flag");
         let _ = std::fs::remove_file(&stop_file); // stale flag would insta-stop the run
@@ -497,6 +615,7 @@ fn run_worker(
         "workspace": workspace,
         "dataset_dir": dataset_dir,
         "model_slug": slug,
+        "model_name": req.model_name,
         "sample_rate": req.sample_rate,
         "version": req.version,
         "total_epoch": req.total_epoch,
@@ -507,6 +626,13 @@ fn run_worker(
         "cache_gpu": req.cache_gpu,
         "fp16": req.fp16,
         "spk_id": req.spk_id,
+        // sovits-only knobs (the rvc pipeline ignores them)
+        "vol_embedding": req.vol_embedding,
+        "loudnorm": req.loudnorm,
+        "kmeans": req.kmeans,
+        "save_every_steps": req.save_every_steps,
+        "keep_ckpts": req.keep_ckpts,
+        "all_in_mem": req.all_in_mem,
         "seed": SEED,
         // Windows cannot hold an EMPTY env var (empty = deleted = all GPUs
         // visible) — CPU mode must be the explicit sentinel "-1"
@@ -518,7 +644,7 @@ fn run_worker(
             "ffmpeg": ffmpeg,
             "rmvpe_pt": rmvpe_pt,
             "contentvec_onnx": contentvec,
-            "configs_dir": app_dir.join("training").join("assets").join("configs").join("rvc"),
+            "configs_dir": app_dir.join("training").join("assets").join("configs").join(&req.backend),
             "mute_dir": app_dir.join("training").join("assets").join("mute"),
         },
     });

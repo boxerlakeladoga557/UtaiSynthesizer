@@ -50,6 +50,13 @@ pub async fn get_training_status(
     Ok(state.training.status())
 }
 
+/// Clear the finished run's DISPLAY state (snapshot + loss history) back to idle.
+/// Files are untouched — the workspace/checkpoints stay resumable.
+#[tauri::command]
+pub async fn reset_training_display(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.training.reset_display().map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn get_training_history(
     state: State<'_, Arc<AppState>>,
