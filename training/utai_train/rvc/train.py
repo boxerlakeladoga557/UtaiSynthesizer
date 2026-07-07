@@ -28,11 +28,11 @@ from random import shuffle
 from time import time as ttime
 
 import torch
-from torch.cuda.amp import GradScaler, autocast
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+from .. import device as device_shim  # aliased: 'device' is a collision-prone name in torch code (device = torch.device(...))
 from . import train_utils as utils
 from .infer_pack import commons
 from .data_utils import (
@@ -102,6 +102,7 @@ def train(cfg, exp_dir, reporter, stop):
 
     torch.manual_seed(hps.train.seed)
     use_cuda = torch.cuda.is_available()
+    amp_backend = "cuda" if use_cuda else "cpu"
     if use_cuda:
         torch.cuda.set_device(0)
 
@@ -169,14 +170,14 @@ def train(cfg, exp_dir, reporter, stop):
             logger.info("loaded pretrained %s" % (hps.pretrainG))
             logger.info(
                 net_g.load_state_dict(
-                    torch.load(hps.pretrainG, map_location="cpu")["model"]
+                    torch.load(hps.pretrainG, map_location="cpu", weights_only=False)["model"]
                 )
             )
         if hps.pretrainD != "":
             logger.info("loaded pretrained %s" % (hps.pretrainD))
             logger.info(
                 net_d.load_state_dict(
-                    torch.load(hps.pretrainD, map_location="cpu")["model"]
+                    torch.load(hps.pretrainD, map_location="cpu", weights_only=False)["model"]
                 )
             )
 
@@ -187,7 +188,7 @@ def train(cfg, exp_dir, reporter, stop):
         optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2
     )
 
-    scaler = GradScaler(enabled=hps.train.fp16_run)
+    scaler = device_shim.make_scaler(amp_backend, hps.train.fp16_run)
 
     weights_dir = os.path.join(exp_dir, "weights")
     os.makedirs(weights_dir, exist_ok=True)
@@ -316,7 +317,7 @@ def train(cfg, exp_dir, reporter, stop):
                 spec_lengths = spec_lengths.cuda(0, non_blocking=True)
                 wave = wave.cuda(0, non_blocking=True)
 
-            with autocast(enabled=hps.train.fp16_run):
+            with device_shim.autocast(amp_backend, enabled=hps.train.fp16_run):
                 (
                     y_hat,
                     ids_slice,
@@ -335,7 +336,7 @@ def train(cfg, exp_dir, reporter, stop):
                 y_mel = commons.slice_segments(
                     mel, ids_slice, hps.train.segment_size // hps.data.hop_length
                 )
-                with autocast(enabled=False):
+                with device_shim.autocast(amp_backend, enabled=False):
                     y_hat_mel = mel_spectrogram_torch(
                         y_hat.float().squeeze(1),
                         hps.data.filter_length,
@@ -354,7 +355,7 @@ def train(cfg, exp_dir, reporter, stop):
 
                 # Discriminator
                 y_d_hat_r, y_d_hat_g, _, _ = net_d(wave, y_hat.detach())
-                with autocast(enabled=False):
+                with device_shim.autocast(amp_backend, enabled=False):
                     loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
                         y_d_hat_r, y_d_hat_g
                     )
@@ -364,10 +365,10 @@ def train(cfg, exp_dir, reporter, stop):
             grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
             scaler.step(optim_d)
 
-            with autocast(enabled=hps.train.fp16_run):
+            with device_shim.autocast(amp_backend, enabled=hps.train.fp16_run):
                 # Generator
                 y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
-                with autocast(enabled=False):
+                with device_shim.autocast(amp_backend, enabled=False):
                     loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
                     loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
                     loss_fm = feature_loss(fmap_r, fmap_g)

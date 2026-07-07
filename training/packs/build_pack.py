@@ -56,7 +56,11 @@ VARIANTS = {
         "lock": "runtime-cpu.lock.txt",
         "label": "CPU 运行时（模型转换基座 + CPU 训练）",
     },
-    # Phase B/C/D: "nv-cu130", "xpu", "amd" — one lockfile each, same recipe.
+    "nv-cu130": {
+        "lock": "runtime-nv-cu130.lock.txt",
+        "label": "NVIDIA 运行时（cu130；RTX 20-50 训练 + 模型转换）",
+    },
+    # Phase C/D: "xpu", "amd" — one lockfile each, same recipe.
 }
 
 PART_BYTES = 1_900_000_000  # < GitHub release 2 GiB per-file cap

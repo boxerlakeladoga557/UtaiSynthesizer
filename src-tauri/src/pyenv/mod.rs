@@ -213,6 +213,61 @@ pub fn converter_python_checked(app_dir: &Path) -> Result<PathBuf> {
     Ok(py)
 }
 
+/// nv-cu130 and amd(torch-hip) both drive the `torch.cuda.*` namespace, so both map
+/// to the "cuda" backend for device.py's shim; xpu and cpu map to themselves.
+fn variant_backend(variant: &str) -> &'static str {
+    match variant {
+        "xpu" => "xpu",
+        "cpu" => "cpu",
+        _ => "cuda",
+    }
+}
+
+/// The TRAINING-role interpreter AND its device backend. Unlike the converter role
+/// (any variant runs its CPU-bound scripts), the pack VARIANT drives `device_backend`
+/// for device.py's shim. `force_cpu` pins "cpu" regardless (the train-on-CPU-anyway
+/// path). Priority: dev venv (unchanged dev experience — backend from the box's own
+/// GPU) → best installed pack (GPU variants first, newest version) → manual slot →
+/// bare python. Returns `(interpreter, device_backend)`.
+pub fn training_interpreter(app_dir: &Path, force_cpu: bool) -> (PathBuf, String) {
+    let default_gpu = || if force_cpu { "cpu" } else { "cuda" }.to_string();
+
+    let venv = app_dir
+        .join("training")
+        .join(".venv")
+        .join("Scripts")
+        .join("python.exe");
+    if venv.exists() {
+        return (venv, default_gpu());
+    }
+    // Same GPU-first order as the converter role; here the variant also fixes the
+    // backend, so an NVIDIA box holding only nv-cu130 trains on GPU (device=cuda).
+    const TRAINING_PRIORITY: [&str; 4] = ["nv-cu130", "amd", "xpu", "cpu"];
+    let packs = list_packs();
+    for variant in TRAINING_PRIORITY {
+        if let Some(p) = packs
+            .iter()
+            .filter(|p| p.meta.variant == variant)
+            .max_by_key(|p| p.meta.version)
+        {
+            let py = pack_python(Path::new(&p.path));
+            if py.exists() {
+                let backend = if force_cpu {
+                    "cpu".to_string()
+                } else {
+                    variant_backend(variant).to_string()
+                };
+                return (py, backend);
+            }
+        }
+    }
+    let embedded = crate::util::manual_python_slot(app_dir);
+    if embedded.exists() {
+        return (embedded, default_gpu());
+    }
+    (PathBuf::from("python"), default_gpu())
+}
+
 // ─── catalog ────────────────────────────────────────────────────────────────
 
 /// A downloadable pack the app knows about. The catalog deliberately carries NO
@@ -249,7 +304,23 @@ pub const CATALOG: &[CatalogEntry] = &[CatalogEntry {
         "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-cpu-v1.manifest.json",
         "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-cpu-v1.manifest.json",
     ],
-    // GPU 变体（nv-cu130 / xpu / amd）按 Phase B/C/D 依次加入 —— 见 s42 设计 §5。
+}, CatalogEntry {
+    id: "runtime-nv-cu130-v1",
+    variant: "nv-cu130",
+    label: "NVIDIA 运行时（cu130；RTX 20-50 训练 + 模型转换）",
+    // Real numbers from the Phase B build: 1.84 GB download / 3.59 GB on disk (single
+    // part — under the 1.9 GiB split cap).
+    download_bytes: 1_838_043_109,
+    disk_bytes: 3_587_520_577,
+    experimental: false,
+    // Same HF dataset repo as cpu; goes live once uploaded (`hf upload
+    // yasoukyoku/utai-runtimes <dist> . --repo-type dataset`). Until then the dev
+    // override UTAI_PACK_BASE_URL serves it for local end-to-end tests.
+    manifest_urls: &[
+        "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-nv-cu130-v1.manifest.json",
+        "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-nv-cu130-v1.manifest.json",
+    ],
+    // xpu / amd 变体按 Phase C/D 依次加入 —— 见 s42 设计 §5。
 }];
 
 /// Manifest URL candidates for a catalog entry: published URLs + the dev override.

@@ -434,7 +434,7 @@ async fn run_fp16_converter(fp32_onnx: &Path, app_dir: &Path) -> Result<String, 
 }
 
 // Converter interpreter resolution = crate::pyenv::converter_python_checked (S42) —
-// see models/convert.rs. util::find_python now serves the TRAINING role only.
+// see models/convert.rs. The TRAINING role uses crate::pyenv::training_interpreter.
 
 /// Catalog-provided architecture wins (validated against the known set); filename heuristics
 /// are only the fallback for URL/local imports without catalog metadata.

@@ -269,5 +269,5 @@ pub fn convert_vocoder_to_onnx(
 
 // Converter interpreter resolution = crate::pyenv::converter_python_checked (S42):
 // dev venv → installed runtime packs (newest per variant) → manual slot → LOUD error
-// (never a doomed bare-"python" spawn on end-user machines). util::find_python now
-// serves the TRAINING role only.
+// (never a doomed bare-"python" spawn on end-user machines). The TRAINING role has
+// its own variant-aware resolver, crate::pyenv::training_interpreter.

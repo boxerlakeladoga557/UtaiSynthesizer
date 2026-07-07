@@ -144,6 +144,66 @@
   margin: 0;
 }
 
+/* download-source radios (moved here from the resource manager) */
+.settings-source {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+.settings-source-opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 2px 0;
+}
+
+.settings-source-opt.active {
+  color: var(--accent-primary);
+}
+
+.settings-source-opt input[type="radio"] {
+  accent-color: var(--accent-primary);
+  margin: 0;
+}
+
+.settings-source-url {
+  margin-left: 22px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  padding: 6px 8px;
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+}
+
+.settings-source-url:focus {
+  border-color: var(--accent-primary);
+  outline: none;
+}
+
+.settings-source-test {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.settings-source-result {
+  font-size: 10px;
+  font-family: var(--font-mono);
+}
+
+.settings-source-result.ok { color: #5db85d; }
+.settings-source-result.slow { color: #d6b24a; }
+.settings-source-result.throttled,
+.settings-source-result.http_error,
+.settings-source-result.unreachable { color: #d16a6a; }
+
 .settings-download-btn {
   font-size: 11px;
   font-family: var(--font-mono);

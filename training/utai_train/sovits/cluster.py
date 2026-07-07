@@ -50,7 +50,7 @@ def _load_features(spk_dir, stop):
     mats = []
     for name in names:
         stop.check()
-        phone = torch.load(os.path.join(spk_dir, name), map_location="cpu")
+        phone = torch.load(os.path.join(spk_dir, name), map_location="cpu", weights_only=False)
         mats.append(phone[0].transpose(-1, -2).numpy())  # [T, dim]
     return np.concatenate(mats, 0)
 

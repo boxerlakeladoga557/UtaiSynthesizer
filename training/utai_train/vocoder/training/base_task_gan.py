@@ -226,7 +226,7 @@ class GanBaseTask(pl.LightningModule):
             # 登记偏离(A2 同批,见头注): map_location="cpu"——社区底模 (2024.02)
             # 是 CUDA 存档,上游裸 torch.load 在 CPU 训练(force_cpu 兜底)下直接
             # RuntimeError;数值中性(load_state_dict 只拷值,设备由 lightning 定)
-            ckpt = torch.load(pre_train_ckpt_path, map_location="cpu")
+            ckpt = torch.load(pre_train_ckpt_path, map_location="cpu", weights_only=False)
 
             state_dict = {}
             for i in ckpt['state_dict']:

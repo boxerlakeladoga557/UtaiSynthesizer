@@ -17,7 +17,6 @@ import {
   type MsstCatalogEntry,
   type MsstCategory,
   type MsstPrecision,
-  type MirrorSource,
 } from "../../lib/models/msst-catalog";
 import { useDraggable } from "../../lib/useDraggable";
 import { VOICE_STRINGS } from "../workflow/nodes/VoiceModelPicker";
@@ -38,9 +37,9 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
   const { i18n } = useTranslation();
   const lang = i18n.language;
   const {
-    installed, downloading, error, mirror,
+    installed, downloading, error,
     fetchInstalled, fetchModelsDir, modelsDir,
-    clearError, deleteModel, setMirror, downloadEntry, convertPrecision,
+    clearError, deleteModel, downloadEntry, convertPrecision,
   } = useMsstModelStore();
 
   const { pos, startDrag } = useDraggable(() => ({ x: 100, y: 96 }));
@@ -50,7 +49,6 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   // Download-time precision choice per catalog entry (roformers only); absent = arch default.
   const [dlPrecision, setDlPrecision] = useState<Record<string, MsstPrecision>>({});
-  const [showMirrorConfig, setShowMirrorConfig] = useState(false);
 
   useEffect(() => {
     fetchModelsDir();
@@ -79,8 +77,6 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
 
   const handleDelete = useCallback(async (filename: string) => { await deleteModel(filename); setConfirmDelete(null); }, [deleteModel]);
 
-  const mirrorLabel = mirror.type === "hf-mirror" ? "HF Mirror" : mirror.type === "custom" ? "Custom" : "HuggingFace";
-
   return (
     <aside className="msst-model-manager" style={{ left: pos.x, top: pos.y }}>
       <div className="panel-header" onMouseDown={startDrag}>
@@ -97,21 +93,7 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
         <button className={topTab === "voice" ? "active" : ""} onClick={() => setTopTab("voice")}>
           {lang === "zh" ? "声音模型" : lang === "ja" ? "ボイスモデル" : "Voice Models"}
         </button>
-        <div className="rm-top-spacer" />
-        {topTab === "separation" && (
-          <button
-            className={`rm-mirror-btn ${showMirrorConfig ? "active" : ""}`}
-            onClick={() => setShowMirrorConfig(!showMirrorConfig)}
-            title={mirrorLabel}
-          >
-            {lang === "zh" ? "源" : lang === "ja" ? "ソース" : "Source"}: {mirrorLabel}
-          </button>
-        )}
       </div>
-
-      {showMirrorConfig && topTab === "separation" && (
-        <MirrorConfig mirror={mirror} onChange={setMirror} lang={lang} onClose={() => setShowMirrorConfig(false)} />
-      )}
 
       {topTab === "voice" && <VoiceModelsTab lang={lang} />}
 
@@ -487,33 +469,6 @@ function DownloadBar({ dl, lang }: { dl: { downloaded: number; total: number; st
           <div className="model-download-bar" style={{ width: dl.total > 0 ? `${(dl.downloaded / dl.total) * 100}%` : "0%" }} />
           <span className="model-download-text">{formatSize(dl.downloaded)} / {dl.total > 0 ? formatSize(dl.total) : "..."}</span>
         </>
-      )}
-    </div>
-  );
-}
-
-function MirrorConfig({ mirror, onChange, lang, onClose }: { mirror: MirrorSource; onChange: (m: MirrorSource) => void; lang: string; onClose: () => void }) {
-  return (
-    <div className="rm-mirror-config">
-      <div className="rm-mirror-title">
-        {lang === "zh" ? "下载源设置" : lang === "ja" ? "ダウンロードソース設定" : "Download Source"}
-        <button className="rm-mirror-close" onClick={onClose}>X</button>
-      </div>
-      <label className={mirror.type === "huggingface" ? "active" : ""}>
-        <input type="radio" name="mirror" checked={mirror.type === "huggingface"} onChange={() => onChange({ type: "huggingface", customUrl: mirror.customUrl })} />
-        HuggingFace ({lang === "zh" ? "默认" : "Default"})
-      </label>
-      <label className={mirror.type === "hf-mirror" ? "active" : ""}>
-        <input type="radio" name="mirror" checked={mirror.type === "hf-mirror"} onChange={() => onChange({ type: "hf-mirror", customUrl: mirror.customUrl })} />
-        HF Mirror (hf-mirror.com) — {lang === "zh" ? "中国大陆加速" : "China mainland"}
-      </label>
-      <label className={mirror.type === "custom" ? "active" : ""}>
-        <input type="radio" name="mirror" checked={mirror.type === "custom"} onChange={() => onChange({ type: "custom", customUrl: mirror.customUrl })} />
-        {lang === "zh" ? "自定义" : "Custom"}
-      </label>
-      {mirror.type === "custom" && (
-        <input type="text" className="rm-mirror-url" placeholder="https://your-mirror.com"
-          value={mirror.customUrl} onChange={(e) => onChange({ type: "custom", customUrl: e.target.value })} />
       )}
     </div>
   );

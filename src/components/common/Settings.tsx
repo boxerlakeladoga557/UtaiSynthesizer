@@ -4,6 +4,8 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../../store/app";
+import { useMsstModelStore } from "../../store/msst-models";
+import { applyMirror } from "../../lib/models/msst-catalog";
 import { useDraggable } from "../../lib/useDraggable";
 import "./Settings.css";
 
@@ -68,12 +70,51 @@ interface PyenvProgress {
   message: string;
 }
 
+/** Mirror of Rust `download::ProbeResult` — download-source throughput probe. */
+interface ProbeResult {
+  reachable: boolean;
+  verdict: string; // ok | slow | throttled | http_error | unreachable
+  mbps: number;
+  ttfb_ms: number;
+  bytes: number;
+  http_status?: number | null;
+  error?: string | null;
+}
+
+// A real published asset used only as the probe target (its host = the source being
+// tested). ~236 MB file → Range-GET of the first few MB measures real throughput.
+const PROBE_ASSET = "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-cpu-v1.tar.zst";
+
 const fmtGB = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.round(b / 1e6)} MB`);
 
 export function Settings({ onClose }: { onClose: () => void }) {
   const { i18n } = useTranslation();
   const lang = i18n.language;
   const { pos, startDrag } = useDraggable(() => ({ x: 72, y: 84 }));
+  // Download-source preference — the store is shared with the resource manager
+  // (which consumes `mirror` for model downloads); the CONFIG UI now lives here.
+  const mirror = useMsstModelStore((s) => s.mirror);
+  const setMirror = useMsstModelStore((s) => s.setMirror);
+  const [srcTest, setSrcTest] = useState<ProbeResult | null>(null);
+  const [srcTesting, setSrcTesting] = useState(false);
+  const handleSrcTest = useCallback(async () => {
+    setSrcTesting(true);
+    setSrcTest(null);
+    try {
+      // test the SELECTED source's host by pulling a few real MB through it — a
+      // ping/HEAD would pass the GFW's small-packet allowance and false-positive.
+      const url = applyMirror(PROBE_ASSET, mirror);
+      setSrcTest(await invoke<ProbeResult>("test_download_source", { url }));
+    } catch (e) {
+      setSrcTest({ reachable: false, verdict: "unreachable", mbps: 0, ttfb_ms: 0, bytes: 0, error: String(e) });
+    } finally {
+      setSrcTesting(false);
+    }
+  }, [mirror]);
+  // a stale verdict must not linger next to a different, untested source
+  useEffect(() => {
+    setSrcTest(null);
+  }, [mirror.type, mirror.customUrl]);
   const [hw, setHw] = useState<HardwareInfo | null>(null);
   const [device, setDevice] = useState("auto");
   const [saving, setSaving] = useState(false);
@@ -325,6 +366,19 @@ export function Settings({ onClose }: { onClose: () => void }) {
       rtNote: { zh: "模型转换与训练使用此内嵌运行时（无需系统 Python）。GPU 训练包（NVIDIA 20-50 系 / AMD / Intel）按阶段加入。", en: "Model conversion and training run on this embedded runtime (no system Python needed). GPU packs (NVIDIA 20-50 / AMD / Intel) arrive in stages.", ja: "モデル変換とトレーニングはこの内蔵ランタイムで実行されます。GPU 版は段階的に追加されます。" },
       rtRecommend: { zh: "本机推荐变体", en: "Recommended variant", ja: "推奨バリアント" },
       rtPackLabel_cpu: { zh: "CPU 运行时（模型转换基座 + CPU 训练）", en: "CPU runtime (model conversion base + CPU training)", ja: "CPU ランタイム（モデル変換基盤 + CPU トレーニング）" },
+      rtPackLabel_nv_cu130: { zh: "NVIDIA 运行时（cu130；RTX 20-50 训练 + 模型转换）", en: "NVIDIA runtime (cu130; RTX 20-50 training + conversion)", ja: "NVIDIA ランタイム（cu130；RTX 20-50 トレーニング + 変換）" },
+      srcTitle: { zh: "下载源 / 网络", en: "Download Source / Network", ja: "ダウンロードソース / ネットワーク" },
+      srcHF: { zh: "HuggingFace（默认）", en: "HuggingFace (default)", ja: "HuggingFace（既定）" },
+      srcMirror: { zh: "HF Mirror (hf-mirror.com) — 中国大陆加速", en: "HF Mirror (hf-mirror.com) — China mainland", ja: "HF Mirror (hf-mirror.com) — 中国本土" },
+      srcCustom: { zh: "自定义", en: "Custom", ja: "カスタム" },
+      srcNote: { zh: "声音 / 分离模型的下载来源，中国大陆建议选 HF Mirror。训练运行时包已自动在 HuggingFace 与镜像间回退，无需在此设置。", en: "Where voice/separation models download from — HF Mirror is recommended in mainland China. Runtime packs already auto-fail-over between HuggingFace and the mirror.", ja: "モデルのダウンロード元。中国本土では HF Mirror 推奨。トレーニングランタイムは自動でフェイルオーバーします。" },
+      srcTest: { zh: "测试连接", en: "Test connection", ja: "接続テスト" },
+      srcTesting: { zh: "测试中…", en: "Testing…", ja: "テスト中…" },
+      srcOk: { zh: "通畅", en: "Good", ja: "良好" },
+      srcSlow: { zh: "偏慢", en: "Slow", ja: "やや遅い" },
+      srcThrottled: { zh: "疑似被限速 / 干扰（大文件可能失败）", en: "Throttled / interfered (large downloads may fail)", ja: "スロットリング / 妨害の疑い（大容量は失敗する可能性）" },
+      srcUnreachable: { zh: "不通", en: "Unreachable", ja: "接続不可" },
+      srcHttpErr: { zh: "源拒绝 / 无测试文件", en: "Rejected / no test file", ja: "拒否 / テストファイルなし" },
     };
     return map[key]?.[lang] ?? map[key]?.en ?? key;
   };
@@ -336,6 +390,15 @@ export function Settings({ onClose }: { onClose: () => void }) {
     const key = `rtPackLabel_${c.variant.replace(/-/g, "_")}`;
     const v = L(key);
     return v === key ? c.label : v;
+  };
+
+  const srcTestLabel = (r: ProbeResult) => {
+    const speed = r.bytes > 0 ? ` · ${r.mbps.toFixed(2)} MB/s` : "";
+    if (r.verdict === "ok") return L("srcOk") + speed;
+    if (r.verdict === "slow") return L("srcSlow") + speed;
+    if (r.verdict === "throttled") return L("srcThrottled") + speed;
+    if (r.verdict === "http_error") return L("srcHttpErr") + (r.http_status ? ` (${r.http_status})` : "");
+    return L("srcUnreachable") + (r.error ? ` — ${r.error}` : "");
   };
 
   return (
@@ -357,7 +420,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
           </div>
         </section>
 
-        <section className="settings-section">
+        <section className="settings-section" style={{ marginTop: 16 }}>
           <h3 className="settings-section-title">{L("hardware")}</h3>
 
           {hw && (
@@ -419,6 +482,41 @@ export function Settings({ onClose }: { onClose: () => void }) {
           {relocateMsg === "migrated" && <p className="settings-note">{L("relocated")}</p>}
           {relocateMsg?.startsWith("error") && <p className="settings-note" style={{ color: "#f87171" }}>{relocateMsg}</p>}
           <p className="settings-note">{L("dataDirNote")}</p>
+        </section>
+
+        <section className="settings-section" style={{ marginTop: 16 }}>
+          <h3 className="settings-section-title">{L("srcTitle")}</h3>
+          <div className="settings-source">
+            {(["huggingface", "hf-mirror", "custom"] as const).map((t) => (
+              <label key={t} className={`settings-source-opt ${mirror.type === t ? "active" : ""}`}>
+                <input
+                  type="radio"
+                  name="dlsource"
+                  checked={mirror.type === t}
+                  onChange={() => setMirror({ type: t, customUrl: mirror.customUrl })}
+                />
+                <span>{t === "huggingface" ? L("srcHF") : t === "hf-mirror" ? L("srcMirror") : L("srcCustom")}</span>
+              </label>
+            ))}
+            {mirror.type === "custom" && (
+              <input
+                type="text"
+                className="settings-source-url"
+                placeholder="https://your-mirror.com"
+                value={mirror.customUrl}
+                onChange={(e) => setMirror({ type: "custom", customUrl: e.target.value })}
+              />
+            )}
+          </div>
+          <div className="settings-source-test">
+            <button className="settings-mini-btn" disabled={srcTesting} onClick={handleSrcTest}>
+              {srcTesting ? L("srcTesting") : L("srcTest")}
+            </button>
+            {srcTest && (
+              <span className={`settings-source-result ${srcTest.verdict}`}>{srcTestLabel(srcTest)}</span>
+            )}
+          </div>
+          <p className="settings-note">{L("srcNote")}</p>
         </section>
 
         <section className="settings-section" style={{ marginTop: 16 }}>

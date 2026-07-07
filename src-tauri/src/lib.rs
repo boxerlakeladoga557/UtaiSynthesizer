@@ -702,6 +702,7 @@ pub fn run() {
             commands::pyenv::cancel_runtime_install,
             commands::pyenv::delete_runtime_pack,
             commands::pyenv::run_pack_envtest,
+            commands::pyenv::test_download_source,
             commands::window::quit_app,
             commands::window::running_tasks,
             commands::window::set_tray_labels,

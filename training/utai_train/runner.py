@@ -22,9 +22,12 @@ def main():
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
-    gpu = cfg.get("gpu")
-    if gpu is not None and str(gpu) != "":
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    # device visibility MUST be set before torch is imported anywhere — the shim's
+    # setup_visibility is pure os.environ (no torch), backend-aware (cuda/xpu), and
+    # byte-identical to the old inline CUDA_VISIBLE_DEVICES for the cuda default.
+    from .device import setup_visibility
+
+    setup_visibility(cfg)
 
     from .protocol import Reporter
     from .stopfile import StopFlag, StopRequested

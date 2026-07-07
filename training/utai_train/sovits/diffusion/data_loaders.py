@@ -202,7 +202,7 @@ class AudioDataset(Dataset):
                 self.pitch_aug_dict[name_ext] = keyshift
 
                 path_units = name_ext + ".soft.pt"
-                units = torch.load(path_units).to(device)
+                units = torch.load(path_units, weights_only=False).to(device)
                 units = units[0]
                 units = repeat_expand_2d(units,f0.size(0),unit_interpolate_mode).transpose(0,1)
 
@@ -298,7 +298,7 @@ class AudioDataset(Dataset):
         units = data_buffer.get('units')
         if units is None:
             path_units = name_ext + ".soft.pt"
-            units = torch.load(path_units)
+            units = torch.load(path_units, weights_only=False)
             units = units[0]
             units = repeat_expand_2d(units,f0.size(0),self.unit_interpolate_mode).transpose(0,1)
 

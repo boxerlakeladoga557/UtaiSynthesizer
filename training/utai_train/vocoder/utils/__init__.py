@@ -168,7 +168,7 @@ def load_ckpt(
         )
     assert len(checkpoint_path) > 0, f'| ckpt not found in {ckpt_base_dir}.'
     checkpoint_path = checkpoint_path[-1]
-    ckpt_loaded = torch.load(checkpoint_path, map_location=device)
+    ckpt_loaded = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if key_in_ckpt is None:
         state_dict = ckpt_loaded
     else:

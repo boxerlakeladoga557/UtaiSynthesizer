@@ -115,7 +115,10 @@ class STFT():
         y = y.squeeze(1)
         
         spec = torch.stft(y, n_fft_new, hop_length=hop_length_new, win_length=win_size_new, window=self.hann_window[keyshift_key],
-                          center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=False)
+                          center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=True)
+        # return_complex=False is removed on the torch-2.11 axis; view_as_real is its
+        # exact expansion (last dim = [real, imag]) so the magnitude below is unchanged
+        spec = torch.view_as_real(spec)
         # print(111,spec)
         spec = torch.sqrt(spec.pow(2).sum(-1)+(1e-9))
         if keyshift != 0:

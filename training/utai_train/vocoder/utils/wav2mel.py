@@ -104,7 +104,7 @@ class PitchAdjustableMelSpectrogram:
 
 if __name__=='__main__':
     import glob
-    import torchaudio
+    import soundfile as sf
     from tqdm import tqdm
     # from concurrent.futures import ProcessPoolExecutor
     # import random
@@ -119,7 +119,11 @@ if __name__=='__main__':
     torch.set_num_threads(1)
 
     for i in tqdm(lll):
-        audio, sr = torchaudio.load(i)
+        # torchaudio.load routes through torchcodec+FFmpeg on the 2.9+ axis (not
+        # bundled); soundfile's PCM16->float32 is the same normalization. This is a
+        # dead __main__ demo — the runtime loads audio via librosa (process_sv.py).
+        data, sr = sf.read(i, dtype='float32', always_2d=True)  # [frames, channels]
+        audio = torch.from_numpy(data.T.copy())                 # [channels, frames]
         audio = torch.clamp(audio[0], -1.0, 1.0)
 
         mel_spec_transform=PitchAdjustableMelSpectrogram()

@@ -262,6 +262,142 @@ async fn stream_one(
     Ok(())
 }
 
+// ─── connection probe (download-source health test, S43) ─────────────────────
+
+/// Result of a download-source throughput probe. Deliberately a REAL transfer, not a
+/// ping/HEAD: the GFW commonly lets small packets through the handshake but throttles
+/// or resets sustained transfers, so a ping/HEAD false-positives ("放小包不放打包").
+#[derive(serde::Serialize)]
+pub struct ProbeResult {
+    /// Got enough bytes to call the transfer real (not a reset-after-handshake).
+    pub reachable: bool,
+    /// "ok" | "slow" | "throttled" | "http_error" | "unreachable"
+    pub verdict: String,
+    pub mbps: f64,
+    pub ttfb_ms: u64,
+    pub bytes: u64,
+    pub http_status: Option<u16>,
+    pub error: Option<String>,
+}
+
+/// Probe `url` by transferring its first ~4 MB and measuring SUSTAINED throughput.
+/// 4 MB is chosen to cross the GFW's small-packet allowance — a HEAD/small GET passes
+/// even when big downloads get throttled/reset. Bounded by a 15 s total window and a
+/// 5 s per-read stall: a slow-but-progressing link reports a low mbps (not an error);
+/// a black-holed/reset one reports few bytes → "throttled"/"unreachable".
+pub async fn probe(url: &str) -> ProbeResult {
+    use futures_util::StreamExt;
+    const WANT: u64 = 4_000_000;
+    const TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+    const READ_STALL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let unreachable = |e: String| ProbeResult {
+        reachable: false,
+        verdict: "unreachable".into(),
+        mbps: 0.0,
+        ttfb_ms: 0,
+        bytes: 0,
+        http_status: None,
+        error: Some(e),
+    };
+    let client = match client() {
+        Ok(c) => c,
+        Err(e) => return unreachable(e.to_string()),
+    };
+    let t0 = std::time::Instant::now();
+    // The header-wait must honor the total window too: a source that accepts the TCP/TLS
+    // handshake but black-holes the HTTP response (a classic interference pattern) would
+    // otherwise hang on the client's 60 s read_timeout, ~4x past the advertised 15 s.
+    let send_fut = client
+        .get(url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", WANT - 1))
+        .send();
+    let resp = match tokio::time::timeout(TOTAL_DEADLINE, send_fut).await {
+        Err(_) => return unreachable("连接 / 响应超时（可能被网络干扰或源不可达）".to_string()),
+        Ok(Err(e)) => {
+            let msg = if e.is_timeout() {
+                "连接超时（可能被网络干扰或源不可达）".to_string()
+            } else if e.is_connect() {
+                "无法建立连接（DNS / 网络 / 被阻断）".to_string()
+            } else {
+                format!("{e}")
+            };
+            return unreachable(msg);
+        }
+        Ok(Ok(r)) => r,
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        return ProbeResult {
+            reachable: false,
+            verdict: "http_error".into(),
+            mbps: 0.0,
+            ttfb_ms: t0.elapsed().as_millis() as u64,
+            bytes: 0,
+            http_status: Some(status.as_u16()),
+            error: Some(format!("HTTP {} —— 源上没有测试文件或拒绝访问", status.as_u16())),
+        };
+    }
+    let ttfb = t0.elapsed();
+    let mut bytes: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    // How the transfer ENDED matters as much as the byte count: a stream Err/None/stall
+    // BEFORE WANT is the "burst then cut" pattern (>200 KB delivered fast, then RST) —
+    // a real multi-GB download would fail the same way, so it must NOT grade ok/slow.
+    // Only a deadline break at the top of the loop = "genuinely slow but progressing".
+    let mut early_cut = false;
+    loop {
+        if t0.elapsed() > TOTAL_DEADLINE {
+            break;
+        }
+        match tokio::time::timeout(READ_STALL, stream.next()).await {
+            Ok(Some(Ok(c))) => {
+                bytes += c.len() as u64;
+                if bytes >= WANT {
+                    break;
+                }
+            }
+            Ok(Some(Err(_))) => {
+                early_cut = true;
+                break;
+            } // stream reset mid-transfer
+            Ok(None) => {
+                early_cut = true;
+                break;
+            } // stream ended before WANT
+            Err(_) => {
+                early_cut = true;
+                break;
+            } // 5 s with no chunk = stopped delivering
+        }
+    }
+    let reached = bytes >= WANT;
+    let elapsed = t0.elapsed().as_secs_f64().max(0.001);
+    let mbps = (bytes as f64 / 1_000_000.0) / elapsed;
+    let verdict = if bytes < 200_000 {
+        "throttled" // barely any data past the handshake (放小包不放打包)
+    } else if early_cut && !reached {
+        "throttled" // burst then cut short — the exact false-positive this probe catches
+    } else if mbps < 0.1 {
+        "throttled"
+    } else if mbps < 1.0 {
+        "slow"
+    } else {
+        "ok"
+    };
+    ProbeResult {
+        // reachable = delivered the full sample, or was still progressing at the deadline
+        // (slow but usable). A cut-short transfer is NOT reachable.
+        reachable: reached || (!early_cut && bytes >= 200_000),
+        verdict: verdict.into(),
+        mbps,
+        ttfb_ms: ttfb.as_millis() as u64,
+        bytes,
+        http_status: Some(status.as_u16()),
+        error: None,
+    }
+}
+
 /// A `Read` that concatenates several files in order — lets multi-part pack archives
 /// stream straight into zstd+tar without materializing a joined copy on disk.
 pub struct MultiFileReader {

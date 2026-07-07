@@ -490,3 +490,14 @@ async fn run_envtest_inner(
         )),
     }
 }
+
+/// Download-source connection test (S43) — a REAL few-MB transfer, not a ping/HEAD
+/// (which false-positives under GFW small-packet passthrough: it lets the handshake +
+/// small responses through, then throttles/resets sustained transfers). `url` is the
+/// mirror-resolved URL of a real published asset (the frontend applies the mirror
+/// transform). Never errors — the ProbeResult carries the reason so the UI shows
+/// "通畅 / 偏慢 / 疑似被限速 / 不通" instead of a toast.
+#[tauri::command]
+pub async fn test_download_source(url: String) -> crate::download::ProbeResult {
+    crate::download::probe(&url).await
+}

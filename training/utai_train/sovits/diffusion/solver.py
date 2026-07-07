@@ -42,9 +42,8 @@ import time
 import librosa
 import numpy as np
 import torch
-from torch import autocast
-from torch.cuda.amp import GradScaler
 
+from ... import device as device_shim  # aliased for consistency + collision-safety (see rvc/sovits trainers)
 from .logger import utils
 from .logger.saver import Saver
 
@@ -218,7 +217,7 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder,
     num_batches = len(loader_train)
     model.train()
     saver.log_info('======= start training =======')
-    scaler = GradScaler()
+    scaler = device_shim.make_scaler(args.device, True)
     if args.train.amp_dtype == 'fp32':
         dtype = torch.float32
     elif args.train.amp_dtype == 'fp16':
@@ -249,7 +248,7 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder,
                 loss = model(data['units'].float(), data['f0'], data['volume'], data['spk_id'],
                                 aug_shift = data['aug_shift'], gt_spec=data['mel'].float(), infer=False, k_step=model.k_step_max)
             else:
-                with autocast(device_type=args.device, dtype=dtype):
+                with device_shim.autocast(args.device, dtype=dtype):
                     loss = model(data['units'], data['f0'], data['volume'], data['spk_id'],
                                     aug_shift = data['aug_shift'], gt_spec=data['mel'], infer=False, k_step=model.k_step_max)
 

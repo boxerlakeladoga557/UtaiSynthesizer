@@ -351,7 +351,7 @@ def _seed_base_model(expdir, pretrain_path, reporter):
         return
     dst = os.path.join(expdir, "model_0.pt")
     tmp = dst + ".tmp"
-    ckpt = torch.load(pretrain_path, map_location="cpu")
+    ckpt = torch.load(pretrain_path, map_location="cpu", weights_only=False)
     if not isinstance(ckpt, dict) or "model" not in ckpt:
         raise RuntimeError("扩散底模格式不符（缺少 'model' 键）: %s" % pretrain_path)
     if int(ckpt.get("global_step") or 0) == 0 and "optimizer" not in ckpt:

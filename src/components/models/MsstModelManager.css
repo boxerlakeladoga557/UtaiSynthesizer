@@ -424,68 +424,6 @@
   background: rgba(255, 184, 108, 0.05);
 }
 
-.rm-top-spacer { flex: 1; }
-
-.rm-mirror-btn {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  white-space: nowrap;
-}
-
-.rm-mirror-config {
-  padding: var(--space-md) var(--space-lg);
-  border-bottom: 1px solid var(--border-subtle);
-  background: var(--bg-base);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-sm);
-  font-size: var(--font-size-xs);
-}
-
-.rm-mirror-title {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  color: var(--text-secondary);
-  font-weight: 600;
-  margin-bottom: var(--space-xs);
-}
-
-.rm-mirror-close {
-  background: none;
-  border: none;
-  color: var(--text-muted);
-  font-size: 10px;
-  padding: 0;
-  width: 16px;
-  height: 16px;
-}
-
-.rm-mirror-config label {
-  display: flex;
-  align-items: center;
-  gap: var(--space-sm);
-  color: var(--text-secondary);
-  cursor: pointer;
-  padding: 2px 0;
-}
-
-.rm-mirror-config label.active {
-  color: var(--accent-primary);
-}
-
-.rm-mirror-config input[type="radio"] {
-  accent-color: var(--accent-primary);
-  margin: 0;
-}
-
-.rm-mirror-url {
-  margin-left: 20px;
-  padding: 2px var(--space-sm);
-  font-size: var(--font-size-xs);
-  font-family: var(--font-mono);
-}
-
 .rm-voice-placeholder {
   flex: 1;
   display: flex;

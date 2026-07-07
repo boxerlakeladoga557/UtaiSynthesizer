@@ -1155,6 +1155,22 @@ fn run_worker(
         let _ = app.emit("training-stage", &stage);
     }
 
+    // resolve the training interpreter + its device backend up front: dev venv →
+    // installed runtime pack (the pack VARIANT fixes the backend) → manual slot →
+    // bare python. device_backend feeds device.py's shim via run.json below.
+    let (python, device_backend) = crate::pyenv::training_interpreter(app_dir, req.force_cpu);
+    // Silent GPU→CPU downgrade guard (S43 review): the user didn't force CPU (so they
+    // asked for their GPU) yet the resolved backend is "cpu" — the ONLY way that happens
+    // is a CPU-only runtime pack installed on a GPU box (the dev venv and every GPU pack
+    // yield "cuda"). Silent slow-training is the user's #1 pain, so say it loudly (the
+    // fuller "gate the GPU option / prompt to install the GPU pack" is the release
+    // gating dialog — see pending_cleanups).
+    if !req.force_cpu && device_backend == "cpu" {
+        tracing::warn!(
+            "训练运行时是 CPU 版：本次将用 CPU 训练（很慢）。如需 GPU，请到 设置 → 训练环境 安装对应显卡的运行时包。"
+        );
+    }
+
     // ---- run config for the sidecar ----
     let run_config = serde_json::json!({
         "backend": req.backend,
@@ -1195,6 +1211,12 @@ fn run_worker(
         // Windows cannot hold an EMPTY env var (empty = deleted = all GPUs
         // visible) — CPU mode must be the explicit sentinel "-1"
         "gpu": if req.force_cpu { "-1".to_string() } else { req.gpu.to_string() },
+        // device.py's shim reads this BEFORE torch import (visibility) and to pick
+        // autocast/scaler. Sourced from the resolved interpreter: dev venv → the box's
+        // GPU (cuda) or force_cpu; installed pack → its variant (nv-cu130/amd->cuda,
+        // xpu->xpu, cpu->cpu). Absent field => shim defaults to cuda-with-availability-
+        // fallback, so a pre-Phase-B run.json stays valid.
+        "device_backend": device_backend,
         "stop_file": stop_file,
         "pretrain_g": ctx.pretrain_g,
         "pretrain_d": ctx.pretrain_d,
@@ -1218,7 +1240,7 @@ fn run_worker(
         return abort_finish(inner, app);
     }
     let training_dir = app_dir.join("training");
-    let python = crate::util::find_python(&training_dir, app_dir);
+    // `python` was resolved above by training_interpreter (dev venv / installed pack)
     tracing::info!(
         "spawning training sidecar: {} -m utai_train.runner --config {}",
         python.display(),

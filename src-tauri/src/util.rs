@@ -1,30 +1,10 @@
 use std::path::{Path, PathBuf};
 
-/// Resolve the Python interpreter for the TRAINING sidecar. Priority:
-///   1. the tool's own venv:        `<venv_dir>/.venv/Scripts/python.exe`
-///   2. the manual portable slot:    `<app_dir>/python/python.exe`
-///   3. the system `python` on PATH (dev fallback)
-///
-/// `venv_dir` is the directory CONTAINING `.venv` (e.g. `app_dir/training`), NOT the `.venv` itself.
-/// S42: the CONVERTER role moved to `crate::pyenv::converter_python` (venv → installed runtime
-/// packs → manual slot → PATH); training deliberately does NOT consult runtime packs yet — the
-/// vendored training code is only validated against packs after the Phase B torch-axis migration
-/// (running it on a 2.11 pack before that would break at the first weights_only torch.load).
-pub fn find_python(venv_dir: &Path, app_dir: &Path) -> PathBuf {
-    let venv = venv_dir.join(".venv").join("Scripts").join("python.exe");
-    if venv.exists() {
-        return venv;
-    }
-    let embedded = manual_python_slot(app_dir);
-    if embedded.exists() {
-        return embedded;
-    }
-    PathBuf::from("python")
-}
-
 /// The manual portable-python slot `<app_dir>/python/python.exe` — ONE definition
-/// shared by `find_python` (training) and `pyenv::converter_python` (converter), so
-/// the two roles can never drift onto different "manual slot" locations.
+/// shared by `pyenv::training_interpreter` (training) and `pyenv::converter_python`
+/// (converter), so the two roles can never drift onto different "manual slot"
+/// locations. (Phase B retired the role-agnostic `find_python` once training moved to
+/// pyenv's variant-aware resolver — the same move the converter made in S42.)
 pub fn manual_python_slot(app_dir: &Path) -> PathBuf {
     app_dir.join("python").join("python.exe")
 }
