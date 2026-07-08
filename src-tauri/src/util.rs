@@ -36,6 +36,18 @@ pub fn python_command(python: &Path) -> std::process::Command {
     cmd.env_remove("PYTHONHOME");
     cmd.env_remove("PYTHONPATH");
     cmd.env("PYTHONNOUSERSITE", "1");
+    // AMD/ROCm (MIOpen) tuning — read ONLY by the rocm torch build; NVIDIA (cuDNN),
+    // CPU and Intel/XPU ignore these, so setting them once in the single spawn helper
+    // is harmless everywhere else and keeps them out of every call site (S44).
+    //   FIND_MODE=5 (FastHybrid): gfx1103 ships no precompiled conv DB (rocm #6335), so
+    //     the default exhaustive kernel search is slow / can hang on first encounter —
+    //     this bounds it (community-verified on the 780M; validated in the S44 dogfood).
+    //   LOG_LEVEL=3 (Error): mute MIOpen's one-time first-step "IsEnoughWorkspace /
+    //     CK grouped conv" Warning burst (~70 lines) that would otherwise crowd the
+    //     200-line stderr ring; real Error/Fatal still surface. (xnack device-cap notice
+    //     is a HIP-runtime line, not MIOpen — a harmless 2-liner this doesn't touch.)
+    cmd.env("MIOPEN_FIND_MODE", "5");
+    cmd.env("MIOPEN_LOG_LEVEL", "3");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
