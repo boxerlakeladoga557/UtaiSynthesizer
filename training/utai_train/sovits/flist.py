@@ -43,15 +43,37 @@ def _p(path):
     return path.replace("\\", "/")
 
 
-def build_filelists(exp_dir, spk, dataset_44k_dir, seed, reporter):
-    """Slice collection + seeded train/val split + filelist write — the shared
-    half of build_flist_and_config (the diffusion pipeline rebuilds filelists
-    every run but must NOT rewrite an existing main config.json, so this half
-    stands alone). Returns (train_list, val_list, n_train, n_val)."""
-    # stage name "filelist" matches the RVC trainer's — the UI label is shared
-    reporter.stage("filelist", message="生成训练清单与配置")
+def resolve_speakers(cfg):
+    """THE single source of speaker identity + id ordering for a run (①c
+    multi-speaker co-training). Returns an ORDERED list of
+    {name(display), slug(ascii dir/config key), dataset_dir(raw audio)}; the
+    list index IS the speaker id, so config.spk / cluster filenames / the
+    exported sidecar all agree by construction. The order is authoritative and
+    the Rust side freezes it in the run manifest (resume-immutable).
 
-    spk_dir = os.path.join(dataset_44k_dir, spk)
+    Single-speaker (the overwhelming case, and every existing caller / gate):
+    cfg has no "speakers" key -> a 1-element list built from the flat
+    dataset_dir + model_slug, which makes build_config/build_filelists/cluster
+    emit BYTE-IDENTICAL output to the pre-①c code (slug key, id 0)."""
+    spks = cfg.get("speakers")
+    if spks:
+        return [
+            {"name": s["name"], "slug": s["slug"], "dataset_dir": s["dataset_dir"]}
+            for s in spks
+        ]
+    return [{
+        "name": cfg.get("model_name") or cfg["model_slug"],
+        "slug": cfg["model_slug"],
+        "dataset_dir": cfg["dataset_dir"],
+    }]
+
+
+def _split_speaker(dataset_44k_dir, spk_slug, seed):
+    """One speaker's slice pool -> (train, val) with the exact pre-①c seeded
+    split + S41 aug protocol. Extracted verbatim from build_filelists so the
+    single-speaker path stays byte-identical while multi-speaker reuses it per
+    speaker (id ordering / val-per-speaker owned by the caller)."""
+    spk_dir = os.path.join(dataset_44k_dir, spk_slug)
     wavs = []
     augs = []
     for file_name in sorted(os.listdir(spk_dir)):
@@ -66,11 +88,11 @@ def build_filelists(exp_dir, spk, dataset_44k_dir, seed, reporter):
         (augs if is_aug_name(file_name) else wavs).append(file_path)
 
     # the 3-slice floor is judged on ORIGINALS — aug copies must not rescue a
-    # dataset that is too small to split honestly
+    # dataset that is too small to split honestly (per speaker for multi)
     if len(wavs) < 3:
         raise RuntimeError(
-            "切片后可用样本只有 %d 个（至少需要 3 个：2 个验证 + 1 个训练）。"
-            "请提供更长的干声素材" % len(wavs)
+            "说话人 %s 切片后可用样本只有 %d 个（至少需要 3 个：2 个验证 + 1 个训练）。"
+            "请提供更长的干声素材" % (spk_slug, len(wavs))
         )
 
     rng = random.Random(seed)
@@ -85,19 +107,52 @@ def build_filelists(exp_dir, spk, dataset_44k_dir, seed, reporter):
         # val split/order under ANY copies stay identical to baseline
         train = train + augs
         random.Random("%s|aug-train" % seed).shuffle(train)
+    return train, val
+
+
+def build_filelists(exp_dir, spk, dataset_44k_dir, seed, reporter, speakers=None):
+    """Slice collection + seeded train/val split + filelist write — the shared
+    half of build_flist_and_config (the diffusion pipeline rebuilds filelists
+    every run but must NOT rewrite an existing main config.json, so this half
+    stands alone). Returns (train_list, val_list, n_train, n_val).
+
+    ①c: `speakers` (resolve_speakers list) drives multi-speaker co-training —
+    each speaker gets its OWN val slices (a global first-2 split could leave a
+    speaker unvalidated) and the concatenated train pool is interleaved across
+    speakers (the DataLoader runs shuffle=False, so speaker-contiguous batches
+    would starve gradient mixing). `speakers=None` (every existing caller/gate)
+    falls back to the single `spk` slug and skips the cross-speaker shuffle —
+    BYTE-IDENTICAL to the pre-①c output."""
+    # stage name "filelist" matches the RVC trainer's — the UI label is shared
+    reporter.stage("filelist", message="生成训练清单与配置")
+
+    if speakers is None:
+        speakers = [{"slug": spk}]
+
+    all_train = []
+    all_val = []
+    for sp in speakers:
+        train, val = _split_speaker(dataset_44k_dir, sp["slug"], seed)
+        all_train += train
+        all_val += val
+
+    # cross-speaker interleave — guarded so a single speaker never reaches it
+    # (keeps the single-speaker filelist byte-identical to the pre-①c split)
+    if len(speakers) > 1:
+        random.Random("%s|spk-order" % seed).shuffle(all_train)
 
     flist_dir = os.path.join(exp_dir, "filelists")
     os.makedirs(flist_dir, exist_ok=True)
     train_list = os.path.join(flist_dir, "train.txt")
     val_list = os.path.join(flist_dir, "val.txt")
     with open(train_list, "w", encoding="utf-8") as f:
-        for fname in train:
+        for fname in all_train:
             f.write(fname + "\n")
     with open(val_list, "w", encoding="utf-8") as f:
-        for fname in val:
+        for fname in all_val:
             f.write(fname + "\n")
-    logger.info("filelists written: %d train / %d val", len(train), len(val))
-    return train_list, val_list, len(train), len(val)
+    logger.info("filelists written: %d train / %d val", len(all_train), len(all_val))
+    return train_list, val_list, len(all_train), len(all_val)
 
 
 def build_config(
@@ -113,6 +168,7 @@ def build_config(
     all_in_mem,
     seed,
     configs_dir,
+    speakers=None,     # ①c: resolve_speakers list -> multi-speaker spk map / n_speakers
 ):
     """config.json only — the filelist PATHS it references are static
     (<exp_dir>/filelists/{train,val}.txt), so the config can be written before
@@ -131,8 +187,16 @@ def build_config(
     ) as f:
         config = json.load(f)
 
-    config["spk"] = {spk: 0}
-    config["model"]["n_speakers"] = 1
+    # ①c: config.spk is keyed by the ASCII dir SLUG — the data loader resolves a
+    # slice's speaker from its parent directory name (data_utils.py:70), so the
+    # keys here MUST be the dataset_44k subdir slugs, id = list order. The
+    # release config (train.py) swaps these for display names for the sidecar.
+    if speakers is None:
+        config["spk"] = {spk: 0}
+        config["model"]["n_speakers"] = 1
+    else:
+        config["spk"] = {sp["slug"]: i for i, sp in enumerate(speakers)}
+        config["model"]["n_speakers"] = len(speakers)
     config["model"]["speech_encoder"] = encoder
     if encoder == "vec768l12":
         config["model"]["ssl_dim"] = config["model"]["filter_channels"] = config[

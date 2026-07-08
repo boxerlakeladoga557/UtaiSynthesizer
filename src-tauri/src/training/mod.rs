@@ -60,6 +60,14 @@ pub(crate) fn backend_family(backend: &str) -> &str {
     }
 }
 
+/// ①c one co-trained speaker: a display name + its own audio files. The id
+/// (emb_g row / config.spk value) is the group's index in the request order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeakerGroup {
+    pub name: String,
+    pub files: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartTrainingRequest {
     pub model_name: String,
@@ -70,6 +78,12 @@ pub struct StartTrainingRequest {
     /// rvc: "32k" | "40k" | "48k" — sovits/vocoder: fixed "44k"
     pub sample_rate: String,
     pub dataset_files: Vec<String>,
+    /// ①c multi-speaker co-training (SoVITS-only for now). Empty or 1 group =
+    /// single-speaker = the byte-identical legacy path (uses dataset_files).
+    /// >1 groups = per-speaker subdir import + run.json "speakers"; the emb_g
+    /// speaker id is the group's index (list order, frozen in the manifest).
+    #[serde(default)]
+    pub speakers: Vec<SpeakerGroup>,
     pub total_epoch: u32,
     pub batch_size: u32,
     #[serde(default = "d_save_every")]
@@ -349,6 +363,30 @@ fn slugify(name: &str) -> String {
     format!("{}_{:08x}", base, h.finish() as u32)
 }
 
+/// ①c deterministic ASCII slug per co-trained speaker — the slug is the
+/// dataset_44k subdir name AND the config.spk key AND (by list order) the
+/// emb_g id, so it MUST be stable across resume (frozen in the manifest) and
+/// unique (two speakers sharing a subdir would clobber each other's slices).
+/// slugify already hash-suffixes so distinct names rarely collide; dedupe
+/// defensively (identical slugs -> _2, _3 …). Returns (display_name, slug) in
+/// request order — do NOT sort (id order is authoritative).
+fn assign_speaker_slugs(speakers: &[SpeakerGroup]) -> Vec<(String, String)> {
+    let mut used = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(speakers.len());
+    for sp in speakers {
+        let base = slugify(&sp.name);
+        let mut slug = base.clone();
+        let mut n = 2;
+        while used.contains(&slug) {
+            slug = format!("{}_{}", base, n);
+            n += 1;
+        }
+        used.insert(slug.clone());
+        out.push((sp.name.clone(), slug));
+    }
+    out
+}
+
 impl TrainingManager {
     pub fn new(app_dir: PathBuf) -> Self {
         Self {
@@ -540,7 +578,42 @@ impl TrainingManager {
         if req.model_name.trim().is_empty() {
             return Err(UtaiError::Training("模型名不能为空".into()));
         }
-        if req.dataset_files.is_empty() {
+
+        // ①c multi-speaker co-training (>1 group): the dataset lives in the
+        // per-speaker `speakers` files, NOT dataset_files, so validate those and
+        // skip the single-speaker empty-dataset gate below. Single-speaker (0 or
+        // 1 group) falls through to the byte-identical legacy path.
+        let is_multi = req.speakers.len() > 1;
+        if is_multi {
+            if req.backend != "sovits" {
+                return Err(UtaiError::Training(
+                    "多说话人共训暂仅支持 SoVITS（RVC 待后续）".into(),
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for sp in &req.speakers {
+                let name = sp.name.trim();
+                if name.is_empty() {
+                    return Err(UtaiError::Training("每个说话人都必须有名字".into()));
+                }
+                if !seen.insert(name.to_string()) {
+                    // duplicate display names would collapse the release config's
+                    // spk dict (train.py) -> a missing sidecar speaker
+                    return Err(UtaiError::Training(format!(
+                        "说话人名字重复：{}（多说话人共训要求名字唯一）",
+                        name
+                    )));
+                }
+                if sp.files.is_empty() {
+                    return Err(UtaiError::Training(format!("说话人「{}」没有数据文件", name)));
+                }
+                for f in &sp.files {
+                    if !Path::new(f).is_file() {
+                        return Err(UtaiError::Training(format!("数据文件不存在: {}", f)));
+                    }
+                }
+            }
+        } else if req.dataset_files.is_empty() {
             // 共享池模式（S41 用户裁定）：浅扩散与主训练共享 dataset/dataset_44k
             // 切片池——宿主工作区已有完整导入时无须重新导入数据。其余后端一律
             // 拒绝（这是防「空数据逃课」的权威闸门，前端禁用只是第一道线）。
@@ -826,6 +899,42 @@ impl TrainingManager {
                             )));
                         }
                     }
+                    // ①c: n_speakers + the ordered speaker set are baked into the
+                    // emb_g rows — resuming with a different count / order / set
+                    // would silently mis-assign every speaker's timbre. Immutable.
+                    // (Old single-speaker manifests have no n_speakers key -> 1,
+                    // which matches a single-speaker resume = no false rejection.)
+                    let old_n = old["n_speakers"].as_u64().unwrap_or(1);
+                    let cur_n = if req.speakers.len() > 1 {
+                        req.speakers.len() as u64
+                    } else {
+                        1
+                    };
+                    if old_n != cur_n {
+                        return Err(UtaiError::Training(format!(
+                            "说话人数量与原工作区不一致（原 {} 现 {}）：多说话人共训必须沿用，或选择重训",
+                            old_n, cur_n
+                        )));
+                    }
+                    if cur_n > 1 {
+                        let old_slugs: Vec<String> = old["speakers"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let cur_slugs: Vec<String> = assign_speaker_slugs(&req.speakers)
+                            .into_iter()
+                            .map(|(_, s)| s)
+                            .collect();
+                        if old_slugs != cur_slugs {
+                            return Err(UtaiError::Training(
+                                "说话人集合或顺序与原工作区不一致：多说话人共训必须沿用同样的说话人与顺序，或选择重训".into(),
+                            ));
+                        }
+                    }
                 }
                 // k_step_max pins the diffusion TRAINING distribution (t ~
                 // [0,k)) and the exported sidecar contract — resuming across a
@@ -912,6 +1021,17 @@ impl TrainingManager {
             // wipe the shared caches AND desync the diffusion training domain
             // from the main model's)
             manifest["loudnorm"] = serde_json::json!(req.loudnorm);
+            // ①c: freeze the speaker count + ordered slug set (resume-immutable,
+            // guarded above). Only written for a genuine co-training (>1) so a
+            // single-speaker manifest stays byte-identical to pre-①c.
+            if req.speakers.len() > 1 {
+                let slugs: Vec<String> = assign_speaker_slugs(&req.speakers)
+                    .into_iter()
+                    .map(|(_, s)| s)
+                    .collect();
+                manifest["n_speakers"] = serde_json::json!(slugs.len());
+                manifest["speakers"] = serde_json::json!(slugs);
+            }
         }
         if req.backend != "sovits_diff" {
             // S41: recorded for every non-diff backend; the sovits value is
@@ -1103,56 +1223,113 @@ fn run_worker(
 ) -> Result<()> {
     // ---- stage: import the dataset into the ASCII workspace ----
     let dataset_dir = workspace.join("dataset");
-    if req.dataset_files.is_empty() {
-        // shared-pool reuse (only sovits_diff reaches here — start() validated
-        // the pool): dataset/ and dataset.fingerprint stay UNTOUCHED, so the
-        // python side reads an unchanged dataset and takes the cache-reuse
-        // path — wiping here would destroy the very pool being shared
-        let stage = StageInfo {
-            stage: "import".into(),
-            done: Some(1),
-            total: Some(1),
-            progress: Some(1.0),
-            message: Some("复用共享切片池（未重新导入）".into()),
-        };
-        inner.snapshot.lock().stage = Some(stage.clone());
-        let _ = app.emit("training-stage", &stage);
-    } else {
+    // ①c: >1 speaker group = per-speaker subdir import; else the pre-①c flat
+    // (or shared-pool) path, verbatim. run_speakers is filled only for multi
+    // and becomes run.json "speakers" so the sovits pipeline co-trains them.
+    let is_multi = req.speakers.len() > 1;
+    let mut run_speakers: Vec<serde_json::Value> = Vec::new();
+    if is_multi {
+        // import EACH speaker's files into dataset/<slug>/ (000..N per speaker,
+        // sorted — same deterministic-order + fingerprint rationale as the flat
+        // path). The pipeline slices each subdir into dataset_44k/<slug> and the
+        // loader derives the emb_g id from the dir name, so these slugs MUST
+        // match the manifest — assign_speaker_slugs is deterministic on the
+        // same request.
         if dataset_dir.exists() {
             std::fs::remove_dir_all(&dataset_dir)?;
         }
         std::fs::create_dir_all(&dataset_dir)?;
-    }
-    // deterministic import order: the workspace copies are named 000..N in
-    // list order and the extraction-cache fingerprint hashes name+content, so
-    // the same SELECTION re-picked in a different dialog order must not read
-    // as "dataset changed" (which would silently re-extract everything —
-    // exactly the cache-reuse promise the diffusion card is built on)
-    let mut dataset_files = req.dataset_files.clone();
-    dataset_files.sort();
-    let total = dataset_files.len();
-    for (i, f) in dataset_files.iter().enumerate() {
-        if inner.abort.load(Ordering::SeqCst) {
-            return abort_finish(inner, app);
+        let assigned = assign_speaker_slugs(&req.speakers);
+        let total: usize = req.speakers.iter().map(|s| s.files.len()).sum();
+        let mut done = 0usize;
+        for (gi, (name, slug)) in assigned.iter().enumerate() {
+            let sub = dataset_dir.join(slug);
+            std::fs::create_dir_all(&sub)?;
+            let mut files = req.speakers[gi].files.clone();
+            files.sort();
+            for (i, f) in files.iter().enumerate() {
+                if inner.abort.load(Ordering::SeqCst) {
+                    return abort_finish(inner, app);
+                }
+                let src = Path::new(f);
+                let ext = src
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("wav")
+                    .to_ascii_lowercase();
+                let dst = sub.join(format!("{:03}.{}", i, ext));
+                std::fs::copy(src, &dst).map_err(|e| {
+                    UtaiError::Training(format!("导入数据 {} 失败: {}", src.display(), e))
+                })?;
+                done += 1;
+                let stage = StageInfo {
+                    stage: "import".into(),
+                    done: Some(done as u64),
+                    total: Some(total as u64),
+                    progress: Some(done as f32 / total.max(1) as f32),
+                    message: src.file_name().map(|n| n.to_string_lossy().into_owned()),
+                };
+                inner.snapshot.lock().stage = Some(stage.clone());
+                let _ = app.emit("training-stage", &stage);
+            }
+            run_speakers.push(serde_json::json!({
+                "name": name,
+                "slug": slug,
+                "dataset_dir": sub,
+            }));
         }
-        let src = Path::new(f);
-        let ext = src
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("wav")
-            .to_ascii_lowercase();
-        let dst = dataset_dir.join(format!("{:03}.{}", i, ext));
-        std::fs::copy(src, &dst)
-            .map_err(|e| UtaiError::Training(format!("导入数据 {} 失败: {}", src.display(), e)))?;
-        let stage = StageInfo {
-            stage: "import".into(),
-            done: Some((i + 1) as u64),
-            total: Some(total as u64),
-            progress: Some((i + 1) as f32 / total as f32),
-            message: src.file_name().map(|n| n.to_string_lossy().into_owned()),
-        };
-        inner.snapshot.lock().stage = Some(stage.clone());
-        let _ = app.emit("training-stage", &stage);
+    } else {
+        if req.dataset_files.is_empty() {
+            // shared-pool reuse (only sovits_diff reaches here — start() validated
+            // the pool): dataset/ and dataset.fingerprint stay UNTOUCHED, so the
+            // python side reads an unchanged dataset and takes the cache-reuse
+            // path — wiping here would destroy the very pool being shared
+            let stage = StageInfo {
+                stage: "import".into(),
+                done: Some(1),
+                total: Some(1),
+                progress: Some(1.0),
+                message: Some("复用共享切片池（未重新导入）".into()),
+            };
+            inner.snapshot.lock().stage = Some(stage.clone());
+            let _ = app.emit("training-stage", &stage);
+        } else {
+            if dataset_dir.exists() {
+                std::fs::remove_dir_all(&dataset_dir)?;
+            }
+            std::fs::create_dir_all(&dataset_dir)?;
+        }
+        // deterministic import order: the workspace copies are named 000..N in
+        // list order and the extraction-cache fingerprint hashes name+content, so
+        // the same SELECTION re-picked in a different dialog order must not read
+        // as "dataset changed" (which would silently re-extract everything —
+        // exactly the cache-reuse promise the diffusion card is built on)
+        let mut dataset_files = req.dataset_files.clone();
+        dataset_files.sort();
+        let total = dataset_files.len();
+        for (i, f) in dataset_files.iter().enumerate() {
+            if inner.abort.load(Ordering::SeqCst) {
+                return abort_finish(inner, app);
+            }
+            let src = Path::new(f);
+            let ext = src
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("wav")
+                .to_ascii_lowercase();
+            let dst = dataset_dir.join(format!("{:03}.{}", i, ext));
+            std::fs::copy(src, &dst)
+                .map_err(|e| UtaiError::Training(format!("导入数据 {} 失败: {}", src.display(), e)))?;
+            let stage = StageInfo {
+                stage: "import".into(),
+                done: Some((i + 1) as u64),
+                total: Some(total as u64),
+                progress: Some((i + 1) as f32 / total as f32),
+                message: src.file_name().map(|n| n.to_string_lossy().into_owned()),
+            };
+            inner.snapshot.lock().stage = Some(stage.clone());
+            let _ = app.emit("training-stage", &stage);
+        }
     }
 
     // resolve the training interpreter + its device backend up front: dev venv →
@@ -1172,7 +1349,7 @@ fn run_worker(
     }
 
     // ---- run config for the sidecar ----
-    let run_config = serde_json::json!({
+    let mut run_config = serde_json::json!({
         "backend": req.backend,
         "workspace": workspace,
         "dataset_dir": dataset_dir,
@@ -1232,6 +1409,12 @@ fn run_worker(
             "vocoder_pretrain": ctx.vocoder_pretrain,
         },
     });
+    // ①c: the sovits pipeline's resolve_speakers reads this array for co-training;
+    // single-speaker omits the key entirely -> pipeline falls back to
+    // dataset_dir/model_slug = byte-identical run.json / behavior.
+    if is_multi {
+        run_config["speakers"] = serde_json::json!(run_speakers);
+    }
     let run_json = workspace.join("run.json");
     std::fs::write(&run_json, serde_json::to_vec_pretty(&run_config)?)?;
 

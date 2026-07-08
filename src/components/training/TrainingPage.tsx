@@ -14,9 +14,11 @@ import { exists, readFile } from "@tauri-apps/plugin-fs";
 import { useAppStore } from "../../store/app";
 import {
   diffPoolReady,
+  trainingDataOk,
   setupTrainingListeners,
   useTrainingStore,
   type CkptInfo,
+  type DatasetFile,
   type WorkspaceInfo,
 } from "../../store/training";
 import {
@@ -56,7 +58,7 @@ function fmtDur(totalSecs: number): string {
 export function TrainingPage() {
   const { t } = useTranslation();
   const closePage = useAppStore((s) => s.toggleTrainingPage);
-  const { wizard, setWizard, dataset, snapshot, refresh, config, diffWsInfo } =
+  const { wizard, setWizard, dataset, speakerGroups, snapshot, refresh, config, diffWsInfo } =
     useTrainingStore();
   const [dropActive, setDropActive] = useState(false);
 
@@ -97,6 +99,9 @@ export function TrainingPage() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
+    // enter-time decision (is this an audio drag we accept?) — reused on `over`
+    // and `drop`, which is why it lives in the effect closure, not React state.
+    let dragAccept = false;
     getCurrentWebview()
       .onDragDropEvent((event) => {
         const p = event.payload;
@@ -104,20 +109,70 @@ export function TrainingPage() {
           const s = useTrainingStore.getState().snapshot.state;
           return s === "starting" || s === "running";
         };
+        // ①c: with ≥2 singers a drop lands on the singer CARD under the cursor,
+        // else the FIRST singer (the fallback) — returning that id means the
+        // hover highlight always shows exactly where the drop will land, so a
+        // fallback-to-first is never a surprise. Hit-test by card GEOMETRY
+        // (getBoundingClientRect), NOT elementFromPoint — the full-screen drop
+        // overlay sits on top of the cards, so elementFromPoint would always
+        // return the overlay (and it isn't torn down synchronously by
+        // setDropActive(false)). Tauri gives a PHYSICAL-pixel position; rects
+        // are CSS px, so divide by DPR.
+        const hitTestSpeaker = (position?: { x: number; y: number }): string | null => {
+          const st = useTrainingStore.getState();
+          if (st.config.backend !== "sovits" || st.speakerGroups.length <= 1) {
+            return null;
+          }
+          if (position) {
+            const dpr = window.devicePixelRatio || 1;
+            const x = position.x / dpr;
+            const y = position.y / dpr;
+            const cards = document.querySelectorAll<HTMLElement>("[data-spk-id]");
+            for (const card of cards) {
+              const r = card.getBoundingClientRect();
+              if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+                return card.getAttribute("data-spk-id");
+              }
+            }
+          }
+          return st.speakerGroups[0]?.id ?? null; // fallback: the first singer
+        };
+        const setHover = (id: string | null) => {
+          const st = useTrainingStore.getState();
+          if (st.dragOverSpeakerId !== id) st.setDragOverSpeakerId(id);
+        };
         if (p.type === "enter") {
           // don't invite a drop we'll refuse: adding to the dataset only affects
           // the NEXT run, so while one is live we accept nothing (matches the
           // Arrangement convention: no affordance for a drop that won't import)
-          setDropActive(!liveNow() && p.paths.some((pp) => AUDIO_EXT_RE.test(pp)));
+          dragAccept = !liveNow() && p.paths.some((pp) => AUDIO_EXT_RE.test(pp));
+          setDropActive(dragAccept);
+          setHover(dragAccept ? hitTestSpeaker(p.position) : null);
+        } else if (p.type === "over") {
+          // 'over' carries no paths — reuse the enter-time accept decision
+          setHover(dragAccept ? hitTestSpeaker(p.position) : null);
         } else if (p.type === "leave") {
+          dragAccept = false;
           setDropActive(false);
+          setHover(null);
         } else if (p.type === "drop") {
           setDropActive(false);
+          const target = dragAccept ? hitTestSpeaker(p.position) : null;
+          dragAccept = false;
+          setHover(null);
           if (liveNow()) return;
           const audio = p.paths.filter((pp) => AUDIO_EXT_RE.test(pp));
           if (audio.length === 0) return;
           const st = useTrainingStore.getState();
-          void st.addFiles(audio);
+          // ①c: SoVITS data is the singer list — a drop lands on the card under
+          // the cursor (or the first singer if not over a card, so files are
+          // never lost); every other backend uses the flat dataset.
+          if (st.config.backend === "sovits") {
+            const gid = target ?? st.speakerGroups[0]?.id;
+            if (gid) void st.addSpeakerFiles(gid, audio);
+          } else {
+            void st.addFiles(audio);
+          }
           st.setWizard(2); // the data page (step 2 since the S41 order swap)
         }
       })
@@ -130,12 +185,25 @@ export function TrainingPage() {
       if (unlisten) unlisten();
     };
   }, []);
+
+  // ①c: when the training object changes, move the imported file list between
+  // the flat dataset (rvc/vocoder/diff) and the first singer (sovits) so a
+  // switch never leaves already-imported files stranded/invisible.
+  const prevBackendRef = useRef(config.backend);
+  useEffect(() => {
+    const prev = prevBackendRef.current;
+    if (prev !== config.backend) {
+      prevBackendRef.current = config.backend;
+      useTrainingStore.getState().migrateOnBackendSwitch(prev, config.backend);
+    }
+  }, [config.backend]);
+
   // S41 order: 1=训练对象 2=数据 3=参数 4=运行 (the object decides whether
   // data is even needed, so it comes first; diff with a reusable shared pool
   // skips step 2). Steps 1/2 are always reachable — every ACTION is guarded
   // downstream (step gating here, start button, Rust validation).
   const diffPool = diffPoolReady(config.backend, diffWsInfo);
-  const step3Ok = dataset.length > 0 || diffPool;
+  const step3Ok = trainingDataOk(config.backend, dataset, speakerGroups, diffPool);
   const step4Ok = step3Ok || running || snapshot.state !== "idle";
   const stepOk = [true, true, step3Ok, step4Ok];
 
@@ -193,9 +261,14 @@ export function TrainingPage() {
         {wizard === 3 && <ParamsStep />}
         {wizard === 4 && <RunStep />}
       </div>
-      {dropActive && (
-        <div className="training-drop-overlay">{t("training.dropHint")}</div>
-      )}
+      {/* ①c: on the DATA step (2) with ≥2 singers the per-card highlight IS the
+          drop affordance, so suppress the full-screen overlay there; on other
+          steps the cards aren't mounted, so keep the overlay (an off-step drop
+          routes to singer #1 by design) */}
+      {dropActive &&
+        !(config.backend === "sovits" && speakerGroups.length > 1 && wizard === 2) && (
+          <div className="training-drop-overlay">{t("training.dropHint")}</div>
+        )}
     </div>
   );
 }
@@ -234,9 +307,27 @@ function Scrubber({ value, onSeek }: { value: number; onSeek: (frac: number) => 
 
 function DataStep() {
   const { t } = useTranslation();
-  const { dataset, addFiles, removeFile, setWizard, config, diffWsInfo } =
-    useTrainingStore();
+  const {
+    dataset,
+    speakerGroups,
+    addFiles,
+    removeFile,
+    addSpeaker,
+    removeSpeaker,
+    setSpeakerName,
+    addSpeakerFiles,
+    removeSpeakerFile,
+    dragOverSpeakerId,
+    flashSpeaker,
+    clearFlashSpeaker,
+    setWizard,
+    config,
+    diffWsInfo,
+  } = useTrainingStore();
   const diffPool = diffPoolReady(config.backend, diffWsInfo);
+  // ①c: SoVITS data is a SINGER LIST (default 1 singer = single-speaker); every
+  // other backend keeps the flat file list.
+  const sovits = config.backend === "sovits";
   const [playingPath, setPlayingPath] = useState<string | null>(null);
   const [loadingPath, setLoadingPath] = useState<string | null>(null);
   const [paused, setPaused] = useState(false);
@@ -256,14 +347,19 @@ function DataStep() {
     };
     rafRef.current = requestAnimationFrame(tick);
   };
+  // reset local preview state — preview.stop() does NOT fire onEnd, so callers
+  // that stop playback explicitly (remove-file / remove-singer) must reset here
+  // or playingPath + the rAF ticker leak (and a same-path file in another group
+  // would show a false "playing" indicator)
+  const resetPreviewState = () => {
+    stopTicker();
+    setPlayingPath(null);
+    setPaused(false);
+    setPos(0);
+  };
 
   useEffect(() => {
-    preview.onEnd = () => {
-      stopTicker();
-      setPlayingPath(null);
-      setPaused(false);
-      setPos(0);
-    };
+    preview.onEnd = resetPreviewState;
     return () => {
       preview.onEnd = null;
       stopTicker();
@@ -311,7 +407,12 @@ function DataStep() {
       const buffer = await preview.decode(bytes);
       // superseded by a newer play gesture (or the file was removed) while decoding
       if (token !== playTokenRef.current) return;
-      if (useTrainingStore.getState().dataset.every((f) => f.path !== path)) {
+      // ①c: the file may live in the flat dataset OR a speaker group
+      const st = useTrainingStore.getState();
+      const stillPresent =
+        st.dataset.some((f) => f.path === path) ||
+        st.speakerGroups.some((g) => g.files.some((f) => f.path === path));
+      if (!stillPresent) {
         setPlayingPath(null);
         setLoadingPath(null);
         return;
@@ -331,85 +432,212 @@ function DataStep() {
   const totalMs = dataset.reduce((acc, f) => acc + (f.durationMs ?? 0), 0);
   const activeDur = preview.duration || 0;
 
+  const pickSpeakerFiles = async (id: string) => {
+    const picked = await open({
+      multiple: true,
+      filters: [{ name: "Audio", extensions: AUDIO_EXTENSIONS }],
+      title: t("training.addFiles"),
+    });
+    if (!picked) return;
+    await addSpeakerFiles(id, Array.isArray(picked) ? picked : [picked]);
+  };
+
+  // one file row (play / scrub / remove) — shared by the flat list AND each
+  // speaker group so the preview logic stays single-source. onRemove differs
+  // (removeFile vs removeSpeakerFile) but the play/scrub state is by path.
+  const renderFileRow = (f: DatasetFile, onRemove: () => void) => {
+    const isActive = playingPath === f.path;
+    const isLoading = loadingPath === f.path;
+    const isPlaying = isActive && !paused && !isLoading;
+    return (
+      <div key={f.path} className="training-file-row" title={f.path}>
+        <div className="training-file-main">
+          <button
+            className={`training-file-play ${isPlaying ? "on" : ""} ${isLoading ? "loading" : ""}`}
+            onClick={() => void togglePlay(f.path)}
+            disabled={isLoading}
+            title={
+              isLoading
+                ? t("training.loadingPreview")
+                : isPlaying
+                  ? t("training.pausePreview")
+                  : t("training.preview")
+            }
+          >
+            {isLoading ? "◌" : isPlaying ? "❚❚" : "▶"}
+          </button>
+          <span className="training-file-name">{f.name}</span>
+          <span className="training-file-dur">
+            {isActive && activeDur > 0
+              ? `${fmtDur(pos)} / ${fmtDur(activeDur)}`
+              : f.durationMs != null
+                ? fmtDur(f.durationMs / 1000)
+                : "--:--"}
+          </span>
+          <button
+            className="training-file-remove"
+            onClick={() => {
+              if (isActive) {
+                preview.stop();
+                resetPreviewState();
+              }
+              onRemove();
+            }}
+            title={t("training.remove")}
+          >
+            X
+          </button>
+        </div>
+        {isActive && activeDur > 0 && (
+          <Scrubber
+            value={pos / activeDur}
+            onSeek={(frac) => {
+              preview.seek(frac);
+              setPos(preview.position);
+            }}
+          />
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="training-data-step">
       <div className="training-hint">{t("training.dataHint")}</div>
-      <div className="training-data-actions">
-        <button className="training-btn" onClick={() => void pickFiles()}>
-          {t("training.addFiles")}
-        </button>
-        <span className="training-data-total">
-          {t("training.files", { count: dataset.length })}
-          {totalMs > 0 && <> · {t("training.totalDur", { dur: fmtDur(totalMs / 1000) })}</>}
-        </span>
-      </div>
-      {dataset.length === 0 ? (
-        <div className="training-empty">
-          {t("training.empty")}
-          {diffPool && (
-            <div className="training-fixed-note">{t("training.diffPoolHint")}</div>
-          )}
-        </div>
-      ) : (
-        <div className="training-file-list">
-          {dataset.map((f) => {
-            const isActive = playingPath === f.path;
-            const isLoading = loadingPath === f.path;
-            const isPlaying = isActive && !paused && !isLoading;
+
+      {sovits ? (
+        <div className="training-spk-stack">
+          {speakerGroups.map((g, i) => {
+            const gMs = g.files.reduce((a, f) => a + (f.durationMs ?? 0), 0);
+            // with a single singer this is just the flat list (no card chrome /
+            // name / remove); the name + remove appear once there are ≥2 singers
+            const multiSinger = speakerGroups.length > 1;
             return (
-              <div key={f.path} className="training-file-row" title={f.path}>
-                <div className="training-file-main">
+              <div
+                key={g.id}
+                // data-spk-id = the drag hit-test anchor (only meaningful with
+                // ≥2 singers; a lone singer takes any drop)
+                data-spk-id={multiSinger ? g.id : undefined}
+                className={
+                  multiSinger
+                    ? `training-spk-group${dragOverSpeakerId === g.id ? " drop-target" : ""}`
+                    : undefined
+                }
+              >
+                {multiSinger && flashSpeaker?.id === g.id && (
+                  // one-shot pulse confirming files landed on THIS singer; the
+                  // nonce key remounts it so repeat adds re-trigger the animation
+                  <span
+                    key={flashSpeaker.nonce}
+                    className="training-spk-flash"
+                    onAnimationEnd={() => clearFlashSpeaker(flashSpeaker.nonce)}
+                  />
+                )}
+                {multiSinger && (
+                  <div className="training-spk-header">
+                    <span className="training-spk-idx">{i + 1}</span>
+                    <input
+                      className="training-spk-name"
+                      value={g.name}
+                      placeholder={t("training.speakerName")}
+                      onChange={(e) => setSpeakerName(g.id, e.target.value)}
+                    />
+                    <span className="training-spk-count">
+                      {t("training.files", { count: g.files.length })}
+                      {gMs > 0 && <> · {fmtDur(gMs / 1000)}</>}
+                    </span>
+                    <button
+                      className="training-file-remove"
+                      onClick={() => {
+                        // stop an in-progress preview of a file in THIS singer
+                        // before the row (and its scrubber) unmounts
+                        if (playingPath && g.files.some((f) => f.path === playingPath)) {
+                          preview.stop();
+                          resetPreviewState();
+                        }
+                        removeSpeaker(g.id);
+                      }}
+                      title={t("training.removeSpeaker")}
+                    >
+                      X
+                    </button>
+                  </div>
+                )}
+                <div className="training-data-actions">
                   <button
-                    className={`training-file-play ${isPlaying ? "on" : ""} ${isLoading ? "loading" : ""}`}
-                    onClick={() => void togglePlay(f.path)}
-                    disabled={isLoading}
-                    title={
-                      isLoading
-                        ? t("training.loadingPreview")
-                        : isPlaying
-                          ? t("training.pausePreview")
-                          : t("training.preview")
+                    className="training-btn"
+                    onClick={() => void pickSpeakerFiles(g.id)}
+                  >
+                    {t("training.addFiles")}
+                  </button>
+                  {!multiSinger && (
+                    <span className="training-data-total">
+                      {t("training.files", { count: g.files.length })}
+                      {gMs > 0 && (
+                        <> · {t("training.totalDur", { dur: fmtDur(gMs / 1000) })}</>
+                      )}
+                    </span>
+                  )}
+                </div>
+                {g.files.length > 0 ? (
+                  <div
+                    className={
+                      multiSinger
+                        ? "training-file-list training-spk-files"
+                        : "training-file-list"
                     }
                   >
-                    {isLoading ? "◌" : isPlaying ? "❚❚" : "▶"}
-                  </button>
-                  <span className="training-file-name">{f.name}</span>
-                  <span className="training-file-dur">
-                    {isActive && activeDur > 0
-                      ? `${fmtDur(pos)} / ${fmtDur(activeDur)}`
-                      : f.durationMs != null
-                        ? fmtDur(f.durationMs / 1000)
-                        : "--:--"}
-                  </span>
-                  <button
-                    className="training-file-remove"
-                    onClick={() => {
-                      if (isActive) preview.stop();
-                      removeFile(f.path);
-                    }}
-                    title={t("training.remove")}
-                  >
-                    X
-                  </button>
-                </div>
-                {isActive && activeDur > 0 && (
-                  <Scrubber
-                    value={pos / activeDur}
-                    onSeek={(frac) => {
-                      preview.seek(frac);
-                      setPos(preview.position);
-                    }}
-                  />
+                    {g.files.map((f) =>
+                      renderFileRow(f, () => removeSpeakerFile(g.id, f.path)),
+                    )}
+                  </div>
+                ) : (
+                  !multiSinger && (
+                    <div className="training-empty">{t("training.empty")}</div>
+                  )
                 )}
               </div>
             );
           })}
+          <button className="training-btn training-spk-add" onClick={addSpeaker}>
+            {t("training.addSpeaker")}
+          </button>
+          <div className="training-hint training-spk-hint">
+            {t("training.multiSpeakerHint")}
+          </div>
         </div>
+      ) : (
+        <>
+          <div className="training-data-actions">
+            <button className="training-btn" onClick={() => void pickFiles()}>
+              {t("training.addFiles")}
+            </button>
+            <span className="training-data-total">
+              {t("training.files", { count: dataset.length })}
+              {totalMs > 0 && (
+                <> · {t("training.totalDur", { dur: fmtDur(totalMs / 1000) })}</>
+              )}
+            </span>
+          </div>
+          {dataset.length === 0 ? (
+            <div className="training-empty">
+              {t("training.empty")}
+              {diffPool && (
+                <div className="training-fixed-note">{t("training.diffPoolHint")}</div>
+              )}
+            </div>
+          ) : (
+            <div className="training-file-list">
+              {dataset.map((f) => renderFileRow(f, () => removeFile(f.path)))}
+            </div>
+          )}
+        </>
       )}
+
       <div className="training-step-nav">
         <button
           className="training-btn primary"
-          disabled={dataset.length === 0 && !diffPool}
+          disabled={!trainingDataOk(config.backend, dataset, speakerGroups, diffPool)}
           onClick={() => setWizard(3)}
         >
           {t("training.next")}
@@ -1174,6 +1402,7 @@ function RunStep() {
     snapshotAt,
     history,
     dataset,
+    speakerGroups,
     config,
     starting,
     start,
@@ -1493,8 +1722,16 @@ function RunStep() {
 
   const onStart = async () => {
     // S41 共享池模式: diff may start with no fresh import when the host
-    // workspace has a reusable pool (Rust re-verifies authoritatively)
-    if (dataset.length === 0 && !diffPoolReady(config.backend, diffWsInfo)) {
+    // workspace has a reusable pool (Rust re-verifies authoritatively).
+    // ①c: multi-speaker needs ≥2 named non-empty groups (trainingDataOk).
+    if (
+      !trainingDataOk(
+        config.backend,
+        dataset,
+        speakerGroups,
+        diffPoolReady(config.backend, diffWsInfo),
+      )
+    ) {
       showToast(t("training.needData"), "error");
       return;
     }

@@ -326,6 +326,103 @@
   color: var(--color-error);
 }
 
+/* -------- ①c singer list (SoVITS multi-speaker co-training) -------- */
+.training-spk-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-lg);
+}
+
+/* explanatory line under the add-singer button */
+.training-spk-hint {
+  margin-bottom: 0;
+}
+
+/* a named singer card — only rendered when there are ≥2 singers; a lone singer
+   renders as the plain flat list (no card chrome) */
+.training-spk-group {
+  position: relative; /* anchor for the add-confirmation flash overlay */
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+}
+
+/* the singer card a file-drag is hovering (or the first singer as the fallback
+   target) — teal accent so it is obvious which singer the drop will feed */
+.training-spk-group.drop-target {
+  border-color: var(--accent-primary);
+  background: var(--accent-primary-glow);
+}
+
+/* one-shot pulse when files are added to a singer — a clear "landed here" cue */
+.training-spk-flash {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border: 1px solid var(--accent-primary);
+  background: var(--accent-primary-glow);
+  animation: spk-flash 0.6s ease-out forwards;
+}
+
+@keyframes spk-flash {
+  0% {
+    opacity: 0;
+  }
+  30% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.training-spk-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.training-spk-idx {
+  flex: 0 0 auto;
+  min-width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-strong);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+}
+
+.training-spk-name {
+  flex: 1;
+  min-width: 0;
+}
+
+.training-spk-count {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+/* inside a card the add-files row is inset and drops the flat list's big margin */
+.training-spk-group .training-data-actions {
+  padding: var(--space-sm) var(--space-md);
+  margin-bottom: 0;
+}
+
+/* the per-singer file list sits inside the card — the card already frames it */
+.training-spk-files {
+  border: none;
+  max-height: 240px;
+}
+
+.training-spk-add {
+  align-self: flex-start;
+}
+
 /* -------- target step -------- */
 .training-backend-cards {
   display: flex;

@@ -48,6 +48,7 @@ from torch.utils.tensorboard import SummaryWriter
 from .. import device as device_shim  # aliased: train() has a local `device = torch.device(...)` that would shadow a bare `device` import
 from . import utils
 from .data_utils import TextAudioCollate, TextAudioSpeakerLoader
+from .flist import resolve_speakers
 from .models import (
     MultiPeriodDiscriminator,
     SynthesizerTrn,
@@ -465,8 +466,12 @@ def _write_release_config(exp_dir, weights_dir, cfg):
     kmeans centers file derived from it) shows the user's model name."""
     with open(os.path.join(exp_dir, "config.json"), encoding="utf-8") as f:
         config = json.load(f)
-    display = cfg.get("model_name") or cfg["model_slug"]
-    config["spk"] = {display: 0}
+    # ①c: same id ordering as the workspace config (resolve_speakers), but keyed
+    # by DISPLAY name for the exported sidecar's speakers map. Single-speaker ->
+    # {display: 0}, byte-identical to pre-①c. (Display names must be unique per
+    # run — enforced UI-side; duplicates would collapse dict keys here.)
+    speakers = resolve_speakers(cfg)
+    config["spk"] = {sp["name"]: i for i, sp in enumerate(speakers)}
     dst = os.path.join(weights_dir, "config.json")
     tmp = dst + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:

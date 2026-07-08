@@ -30,6 +30,7 @@ aug_copies is manifest-recorded and INHERITED by diffusion runs (shared
 dataset_44k — a diff run regenerating the tree must re-augment identically).
 """
 import glob
+import hashlib
 import logging
 import os
 import shutil
@@ -43,7 +44,7 @@ from ..rvc.train_utils import get_logger  # shared harness helper (single source
 from . import utils
 from .cluster import build_kmeans, build_retrieval
 from .extract import extract_all
-from .flist import build_config, build_filelists
+from .flist import build_config, build_filelists, resolve_speakers
 from .preprocess import slice_and_resample
 from .train import train
 
@@ -52,14 +53,35 @@ logger = logging.getLogger(__name__)
 VERSION_ENCODER = {"4.1": "vec768l12", "4.0": "vec256l9"}
 
 
-def extract_cache_fp_text(dataset_dir, encoder, loudnorm):
+def extract_cache_fp_text(speakers, encoder, loudnorm):
     """THE cache-identity string for the dataset_44k tree — the sovits main
     pipeline and the diffusion pipeline share the workspace, so both MUST
     build this string identically or a diff run would silently wipe the main
-    run's feature caches (and vice versa). Single source, do not inline."""
-    return "%s|enc=%s|loudnorm=%d" % (
-        dataset_fingerprint(dataset_dir), encoder, int(loudnorm)
-    )
+    run's feature caches (and vice versa). Single source, do not inline.
+
+    ①c: `speakers` = resolve_speakers list. A single speaker fingerprints its
+    one dataset_dir EXACTLY as the pre-①c code did (byte-identical string, so
+    existing workspaces don't re-preprocess); multiple speakers fold each
+    (slug, dataset_dir fingerprint) in list order so adding / removing /
+    reordering a speaker invalidates the shared tree."""
+    if len(speakers) == 1:
+        fp = dataset_fingerprint(speakers[0]["dataset_dir"])
+    else:
+        h = hashlib.blake2b(digest_size=16)
+        for sp in speakers:
+            h.update(sp["slug"].encode("utf-8"))
+            h.update(dataset_fingerprint(sp["dataset_dir"]).encode())
+        fp = h.hexdigest()
+    return "%s|enc=%s|loudnorm=%d" % (fp, encoder, int(loudnorm))
+
+
+def _speaker_meta_dir(exp_dir, is_multi, slug):
+    """aug_meta location for a speaker. Single-speaker keeps the flat
+    exp_dir/aug_meta (byte-identical to pre-①c); multi-speaker namespaces per
+    slug because slice stems (000_000, ...) recur across speakers and the
+    meta json is keyed by stem — a shared dir would collide."""
+    base = os.path.join(exp_dir, "aug_meta")
+    return os.path.join(base, slug) if is_multi else base
 
 
 def run(cfg, reporter, stop):
@@ -76,7 +98,6 @@ def run(cfg, reporter, stop):
     if version not in VERSION_ENCODER:
         raise RuntimeError("非法 SoVITS 版本: %s（可选 4.1/4.0）" % version)
     encoder = VERSION_ENCODER[version]
-    slug = cfg["model_slug"]
     seed = int(cfg.get("seed", 1234))
     fp16 = bool(cfg.get("fp16", False)) and backend == "cuda"
     vol_embedding = bool(cfg.get("vol_embedding", False))
@@ -86,33 +107,41 @@ def run(cfg, reporter, stop):
     # the slice/extract products live together under dataset_44k — invalidate the
     # whole tree when the dataset OR any parameter that changes slice output /
     # feature space changes (loudnorm rewrites every wav; encoder switches the
-    # .soft.pt dimension — version is manifest-immutable, belt and suspenders)
-    fp_text = extract_cache_fp_text(cfg["dataset_dir"], encoder, loudnorm)
+    # .soft.pt dimension — version is manifest-immutable, belt and suspenders).
+    # ①c: resolve_speakers gives N (name, slug, dataset_dir) in id order; a run
+    # with no "speakers" key is a 1-element list = pre-①c single-speaker path.
+    speakers = resolve_speakers(cfg)
+    is_multi = len(speakers) > 1
+    fp_text = extract_cache_fp_text(speakers, encoder, loudnorm)
     invalidate_extract_caches(exp_dir, fp_text, ("dataset_44k",))
 
     dataset_44k = os.path.join(exp_dir, "dataset_44k")
-    spk_dir = os.path.join(dataset_44k, slug)
-    slice_and_resample(cfg["dataset_dir"], spk_dir, loudnorm, ffmpeg, reporter, stop)
-
-    stop.check()
     aug_copies = int(cfg.get("aug_copies", 0))
-    meta_dir = os.path.join(exp_dir, "aug_meta")
-    augment_slices(
-        spk_dir,
-        aug_copies,
-        seed,
-        meta_dir,
-        read_wav,
-        _write_slice_int16,
-        lambda stem: _remove_aug_products(spk_dir, meta_dir, stem),
-        reporter,
-        stop,
-    )
 
-    stop.check()
+    # slice + augment EACH speaker into its own dataset_44k/<slug> subdir (the
+    # data loader derives the speaker id from the parent-dir name). aug_meta is
+    # namespaced per speaker for multi; single-speaker keeps the flat path.
+    for sp in speakers:
+        spk_dir = os.path.join(dataset_44k, sp["slug"])
+        meta_dir = _speaker_meta_dir(exp_dir, is_multi, sp["slug"])
+        slice_and_resample(sp["dataset_dir"], spk_dir, loudnorm, ffmpeg, reporter, stop)
+        stop.check()
+        augment_slices(
+            spk_dir,
+            aug_copies,
+            seed,
+            meta_dir,
+            read_wav,
+            _write_slice_int16,
+            lambda stem, d=spk_dir, m=meta_dir: _remove_aug_products(d, m, stem),
+            reporter,
+            stop,
+        )
+        stop.check()
+
     build_config(
         exp_dir,
-        slug,
+        speakers[0]["slug"],
         encoder,
         vol_embedding,
         fp16,
@@ -123,6 +152,7 @@ def run(cfg, reporter, stop):
         bool(cfg.get("all_in_mem", False)),
         seed,
         assets["configs_dir"],
+        speakers=speakers,
     )
 
     stop.check()
@@ -137,31 +167,57 @@ def run(cfg, reporter, stop):
         stop,
     )
     # aug slices whose extraction failed have PARTIAL companion sets — remove
-    # them before the gate/filelists (the gate would only catch missing f0)
+    # them before the gate/filelists (mapped back to their owning speaker dir)
     for filename in failed_aug or ():
         stem = os.path.basename(filename).split(".")[0]
-        logger.warning("removing aug slice with failed extraction: %s", stem)
-        _remove_aug_products(spk_dir, meta_dir, stem)
+        fslug = os.path.basename(os.path.dirname(filename))
+        logger.warning("removing aug slice with failed extraction: %s/%s", fslug, stem)
+        _remove_aug_products(
+            os.path.join(dataset_44k, fslug),
+            _speaker_meta_dir(exp_dir, is_multi, fslug),
+            stem,
+        )
 
     stop.check()
-    run_f0_gate(
-        list_aug_entries(spk_dir, meta_dir),
-        lambda stem: _load_gate_f0(spk_dir, stem),
-        lambda stem: _remove_aug_products(spk_dir, meta_dir, stem),
-        reporter,
-        stop,
-        report_path=os.path.join(exp_dir, "aug_gate_report.json"),
-    )
+    # f0 quality gate per speaker (report is per-speaker for multi; single keeps
+    # the flat aug_gate_report.json)
+    for sp in speakers:
+        spk_dir = os.path.join(dataset_44k, sp["slug"])
+        meta_dir = _speaker_meta_dir(exp_dir, is_multi, sp["slug"])
+        report = os.path.join(
+            exp_dir,
+            "aug_gate_report_%s.json" % sp["slug"] if is_multi else "aug_gate_report.json",
+        )
+        run_f0_gate(
+            list_aug_entries(spk_dir, meta_dir),
+            lambda stem, d=spk_dir: _load_gate_f0(d, stem),
+            lambda stem, d=spk_dir, m=meta_dir: _remove_aug_products(d, m, stem),
+            reporter,
+            stop,
+            report_path=report,
+        )
 
     stop.check()
-    build_filelists(exp_dir, slug, dataset_44k, seed, reporter)
+    build_filelists(exp_dir, speakers[0]["slug"], dataset_44k, seed, reporter, speakers=speakers)
 
     stop.check()
     if bool(cfg.get("kmeans", False)):
-        display = cfg.get("model_name") or slug
-        index_path, index_rows = build_kmeans(exp_dir, spk_dir, display, reporter, stop)
+        named = [(sp["name"], os.path.join(dataset_44k, sp["slug"])) for sp in speakers]
+        index_path, index_rows = build_kmeans(exp_dir, named, reporter, stop)
     else:
-        index_path, index_rows = build_retrieval(exp_dir, spk_dir, seed, reporter, stop)
+        # retrieval matrix per speaker -> <id>.index_vectors.npy (id = list order)
+        index_path = None
+        index_rows = 0
+        for i, sp in enumerate(speakers):
+            index_path, rows = build_retrieval(
+                exp_dir,
+                os.path.join(dataset_44k, sp["slug"]),
+                seed,
+                reporter,
+                stop,
+                spk_id=i,
+            )
+            index_rows += rows
 
     stop.check()
     reporter.stage("train_prep", message="加载模型与数据，训练即将开始")

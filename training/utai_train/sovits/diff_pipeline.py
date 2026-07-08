@@ -59,7 +59,7 @@ from .. import device as device_shim
 from ..cache import invalidate_extract_caches
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from .extract import extract_all
-from .flist import ENCODER_DIMS, _wav_duration, build_config, build_filelists
+from .flist import ENCODER_DIMS, _wav_duration, build_config, build_filelists, resolve_speakers
 from .pipeline import (
     VERSION_ENCODER,
     _load_gate_f0,
@@ -102,9 +102,29 @@ def run(cfg, reporter, stop):
     vol_embedding = bool(cfg.get("vol_embedding", False))
     ffmpeg = assets["ffmpeg"]
 
+    # ①c: shallow diffusion does not yet support multi-speaker models — the
+    # diffusion yaml carries ONE spk map that doubles as loader keys (need dir
+    # slugs) AND the exported sidecar names (want display names); the main
+    # model's dual-config split isn't wired here. Refuse BEFORE any cache/slice
+    # op so a multi-speaker workspace's shared caches are never touched.
+    if len(cfg.get("speakers") or []) > 1:
+        raise RuntimeError("浅扩散暂不支持多说话人模型（请先训练单说话人扩散）")
+    _existing_cfg = os.path.join(exp_dir, "config.json")
+    if os.path.exists(_existing_cfg):
+        try:
+            _probe_n = int(getattr(
+                sovits_utils.get_hparams_from_file(_existing_cfg).model, "n_speakers", 1
+            ))
+        except Exception:
+            _probe_n = 1
+        if _probe_n > 1:
+            raise RuntimeError("浅扩散暂不支持多说话人模型（该工作区主模型为多说话人）")
+
     # same cache identity as the sovits main pipeline (single source — a
-    # format drift here would wipe the shared caches on every backend switch)
-    fp_text = extract_cache_fp_text(cfg["dataset_dir"], encoder, loudnorm)
+    # format drift here would wipe the shared caches on every backend switch).
+    # resolve_speakers is single-speaker here (multi is refused above) so this
+    # is byte-identical to the pre-①c fingerprint.
+    fp_text = extract_cache_fp_text(resolve_speakers(cfg), encoder, loudnorm)
     invalidate_extract_caches(exp_dir, fp_text, ("dataset_44k",))
 
     dataset_44k = os.path.join(exp_dir, "dataset_44k")

@@ -19,6 +19,19 @@ export interface DatasetFile {
   durationMs: number | null;
 }
 
+/** ①c multi-speaker co-training: one co-trained singer = a display name + its
+ *  own files. Drives the SoVITS card's singer list (1 singer = single-speaker,
+ *  the degenerate case). `id` is a stable React key (names may be blank /
+ *  duplicate mid-edit). */
+export interface SpeakerGroupDraft {
+  id: string;
+  name: string;
+  files: DatasetFile[];
+}
+
+let spkSeq = 0;
+let flashSeq = 0;
+
 export interface StageInfo {
   stage: string;
   done?: number | null;
@@ -78,6 +91,49 @@ export function diffPoolReady(backend: string, info: WorkspaceInfo | null): bool
     !!info?.exists &&
     info.family === "sovits" &&
     info.has_dataset
+  );
+}
+
+/** THE single predicate for "step 2 (data) is satisfied" — shared by the root
+ *  wizard gating (step3Ok) AND the DataStep next button so they never drift.
+ *  ①c: SoVITS data is a SINGER LIST (default 1 singer = single-speaker, the
+ *  degenerate case of N). Every singer needs files; with ≥2 singers each also
+ *  needs a (unique) name. Other backends keep the flat-dataset / shared-pool rule. */
+export function trainingDataOk(
+  backend: string,
+  dataset: DatasetFile[],
+  speakerGroups: SpeakerGroupDraft[],
+  diffPool: boolean,
+): boolean {
+  if (backend === "sovits") {
+    const allHaveFiles =
+      speakerGroups.length > 0 && speakerGroups.every((g) => g.files.length > 0);
+    if (speakerGroups.length <= 1) return allHaveFiles;
+    // ≥2 singers: each needs a name, and names must be UNIQUE (the Rust side
+    // hard-rejects duplicates — gate here so Next/Start never advertise a state
+    // that would only fail with an error toast)
+    const names = speakerGroups.map((g) => g.name.trim());
+    const allNamed = names.every((n) => n !== "");
+    const uniqueNames = new Set(names).size === names.length;
+    return allHaveFiles && allNamed && uniqueNames;
+  }
+  return dataset.length > 0 || diffPool;
+}
+
+/** Probe duration + derive the display name for a batch of picked paths.
+ *  Single source for the flat dataset add AND the per-speaker add. */
+async function probeFiles(paths: string[]): Promise<DatasetFile[]> {
+  return Promise.all(
+    paths.map(async (path) => {
+      let durationMs: number | null = null;
+      try {
+        durationMs = await invoke<number>("probe_audio_duration", { path });
+      } catch {
+        durationMs = null;
+      }
+      const name = path.replace(/\\/g, "/").split("/").pop() ?? path;
+      return { path, name, durationMs };
+    }),
   );
 }
 
@@ -235,6 +291,8 @@ interface TrainingStoreState {
   snapshotAt: number;
   history: StepPoint[];
   dataset: DatasetFile[];
+  /** ①c: the SoVITS card's singer list (always ≥1; 1 = single-speaker). */
+  speakerGroups: SpeakerGroupDraft[];
   config: TrainingFormConfig;
   wizard: 1 | 2 | 3 | 4;
   starting: boolean;
@@ -248,6 +306,26 @@ interface TrainingStoreState {
   updateConfig: (u: Partial<TrainingFormConfig>) => void;
   addFiles: (paths: string[]) => Promise<void>;
   removeFile: (path: string) => void;
+  addSpeaker: () => void;
+  removeSpeaker: (id: string) => void;
+  setSpeakerName: (id: string, name: string) => void;
+  addSpeakerFiles: (id: string, paths: string[]) => Promise<void>;
+  removeSpeakerFile: (id: string, path: string) => void;
+  /** ①c: which singer card a file-drag is currently over (highlight target);
+   *  null = none. Set by the drag handler, read by the DataStep cards. */
+  dragOverSpeakerId: string | null;
+  setDragOverSpeakerId: (id: string | null) => void;
+  /** ①c: transient "files were just added to this singer" pulse — id + nonce so
+   *  the SAME singer re-flashes on repeat adds (the nonce forces the animated
+   *  node to remount). Only set with ≥2 singers; cleared on animation end. */
+  flashSpeaker: { id: string; nonce: number } | null;
+  /** clear the pulse, but only if `nonce` still matches — so a stale animationend
+   *  from one singer cannot wipe a pulse just started on another. */
+  clearFlashSpeaker: (nonce: number) => void;
+  /** ①c: move the imported file list between the flat dataset (rvc/vocoder/diff)
+   *  and the first singer (sovits) when the training object changes, so a switch
+   *  never leaves already-imported files stranded/invisible. */
+  migrateOnBackendSwitch: (prev: string, next: string) => void;
   refresh: () => Promise<void>;
   start: (fresh: boolean) => Promise<void>;
   stop: () => Promise<void>;
@@ -264,6 +342,10 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
   snapshotAt: Date.now(),
   history: [],
   dataset: [],
+  // ①c: always ≥1 singer (default 1 = single-speaker). removeSpeaker keeps ≥1.
+  speakerGroups: [{ id: `spk${++spkSeq}`, name: "", files: [] }],
+  dragOverSpeakerId: null,
+  flashSpeaker: null,
   config: { ...DEFAULT_CONFIG },
   wizard: 1,
   starting: false,
@@ -277,22 +359,87 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
     const existing = new Set(get().dataset.map((f) => f.path));
     const fresh = paths.filter((p) => !existing.has(p));
     if (!fresh.length) return;
-    const probed: DatasetFile[] = await Promise.all(
-      fresh.map(async (path) => {
-        let durationMs: number | null = null;
-        try {
-          durationMs = await invoke<number>("probe_audio_duration", { path });
-        } catch {
-          durationMs = null;
-        }
-        const name = path.replace(/\\/g, "/").split("/").pop() ?? path;
-        return { path, name, durationMs };
-      }),
-    );
+    const probed = await probeFiles(fresh);
     set((s) => ({ dataset: [...s.dataset, ...probed] }));
   },
   removeFile: (path) =>
     set((s) => ({ dataset: s.dataset.filter((f) => f.path !== path) })),
+
+  addSpeaker: () =>
+    set((s) => ({
+      speakerGroups: [
+        ...s.speakerGroups,
+        { id: `spk${++spkSeq}`, name: "", files: [] },
+      ],
+    })),
+  removeSpeaker: (id) =>
+    set((s) =>
+      // keep ≥1 singer (the single-speaker degenerate case) — the last group
+      // is not removable
+      s.speakerGroups.length > 1
+        ? { speakerGroups: s.speakerGroups.filter((g) => g.id !== id) }
+        : {},
+    ),
+  setSpeakerName: (id, name) =>
+    set((s) => ({
+      speakerGroups: s.speakerGroups.map((g) =>
+        g.id === id ? { ...g, name } : g,
+      ),
+    })),
+  addSpeakerFiles: async (id, paths) => {
+    const grp = get().speakerGroups.find((g) => g.id === id);
+    if (!grp) return;
+    const existing = new Set(grp.files.map((f) => f.path));
+    const fresh = paths.filter((p) => !existing.has(p));
+    if (!fresh.length) return;
+    const probed = await probeFiles(fresh);
+    // the group may have been removed during the async probe — bail rather than
+    // discard the files (and leave a flash pointing at a dead id)
+    if (!get().speakerGroups.some((g) => g.id === id)) return;
+    set((s) => {
+      const speakerGroups = s.speakerGroups.map((g) =>
+        g.id === id ? { ...g, files: [...g.files, ...probed] } : g,
+      );
+      return {
+        speakerGroups,
+        // pulse the target card — only with ≥2 singers (a lone singer has no
+        // card to pulse; setting it would leave an uncleared flash that fires
+        // late when a second singer is added)
+        flashSpeaker:
+          speakerGroups.length > 1 ? { id, nonce: ++flashSeq } : s.flashSpeaker,
+      };
+    });
+  },
+  removeSpeakerFile: (id, path) =>
+    set((s) => ({
+      speakerGroups: s.speakerGroups.map((g) =>
+        g.id === id
+          ? { ...g, files: g.files.filter((f) => f.path !== path) }
+          : g,
+      ),
+    })),
+  setDragOverSpeakerId: (id) => set({ dragOverSpeakerId: id }),
+  clearFlashSpeaker: (nonce) =>
+    set((s) => (s.flashSpeaker?.nonce === nonce ? { flashSpeaker: null } : {})),
+  migrateOnBackendSwitch: (prev, next) =>
+    set((s) => {
+      const wasSovits = prev === "sovits";
+      const isSovits = next === "sovits";
+      if (isSovits === wasSovits) return {}; // both sovits / both non-sovits: same list
+      // only ever migrate a LONE singer (never clobber a real multi-singer setup)
+      const g0 = s.speakerGroups[0];
+      if (!g0 || s.speakerGroups.length !== 1) return {};
+      if (isSovits) {
+        // flat dataset -> the (empty default) first singer
+        if (s.dataset.length > 0 && g0.files.length === 0) {
+          return { dataset: [], speakerGroups: [{ ...g0, files: s.dataset }] };
+        }
+      } else if (s.dataset.length === 0 && g0.files.length > 0) {
+        // leaving sovits with a lone singer -> the (empty) flat dataset
+        return { dataset: g0.files, speakerGroups: [{ ...g0, files: [] }] };
+      }
+      return {};
+    }),
 
   refresh: async () => {
     try {
@@ -316,13 +463,33 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
   },
 
   start: async (fresh) => {
-    const { config, dataset } = get();
+    const { config, dataset, speakerGroups } = get();
     set({ starting: true });
     try {
+      // ①c: SoVITS data is the singer list. 1 singer = single-speaker: send its
+      // files as the flat dataset_files, NO `speakers` key -> byte-identical to
+      // pre-①c. ≥2 singers: send `speakers` (matching Rust
+      // StartTrainingRequest.speakers: Vec<SpeakerGroup{name,files}>) + empty
+      // dataset_files. Non-sovits backends keep the flat `dataset`.
+      const isSovits = config.backend === "sovits";
+      const multi = isSovits && speakerGroups.length > 1;
+      const datasetFiles = multi
+        ? []
+        : isSovits
+          ? (speakerGroups[0]?.files ?? []).map((f) => f.path)
+          : dataset.map((f) => f.path);
       const base = {
         model_name: config.modelName.trim(),
         backend: config.backend,
-        dataset_files: dataset.map((f) => f.path),
+        dataset_files: datasetFiles,
+        ...(multi
+          ? {
+              speakers: speakerGroups.map((g) => ({
+                name: g.name.trim(),
+                files: g.files.map((f) => f.path),
+              })),
+            }
+          : {}),
         gpu: config.gpu,
         force_cpu: config.forceCpu,
         spk_id: 0,

@@ -55,7 +55,7 @@ def _load_features(spk_dir, stop):
     return np.concatenate(mats, 0)
 
 
-def build_retrieval(exp_dir, spk_dir, seed, reporter, stop, n_cpu=None):
+def build_retrieval(exp_dir, spk_dir, seed, reporter, stop, n_cpu=None, spk_id=0):
     reporter.stage("index", message="构建检索特征库")
     big_npy = _load_features(spk_dir, stop)
 
@@ -86,37 +86,53 @@ def build_retrieval(exp_dir, spk_dir, seed, reporter, stop, n_cpu=None):
     big_npy = np.ascontiguousarray(big_npy.astype(np.float32))
     cluster_dir = os.path.join(exp_dir, "cluster")
     os.makedirs(cluster_dir, exist_ok=True)
-    # speaker id 0 — single-speaker training; file name contract of export_cluster.py
-    out_path = os.path.join(cluster_dir, "0.index_vectors.npy")
+    # file name contract of export_cluster.py = "<speaker_id>.index_vectors.npy".
+    # spk_id defaults to 0 (single-speaker; byte-identical to pre-①c + the gate);
+    # ①c calls this once per speaker with its list-order id.
+    out_path = os.path.join(cluster_dir, "%d.index_vectors.npy" % spk_id)
     np.save(out_path, big_npy, allow_pickle=False)
     logger.info("retrieval matrix saved: %s rows -> %s", big_npy.shape[0], out_path)
     reporter.stage("index", done=1, total=1)
     return out_path, int(big_npy.shape[0])
 
 
-def build_kmeans(exp_dir, spk_dir, speaker_name, reporter, stop):
-    reporter.stage("index", message="训练聚类中心 (kmeans)")
+def _fit_kmeans(features):
     from sklearn.cluster import MiniBatchKMeans
 
-    features = _load_features(spk_dir, stop).astype(np.float32)
-    stop.check()
     n_clusters = min(N_CLUSTERS, features.shape[0])
     kmeans = MiniBatchKMeans(
         n_clusters=n_clusters, verbose=False, batch_size=4096, max_iter=80
     ).fit(features)
-    ckpt = {
-        speaker_name: {
+    return kmeans, n_clusters
+
+
+def build_kmeans(exp_dir, named_spk_dirs, reporter, stop):
+    """upstream kmeans_10000.pt = one dict keyed by SPEAKER NAME (export_cluster.py
+    owns <safe_name>.centers.npy naming). `named_spk_dirs` = [(name, spk_dir), ...];
+    single-speaker passes one pair -> byte-identical to the pre-①c {name:{...}} dict.
+    ①c accumulates every co-trained speaker into the one .pt."""
+    reporter.stage("index", message="训练聚类中心 (kmeans)")
+    ckpt = {}
+    total = 0
+    dim = 0
+    for name, spk_dir in named_spk_dirs:
+        features = _load_features(spk_dir, stop).astype(np.float32)
+        stop.check()
+        kmeans, n_clusters = _fit_kmeans(features)
+        ckpt[name] = {
             "n_features_in_": kmeans.n_features_in_,
             "_n_threads": kmeans._n_threads,
             "cluster_centers_": kmeans.cluster_centers_,
         }
-    }
+        total += n_clusters
+        dim = features.shape[1]
     cluster_dir = os.path.join(exp_dir, "cluster")
     os.makedirs(cluster_dir, exist_ok=True)
     out_path = os.path.join(cluster_dir, "kmeans_%d.pt" % N_CLUSTERS)
     tmp = out_path + ".tmp"
     torch.save(ckpt, tmp)
     os.replace(tmp, out_path)
-    logger.info("kmeans centers saved: %s x %s -> %s", n_clusters, features.shape[1], out_path)
+    logger.info("kmeans centers saved: %s speakers, %s x %s -> %s",
+                len(ckpt), total, dim, out_path)
     reporter.stage("index", done=1, total=1)
-    return out_path, int(n_clusters)
+    return out_path, int(total)
