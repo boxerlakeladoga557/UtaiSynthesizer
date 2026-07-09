@@ -21,7 +21,7 @@ import {
   nextSnapshotSeq,
   resolveDetachAncestor,
 } from "../lib/audio/laneOps";
-import type { Track, Segment, SegmentContent, LaneControl } from "../types/project";
+import type { Track, Segment, SegmentContent, LaneControl, Note, PitchCurve, VocalTrackParams } from "../types/project";
 
 /**
  * Global (timeline) undo/redo for the audio-arrangement document.
@@ -97,11 +97,40 @@ let unsubscribe: (() => void) | null = null;
 // (the sub-lane slice/edge-stretch recipe is an arrangement edit, so it IS undoable even though the
 // processedOutputs it edits are not). Two states with the same signature are "the same edit" for undo.
 // ---------------------------------------------------------------------------
+/** Deterministic signature of a pitch/param curve (ordered parallel arrays). */
+function curveSig(c?: PitchCurve): string {
+  return c ? `${c.xs.join(",")}:${c.ys.join(",")}` : "";
+}
+
+/** Deterministic signature of one vocal note: the 7 base fields + the optional pitch/expression edits.
+ *  Every optional folds to its DEFAULT so "absent" reads identical to "default-valued" — the store omits
+ *  defaults, so a note that never gained a `detune` and one whose `detune` returned to 0 are the same edit
+ *  (no phantom undo step / no false-dirty). Order is fixed; arrays serialize in element order. */
+function noteSig(n: Note): string {
+  const pts = (n.pitchPoints ?? []).map((p) => `${p.x},${p.y},${p.shape}`).join(">");
+  const v = n.vibrato;
+  const vib = v ? `${v.length},${v.period},${v.depth},${v.in},${v.out},${v.shift},${v.drift}` : "";
+  return (
+    `${n.id}.${n.tick}.${n.duration}.${n.pitch}.${n.lyric}.${n.phoneme ?? ""}.${n.velocity}` +
+    `.${n.detune ?? 0}.${n.tie ? 1 : 0}.${n.pitchAuto === false ? 0 : 1}.${n.lang ?? ""}.${n.phonemeInput ?? ""}` +
+    `.${pts}.${vib}`
+  );
+}
+
 function contentSig(c: SegmentContent): string {
   if (c.type === "audioClip") return `a:${c.sourcePath}:${c.offsetMs}:${c.totalDurationMs}`;
-  return `n:${c.notes
-    .map((n) => `${n.id}.${n.tick}.${n.duration}.${n.pitch}.${n.lyric}.${n.phoneme ?? ""}.${n.velocity}`)
-    .join("|")}`;
+  const notes = c.notes.map(noteSig).join("|");
+  const dev = curveSig(c.pitchDev);
+  // paramCurves is a Record — key order is not guaranteed, so SORT (like laneSig) for a stable signature.
+  const params = c.paramCurves
+    ? Object.keys(c.paramCurves).sort().map((k) => `${k}=${curveSig(c.paramCurves![k])}`).join("&")
+    : "";
+  return `n:${notes}#${dev}#${params}`;
+}
+
+/** Deterministic signature of a track's vocal params (undoable, like voiceModel). */
+function vocalParamsSig(p?: VocalTrackParams): string {
+  return p ? `${p.backend},${p.speakerId},${p.langId},${p.transpose}` : "";
 }
 
 function laneSig(lc: Record<string, LaneControl>, mutes?: Record<string, boolean>): string {
@@ -126,7 +155,7 @@ function meaningfulSig(tracks: Track[], tempo: number, timeSig: [number, number]
         (t) =>
           `${t.id}~${t.name}~${t.trackType}~${t.volumeDb}~${t.pan}~${t.muted ? 1 : 0}~${t.solo ? 1 : 0}~` +
           `${t.playOriginal ? 1 : 0}~` +
-          `${t.voiceModel ?? ""}~${t.voiceModelAvatar ?? ""}~${laneSig(t.laneControls, t.laneMutes)}~` +
+          `${t.voiceModel ?? ""}~${t.voiceModelAvatar ?? ""}~${vocalParamsSig(t.vocalParams)}~${laneSig(t.laneControls, t.laneMutes)}~` +
           t.segments
             .map((s) => `${s.id}.${s.startTick}.${s.durationTicks}.${contentSig(s.content)}.${laneOpsSig(s.laneOps)}`)
             .join(";"),

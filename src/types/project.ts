@@ -15,6 +15,11 @@ export interface Track {
   solo: boolean;
   voiceModel?: string;
   voiceModelAvatar?: string;
+  /** ② Vocal-track (自己唱) settings — backend + the ScoreToCV speaker/lang + a track-level transpose.
+   *  Present only on vocal tracks that have been configured; absent = defaults. Persisted + UNDOABLE
+   *  (in meaningfulSig, like voiceModel). The SVC voice itself stays in `voiceModel`; the render-time SVC
+   *  inference knobs (noise_scale…) join here in Phase 6 when the vocal render is wired. (S48 Phase 3) */
+  vocalParams?: VocalTrackParams;
   expanded: boolean;
   /** Per-GROUP mix (volume/pan), keyed by the producing Output node id (`laneGroupId`) — "recorded ON
    *  the Output node", exactly like laneOps: all lanes of one 组 share the setting (解组 to control
@@ -97,9 +102,24 @@ export interface Segment {
 }
 
 export type SegmentContent =
-  | { type: "notes"; notes: Note[] }
+  | {
+      type: "notes";
+      notes: Note[];
+      /** ② Hand-drawn ADDITIVE f0 offset over the whole part (SynthV "Pitch Deviation"), in cents,
+       *  X = ticks relative to the segment start. Adds ON TOP of the note-derived baseline (§3.2 layer ③);
+       *  a paint gesture REPLACES the covered x-interval. Absent = no manual deviation. (S48 Phase 3) */
+      pitchDev?: PitchCurve;
+      /** ② Per-parameter automation lanes (loudness / tension / breath / gender …), keyed by param name.
+       *  Same PitchCurve shape (X = ticks rel. segment start, Y = param value). Absent = all defaults. */
+      paramCurves?: Record<string, PitchCurve>;
+    }
   | { type: "audioClip"; sourcePath: string; offsetMs: number; totalDurationMs: number };
 
+/** One vocal note (§3.1 "VocalNote"). A SUPERSET of the original 7-field Note: the base fields are the
+ *  musical note; the optional fields (all absent = a plain note at its谱-derived pitch) carry the pitch/
+ *  expression edits SynthV/OpenUTAU expose. UNITS ARE FIXED: X = ticks (480 PPQ), Y = cents — end to end.
+ *  Every optional is written ONLY when non-default (the store omits defaults) so the raw-JSON
+ *  save/autosave compare stays byte-stable (§5 false-dirty rule). All fields are UNDOABLE (contentSig). */
 export interface Note {
   id: string;
   tick: number;
@@ -108,6 +128,66 @@ export interface Note {
   lyric: string;
   phoneme?: string;
   velocity: number;
+  /** Fine pitch offset in cents (± ), added to `pitch`. Absent = 0. */
+  detune?: number;
+  /** Per-note pitch-transition control points (Pointer tool): X = ticks relative to the note start,
+   *  Y = cents. Ordered by X. A first point BEFORE the note start makes the transition slide in from the
+   *  previous note (OpenUTAU snapFirst / §3.2 layer ②). Absent = no per-note pitch shaping. */
+  pitchPoints?: PitchPoint[];
+  /** Tail vibrato (OpenUTAU-style). All fields present when vibrato is on; absent = none. */
+  vibrato?: VibratoSpec;
+  /** false = the note's pitch baseline is FROZEN to the user's manual edits (v1 "Path B"); absent/true =
+   *  re-derived from the score (Path A). Stored ONLY when false. */
+  pitchAuto?: boolean;
+  /** Explicit tie / sustain to the previous note (承前元音 legato). Stored ONLY when true. */
+  tie?: boolean;
+  /** Per-note language override (zh/ja/en/de/fr/es/it). Absent = follow the track default (§3.7 ACE-style). */
+  lang?: string;
+  /** User override at the TRADITIONAL-phoneme layer (拼音/假名/ARPABET — NOT raw IPA); stage2 converts it
+   *  to IPA at render (§3.7). Absent = derive from `lyric`. */
+  phonemeInput?: string;
+}
+
+/** A pitch-transition control point: X = ticks (rel. note start), Y = cents, with an easing SHAPE for the
+ *  segment leading UP TO this point (ported from OpenUTAU MusicMath.InterpolateShape). */
+export interface PitchPoint {
+  x: number;
+  y: number;
+  shape: "linear" | "sineIn" | "sineOut" | "sineInOut";
+}
+
+/** An ordered polyline (X = ticks, Y = cents/param-value). Parallel arrays keep it compact + JSON-stable;
+ *  painting replaces the covered x-interval. `xs` is strictly increasing; `xs.length === ys.length`. */
+export interface PitchCurve {
+  xs: number[];
+  ys: number[];
+}
+
+export interface VibratoSpec {
+  /** Fraction of the note covered by vibrato, 0–1 (tail-anchored). */
+  length: number;
+  /** Period in ms. */
+  period: number;
+  /** Depth in cents. */
+  depth: number;
+  /** Fade-in / fade-out fractions of the vibrato span, 0–1. */
+  in: number;
+  out: number;
+  /** Phase shift (0–1) and pitch drift (cents) — OpenUTAU VBR P/D. */
+  shift: number;
+  drift: number;
+}
+
+/** ② Vocal-track (自己唱) parameters (§3.1). The SVC voice/singer stays in `Track.voiceModel`; this holds
+ *  the backend choice + the ScoreToCV conditioning (speaker/lang) + a track-level transpose. */
+export interface VocalTrackParams {
+  backend: "rvc" | "sovits";
+  /** ScoreToCV speaker id (0–76; near speaker-invariant, default 49 = kiritan). NOT the SVC voice. */
+  speakerId: number;
+  /** ScoreToCV language id (zh0 ja2 en1 de3 fr4 es5 it6). */
+  langId: number;
+  /** Track-level transpose in semitones, applied to every note's pitch → f0. */
+  transpose: number;
 }
 
 export interface Workflow {

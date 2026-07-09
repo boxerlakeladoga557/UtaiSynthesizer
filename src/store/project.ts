@@ -1,7 +1,17 @@
 import { create } from "zustand";
 import { useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { Track, Segment, LaneControl, ProcessedOutput, LaneClip } from "../types/project";
+import type {
+  Track,
+  Segment,
+  SegmentContent,
+  LaneControl,
+  ProcessedOutput,
+  LaneClip,
+  Note,
+  PitchCurve,
+  VocalTrackParams,
+} from "../types/project";
 import { TimeAxis } from "../lib/timeAxis";
 import { orderProcessedOutputs, laneControlFor } from "../lib/trackLayout";
 import {
@@ -34,6 +44,69 @@ function cancelRunningRenders(segmentIds: string[]) {
 /** Gesture base for the BPM edit session (beginTempoScale/endTempoScale): setTempo scales geometry
  *  from THIS fixed snapshot so per-keystroke intermediate values can't accumulate rounding error. */
 let tempoScaleBase: { tempo: number; tracks: Track[]; playheadTick: number } | null = null;
+
+// ─── ② Vocal-note editing (S48 Phase 3) — data-layer store actions (no editor UI yet) ─────────────
+
+/** Seed for a track's first vocal-param write (partial updates merge onto this). */
+const DEFAULT_VOCAL_PARAMS: VocalTrackParams = { backend: "sovits", speakerId: 49, langId: 2, transpose: 0 };
+
+/** Canonicalize a vocal note so the SAME logical note ALWAYS has the SAME shape — the omit-default rule
+ *  that keeps the raw-JSON save/autosave compare byte-stable (§5 false-dirty) AND the undo sig phantom-free:
+ *  drop every optional equal to its default, and keep `pitchPoints` in canonical x-order. The undo sig
+ *  (history.contentSig) folds the same defaults, so absent ≡ default on BOTH sides. (When the Phase-5 pitch
+ *  editor writes float curves, round them HERE — one place feeds both the sig and serialize, so they can't
+ *  disagree.) */
+function normalizeNote(n: Note): Note {
+  const out: Note = {
+    id: n.id, tick: n.tick, duration: n.duration, pitch: n.pitch, lyric: n.lyric, velocity: n.velocity,
+  };
+  if (n.phoneme) out.phoneme = n.phoneme;
+  if (n.detune) out.detune = n.detune; // 0 → absent
+  // Rebuild pitchPoints (sorted by x) and vibrato with FIXED key order — the sig reads sub-fields by
+  // name (order-independent) but JSON.stringify preserves object key insertion order, so canonicalizing
+  // here keeps serialize byte-stable regardless of how a future caller constructs these objects (the same
+  // sig↔serialize agreement the paramCurves sort guards).
+  if (n.pitchPoints && n.pitchPoints.length > 0) {
+    out.pitchPoints = [...n.pitchPoints]
+      .sort((a, b) => a.x - b.x)
+      .map((p) => ({ x: p.x, y: p.y, shape: p.shape }));
+  }
+  if (n.vibrato) {
+    const v = n.vibrato;
+    out.vibrato = { length: v.length, period: v.period, depth: v.depth, in: v.in, out: v.out, shift: v.shift, drift: v.drift };
+  }
+  if (n.pitchAuto === false) out.pitchAuto = false; // absent/true (the default) → absent
+  if (n.tie) out.tie = true; // false → absent
+  if (n.lang) out.lang = n.lang;
+  if (n.phonemeInput) out.phonemeInput = n.phonemeInput;
+  return out;
+}
+
+type NotesContent = Extract<SegmentContent, { type: "notes" }>;
+
+/** Immutably transform ONE notes-segment's content (other tracks / segments / non-notes segments left as
+ *  the same ref). Returns a fresh tracks[] with new refs only along the matched path — installHistory +
+ *  autosave both key off ref changes, so this auto-captures + auto-persists (never mutate a note in place).
+ *  A mis-targeted call (wrong id / an audioClip segment) changes nothing meaningful → the sig is unchanged
+ *  → installHistory early-outs (no phantom undo step). */
+function mapNotesContent(
+  tracks: Track[],
+  trackId: string,
+  segmentId: string,
+  fn: (c: NotesContent) => NotesContent,
+): Track[] {
+  return tracks.map((t) => {
+    if (t.id !== trackId) return t;
+    return {
+      ...t,
+      segments: t.segments.map((seg) =>
+        seg.id === segmentId && seg.content.type === "notes"
+          ? { ...seg, content: fn(seg.content) }
+          : seg,
+      ),
+    };
+  });
+}
 
 interface ProjectState {
   name: string;
@@ -87,6 +160,22 @@ interface ProjectState {
   /** Set (or clear, when `clips` is undefined) a segment's non-destructive sub-lane recipe for one
    *  Output-node group (keyed by outputNodeId). Undoable — laneOps is in the history meaningfulSig. */
   updateSegmentLaneOps: (trackId: string, segmentId: string, outputNodeId: string, clips: LaneClip[] | undefined) => void;
+
+  // ── ② Vocal-note data-layer actions (S48 Phase 3). All mutate `seg.content.notes` of a `notes`
+  //    segment (no-op on an audioClip segment), immutably + `dirty:true`, so installHistory captures ONE
+  //    undo step and autosave persists. `normalizeNote` strips default optionals on write (§5). ──
+  /** Append a vocal note to a notes-segment (normalized on write). */
+  addVocalNote: (trackId: string, segmentId: string, note: Note) => void;
+  /** Patch one vocal note by id (partial merge, re-normalized). */
+  updateVocalNote: (trackId: string, segmentId: string, noteId: string, updates: Partial<Note>) => void;
+  /** Delete one or many vocal notes by id (box-select delete). */
+  deleteVocalNotes: (trackId: string, segmentId: string, noteIds: string[]) => void;
+  /** Set (or clear, when `curve` is undefined/empty) the part-level hand-drawn pitch deviation. */
+  setSegmentPitchDev: (trackId: string, segmentId: string, curve: PitchCurve | undefined) => void;
+  /** Set (or clear) one named parameter automation lane on a notes-segment. */
+  setSegmentParamCurve: (trackId: string, segmentId: string, param: string, curve: PitchCurve | undefined) => void;
+  /** Merge a partial vocal-params update onto the track (seeds defaults on first write). Undoable. */
+  setVocalParams: (trackId: string, updates: Partial<VocalTrackParams>) => void;
   /** Per-lane deposit: replace only the lanes present in `outputs` (keyed by outputNodeId), keep sibling
    *  lanes. Used by the live Output reconciler so depositing one lane never clobbers the others. */
   mergeProcessedOutputs: (trackId: string, segmentId: string, outputs: ProcessedOutput[]) => void;
@@ -417,6 +506,81 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
           }),
         };
       }),
+    })),
+
+  addVocalNote: (trackId, segmentId, note) =>
+    set((s) => ({
+      dirty: true,
+      tracks: mapNotesContent(s.tracks, trackId, segmentId, (c) => ({
+        ...c,
+        notes: [...c.notes, normalizeNote(note)],
+      })),
+    })),
+
+  updateVocalNote: (trackId, segmentId, noteId, updates) =>
+    set((s) => ({
+      dirty: true,
+      tracks: mapNotesContent(s.tracks, trackId, segmentId, (c) => ({
+        ...c,
+        // Re-normalize the merged note so a field set back to its default drops out (no false-dirty).
+        notes: c.notes.map((n) => (n.id === noteId ? normalizeNote({ ...n, ...updates }) : n)),
+      })),
+    })),
+
+  deleteVocalNotes: (trackId, segmentId, noteIds) =>
+    set((s) => {
+      const ids = new Set(noteIds);
+      return {
+        dirty: true,
+        tracks: mapNotesContent(s.tracks, trackId, segmentId, (c) => ({
+          ...c,
+          notes: c.notes.filter((n) => !ids.has(n.id)),
+        })),
+      };
+    }),
+
+  setSegmentPitchDev: (trackId, segmentId, curve) =>
+    set((s) => ({
+      dirty: true,
+      tracks: mapNotesContent(s.tracks, trackId, segmentId, (c) => {
+        const next: NotesContent = { ...c };
+        if (curve && curve.xs.length > 0) next.pitchDev = curve;
+        else delete next.pitchDev;
+        return next;
+      }),
+    })),
+
+  setSegmentParamCurve: (trackId, segmentId, param, curve) =>
+    set((s) => ({
+      dirty: true,
+      tracks: mapNotesContent(s.tracks, trackId, segmentId, (c) => {
+        const src = { ...(c.paramCurves ?? {}) };
+        if (curve && curve.xs.length > 0) src[param] = curve;
+        else delete src[param];
+        const next: NotesContent = { ...c };
+        const keys = Object.keys(src);
+        if (keys.length > 0) {
+          // Rebuild with SORTED keys so the serialized JSON has a canonical key order — else a
+          // delete-then-re-add reorders the Record and false-dirties the autosave raw-JSON compare
+          // even though contentSig (which sorts keys) sees no change (the sig↔serialize agreement rule).
+          const canonical: Record<string, PitchCurve> = {};
+          for (const k of keys.sort()) canonical[k] = src[k]!;
+          next.paramCurves = canonical;
+        } else {
+          delete next.paramCurves;
+        }
+        return next;
+      }),
+    })),
+
+  setVocalParams: (trackId, updates) =>
+    set((s) => ({
+      dirty: true,
+      tracks: s.tracks.map((t) =>
+        t.id === trackId
+          ? { ...t, vocalParams: { ...(t.vocalParams ?? DEFAULT_VOCAL_PARAMS), ...updates } }
+          : t,
+      ),
     })),
 
   mergeProcessedOutputs: (trackId, segmentId, outputs) =>
