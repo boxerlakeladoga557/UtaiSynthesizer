@@ -7,6 +7,8 @@ pub mod nsf_hifigan;
 pub mod rvc;
 pub mod score2cv;
 mod score2cv_tables;
+#[cfg(test)]
+mod score2cv_cv_ref;
 pub mod sovits;
 
 use parking_lot::RwLock;

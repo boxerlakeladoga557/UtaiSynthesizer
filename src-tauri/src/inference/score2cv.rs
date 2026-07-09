@@ -361,4 +361,59 @@ mod tests {
         assert_eq!(kana_map().len(), tbl::KANA.len());
         assert_eq!(r2ipa_map().len(), tbl::R2IPA.len());
     }
+
+    // ── Phase 1d GATE: end-to-end Rust → ORT → cv, matched ≤1e-3 to Python-ORT (score2cv_cv_ref.rs).
+    // Needs the 181MB models (data/models/aux) + the dev ORT dll (runtime/ort) — hence #[ignore]; run:
+    //   cargo test --lib inference::score2cv::tests::onnx_cv_parity_cpu -- --ignored --nocapture
+    // Forces the CPU EP so numerics equal the Python CPUExecutionProvider reference exactly. ──
+    #[test]
+    #[ignore]
+    fn onnx_cv_parity_cpu() {
+        use super::super::engine::DeviceConfig;
+        use super::super::score2cv_cv_ref as cvref;
+        use std::path::{Path, PathBuf};
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dll = root.join("../runtime/ort/onnxruntime.dll");
+        assert!(dll.exists(), "ORT dll missing at {} (dev runtime required)", dll.display());
+        match ort::init_from(&dll) {
+            Ok(b) => {
+                let _ = b.commit();
+            }
+            Err(e) => panic!("ort init_from failed: {e}"),
+        }
+
+        let engine = OnnxEngine::new();
+        engine.set_device(DeviceConfig::Cpu); // deterministic; matches the Python CPU reference
+
+        let arr = build_arrays(pr::SCORE).unwrap();
+        let chunks = chunk_at_sp(&arr, 400);
+
+        for (dim, model, refs) in [
+            (768usize, "score2cv_768.onnx", cvref::REF_768),
+            (256usize, "score2cv_256.onnx", cvref::REF_256),
+        ] {
+            let path: PathBuf = root.join("../data/models/aux").join(model);
+            assert!(path.exists(), "model missing: {}", path.display());
+            let sid = engine.load_model_with(&path, false).unwrap();
+            assert_eq!(chunks.len(), refs.len(), "chunk count vs reference");
+            for (ci, chunk) in chunks.iter().enumerate() {
+                let cv = run_score2cv(&engine, &sid, chunk, dim, 49, 2).unwrap();
+                let r = &refs[ci];
+                assert_eq!(cv.nrows(), r.t, "{} c{} T", model, ci);
+                assert_eq!(cv.ncols(), r.dim, "{} c{} dim", model, ci);
+                let flat = cv.as_slice().expect("cv is contiguous");
+                let mut worst = 0.0f32;
+                for (&i, &v) in r.idx.iter().zip(r.val) {
+                    worst = worst.max((flat[i] - v).abs());
+                }
+                assert!(worst <= 1e-3, "{} c{}: worst sampled cv diff {:.3e} > 1e-3", model, ci, worst);
+                let sum: f64 = flat.iter().map(|&x| x as f64).sum();
+                let sumsq: f64 = flat.iter().map(|&x| (x as f64) * (x as f64)).sum();
+                assert!((sum - r.sum).abs() <= 0.1 + r.sum.abs() * 1e-4, "{} c{}: sum {} vs {}", model, ci, sum, r.sum);
+                assert!((sumsq - r.sumsq).abs() <= 0.1 + r.sumsq * 1e-4, "{} c{}: sumsq {} vs {}", model, ci, sumsq, r.sumsq);
+                eprintln!("[1d] {} chunk{}: T={} dim={} sampled-worst={:.2e} sum={:.2} PASS", model, ci, r.t, r.dim, worst, sum);
+            }
+        }
+    }
 }
