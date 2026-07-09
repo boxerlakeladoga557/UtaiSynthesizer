@@ -873,9 +873,18 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
 
 // ── module helpers ──
 
-/** A cheap per-note signature for the commit diff (only fields the editor mutates in Phase 4). */
+/** Full per-note content signature for the commit diff (mirrors history.ts noteSig, minus id which is the
+ *  diff key). ⚠ MUST cover EVERY editable field: commitNotes drops an edit whose sig is unchanged, so a
+ *  pitchPoints/vibrato/pitchAuto-only edit (Phase 5) would be SILENTLY lost if the sig omitted them
+ *  (silent-regression class). Extended in S50 to unblock Phase-5 pitch writes. */
 function noteSig(n: Note): string {
-  return `${n.tick}.${n.duration}.${n.pitch}.${n.lyric}.${n.detune ?? 0}`;
+  const pts = (n.pitchPoints ?? []).map((p) => `${p.x},${p.y},${p.shape}`).join(">");
+  const v = n.vibrato;
+  const vib = v ? `${v.length},${v.period},${v.depth},${v.in},${v.out},${v.shift},${v.drift}` : "";
+  return (
+    `${n.tick}.${n.duration}.${n.pitch}.${n.lyric}.${n.phoneme ?? ""}.${n.velocity}` +
+    `.${n.detune ?? 0}.${n.tie ? 1 : 0}.${n.pitchAuto === false ? 0 : 1}.${n.lang ?? ""}.${n.phonemeInput ?? ""}.${pts}.${vib}`
+  );
 }
 
 const SMALL_KANA = new Set([..."ぁぃぅぇぉゃゅょゎっゕゖァィゥェォャュョヮッ"]);
