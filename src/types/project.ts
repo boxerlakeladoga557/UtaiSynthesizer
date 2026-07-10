@@ -162,6 +162,11 @@ export interface NoteTransition {
   depthLeftCents?: number;
   /** Departure overshoot at the right transition, signed cents (SynthV Depth Right). */
   depthRightCents?: number;
+  /** Open-edge scoop depth, cents ≥ 0 (§10.5). At a boundary with NO connected neighbour, the pitch references
+   *  `tone − openEdgeCents`: an isolated ONSET scoops UP from it (with durLeft/depthLeft), an isolated RELEASE
+   *  drifts DOWN to it (with durRight/depthRight). SynthV renders this via its AI; we synthesize it with the
+   *  transition machinery + this one reference amount. 0 = flat onset/release (pre-§10.5 behaviour). */
+  openEdgeCents?: number;
 }
 
 /** An ordered polyline (X = ticks, Y = cents/param-value). Parallel arrays keep it compact + JSON-stable;

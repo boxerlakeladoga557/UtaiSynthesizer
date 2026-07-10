@@ -23,6 +23,14 @@ import {
 } from "../lib/audio/laneOps";
 import type { Track, Segment, SegmentContent, LaneControl, Note, PitchCurve, VocalTrackParams } from "../types/project";
 
+// ── HMR safety (DEV ONLY — a no-op in the production build) ──
+// This module owns the undo state machine as module-level mutable state (past/future/txnDepth/lastSig below).
+// A hot-swap spawns a SECOND module instance while ref-captured beginTransaction/commitTransaction closures (the
+// VolumeFader gesture brackets) + the installHistory subscription still point at the OLD one — a split-brain
+// where undo()/auto-capture read a stale txnDepth/past and silently NO-OP (it "heals" only on the next full
+// reload). Self-accept + full reload so any edit here re-inits every consumer against ONE state machine.
+if (import.meta.hot) import.meta.hot.accept(() => location.reload());
+
 /**
  * Global (timeline) undo/redo for the audio-arrangement document.
  *
@@ -108,7 +116,7 @@ function curveSig(c?: PitchCurve): string {
  *  (no phantom undo step / no false-dirty). Order is fixed; arrays serialize in element order. */
 function noteSig(n: Note): string {
   const t = n.transition;
-  const tr = t ? `${t.offsetMs ?? ""}|${t.durLeftMs ?? ""}|${t.durRightMs ?? ""}|${t.depthLeftCents ?? ""}|${t.depthRightCents ?? ""}` : "";
+  const tr = t ? `${t.offsetMs ?? ""}|${t.durLeftMs ?? ""}|${t.durRightMs ?? ""}|${t.depthLeftCents ?? ""}|${t.depthRightCents ?? ""}|${t.openEdgeCents ?? ""}` : "";
   const v = n.vibrato;
   const vib = v ? `${v.depthCents},${v.freqHz},${v.phase},${v.startMs},${v.easeInMs},${v.easeOutMs}` : "";
   return (
@@ -133,7 +141,7 @@ function contentSig(c: SegmentContent): string {
 function vocalParamsSig(p?: VocalTrackParams): string {
   if (!p) return "";
   const t = p.transition;
-  const tr = t ? `${t.offsetMs},${t.durLeftMs},${t.durRightMs},${t.depthLeftCents},${t.depthRightCents}` : "";
+  const tr = t ? `${t.offsetMs},${t.durLeftMs},${t.durRightMs},${t.depthLeftCents},${t.depthRightCents},${t.openEdgeCents}` : "";
   return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${tr}`;
 }
 

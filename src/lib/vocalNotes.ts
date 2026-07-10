@@ -26,10 +26,10 @@ const HUGE = 1e9;
 
 /** Track-level DEFAULT note transition — every field concrete (a note's partial NoteTransition overrides
  *  per field). This is why every note glides smoothly by default (SynthV, §10.3). */
-export const DEFAULT_TRANSITION = { offsetMs: 0, durLeftMs: 100, durRightMs: 70, depthLeftCents: 15, depthRightCents: 15 } as const;
-const TRANSITION_KEYS = ["offsetMs", "durLeftMs", "durRightMs", "depthLeftCents", "depthRightCents"] as const;
+export const DEFAULT_TRANSITION = { offsetMs: 0, durLeftMs: 100, durRightMs: 70, depthLeftCents: 15, depthRightCents: 15, openEdgeCents: 200 } as const;
+const TRANSITION_KEYS = ["offsetMs", "durLeftMs", "durRightMs", "depthLeftCents", "depthRightCents", "openEdgeCents"] as const;
 const TRANSITION_BOUNDS: Record<(typeof TRANSITION_KEYS)[number], readonly [number, number]> = {
-  offsetMs: [-2000, 2000], durLeftMs: [0, 2000], durRightMs: [0, 2000], depthLeftCents: [-1200, 1200], depthRightCents: [-1200, 1200],
+  offsetMs: [-2000, 2000], durLeftMs: [0, 2000], durRightMs: [0, 2000], depthLeftCents: [-1200, 1200], depthRightCents: [-1200, 1200], openEdgeCents: [0, 1200],
 };
 /** Canonicalize a PARTIAL NoteTransition: keep only finite fields (clamped) in a FIXED key order so a
  *  per-note override serializes byte-stable; drop non-finite. Empty object if nothing survives (caller omits). */
@@ -96,7 +96,7 @@ export function normalizeNote(n: Note): Note {
     const v = n.vibrato;
     if ([v.depthCents, v.freqHz, v.phase, v.startMs, v.easeInMs, v.easeOutMs].every((x) => Number.isFinite(x)) && v.depthCents > 0) {
       out.vibrato = {
-        depthCents: clampNum(v.depthCents, 0, 2400, 0), freqHz: clampNum(v.freqHz, 0.1, 20, 5.5), phase: clampNum(v.phase, -1, 1, 0),
+        depthCents: clampNum(v.depthCents, 0, 2400, 0), freqHz: clampNum(v.freqHz, 0.1, 40, 5.5), phase: clampNum(v.phase, -1, 1, 0),
         startMs: clampNum(v.startMs, 0, 60000, 0), easeInMs: clampNum(v.easeInMs, 0, 10000, 0), easeOutMs: clampNum(v.easeOutMs, 0, 10000, 0),
       };
     }
@@ -220,6 +220,7 @@ export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrack
       durRightMs: clampNum(tr.durRightMs ?? NaN, 0, 2000, DEFAULT_TRANSITION.durRightMs),
       depthLeftCents: clampNum(tr.depthLeftCents ?? NaN, -1200, 1200, DEFAULT_TRANSITION.depthLeftCents),
       depthRightCents: clampNum(tr.depthRightCents ?? NaN, -1200, 1200, DEFAULT_TRANSITION.depthRightCents),
+      openEdgeCents: clampNum(tr.openEdgeCents ?? NaN, 0, 1200, DEFAULT_TRANSITION.openEdgeCents),
     },
   };
 }

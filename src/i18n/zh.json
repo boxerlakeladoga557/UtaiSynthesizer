@@ -321,6 +321,28 @@
     "restore": "还原",
     "preview": "试听",
     "stop": "停止",
-    "close": "关闭"
+    "close": "关闭",
+    "sidebar": {
+      "noteTransition": "音符间过渡",
+      "selectNoteHint": "选择音符以编辑",
+      "vibrato": "颤音",
+      "addVibrato": "添加颤音",
+      "removeVibrato": "移除颤音",
+      "trackTransition": "轨道默认过渡",
+      "resetTrack": "恢复默认值",
+      "resetInherit": "重置为轨道默认",
+      "tr_offsetMs": "偏移",
+      "tr_durLeftMs": "滑入",
+      "tr_durRightMs": "滑出",
+      "tr_depthLeftCents": "入过冲",
+      "tr_depthRightCents": "出过冲",
+      "tr_openEdgeCents": "起收滑幅",
+      "vib_depthCents": "深度",
+      "vib_freqHz": "频率",
+      "vib_phase": "相位",
+      "vib_startMs": "起振",
+      "vib_easeInMs": "淡入",
+      "vib_easeOutMs": "淡出"
+    }
   }
 }

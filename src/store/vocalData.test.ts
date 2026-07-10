@@ -13,7 +13,7 @@ import { useProjectStore } from "./project";
 import { useHistoryStore, installHistory } from "./history";
 import { useAppStore } from "./app";
 import { buildSaveBundle, buildAutosaveJson, parseLoadedBundle } from "../lib/project/bundle";
-import { normalizeCurve, resolveOverlaps, sanitizeText } from "../lib/vocalNotes";
+import { normalizeCurve, resolveOverlaps, sanitizeText, DEFAULT_TRANSITION } from "../lib/vocalNotes";
 import type { Track, Segment, SegmentContent, Note, VocalTrackParams } from "../types/project";
 
 type NotesContent = Extract<SegmentContent, { type: "notes" }>;
@@ -109,7 +109,7 @@ describe("Phase 3 — .usp save/load round-trips every vocal field (GATE C)", ()
       { pitchDev: { xs: [0, 240], ys: [0, 50] }, paramCurves: { loudness: { xs: [0, 480], ys: [0, -3] } } },
     ),
     { backend: "sovits", speakerId: 49, langId: 2, transpose: 2,
-      transition: { offsetMs: 0, durLeftMs: 100, durRightMs: 70, depthLeftCents: 15, depthRightCents: 15 } },
+      transition: { offsetMs: 0, durLeftMs: 100, durRightMs: 70, depthLeftCents: 15, depthRightCents: 15, openEdgeCents: 50 } },
   );
 
   it("preserves vocalParams + all note/curve fields through save→load", () => {
@@ -291,7 +291,7 @@ describe("Phase 4a — untrusted .usp load boundary (§9.8.1)", () => {
     expect(b.transition!.depthLeftCents).toBe(1200); // 1e9 → clamped [-1200,1200]
     expect(b.transition!.offsetMs).toBeUndefined(); // NaN dropped (finite-only, canonical)
     expect(b.vibrato!.depthCents).toBe(2400); // 1e9 → clamped [0,2400]
-    expect(b.vibrato!.freqHz).toBe(20); // 1e9 → clamped [0.1,20]
+    expect(b.vibrato!.freqHz).toBe(40); // 1e9 → clamped [0.1,40]
     expect(b.vibrato!.phase).toBe(1); // 9 → clamped [-1,1]
 
     const vp = loaded.tracks[0]!.vocalParams!;
@@ -327,5 +327,67 @@ describe("Phase 4a — pure vocalNotes helpers", () => {
     expect(sanitizeText("a" + String.fromCharCode(0) + "b" + String.fromCharCode(0x202e) + "c")).toBe("abc");
     // decomposed か + ゛ (U+304B U+3099) → composed が (U+304C)
     expect(sanitizeText(String.fromCharCode(0x304b, 0x3099))).toBe(String.fromCharCode(0x304c));
+  });
+});
+
+describe("Phase 5 — property sidebar data-layer (transition override / vibrato)", () => {
+  it("per-note transition override stores a PARTIAL; resetting a field re-inherits; both undoable", () => {
+    const { applyNoteEdits } = useProjectStore.getState();
+    // set ONE field → an explicit partial override (the sidebar's editTransition path — not a full 5-field object)
+    applyNoteEdits(T, S, { update: { n1: { transition: { durLeftMs: 200 } } } });
+    expect(notes()[0]!.transition).toEqual({ durLeftMs: 200 });
+    expect(useHistoryStore.getState().canUndo).toBe(true);
+    // reset that field to inherit → normalizeTransition drops the non-finite → transition omitted entirely
+    applyNoteEdits(T, S, { update: { n1: { transition: { durLeftMs: undefined } } } });
+    expect(notes()[0]!.transition).toBeUndefined();
+    useHistoryStore.getState().undo(); // undo the reset
+    expect(notes()[0]!.transition).toEqual({ durLeftMs: 200 });
+  });
+
+  it("vibrato: add a default spec then depth→0 canonicalizes to no-vibrato (= remove, byte-identical)", () => {
+    const { applyNoteEdits } = useProjectStore.getState();
+    const spec = { depthCents: 100, freqHz: 5.5, phase: 0, startMs: 250, easeInMs: 200, easeOutMs: 200 };
+    applyNoteEdits(T, S, { update: { n1: { vibrato: spec } } });
+    expect(notes()[0]!.vibrato).toEqual(spec);
+    applyNoteEdits(T, S, { update: { n1: { vibrato: { ...spec, depthCents: 0 } } } });
+    expect(notes()[0]!.vibrato).toBeUndefined(); // depthCents≤0 → stripped → absent
+  });
+
+  it("REPRO track-default undo: note edit THEN transaction-wrapped track-default edit → undo reverts the track-default (not the note)", () => {
+    const hist = () => useHistoryStore.getState();
+    const { applyNoteEdits, setVocalParams } = useProjectStore.getState();
+    // 1. a note edit, transaction-wrapped like a note-override slider drag
+    hist().beginTransaction();
+    applyNoteEdits(T, S, { update: { n1: { detune: 20 } } });
+    hist().commitTransaction();
+    // 2. a track-default transition edit, transaction-wrapped exactly like the sidebar track slider
+    hist().beginTransaction();
+    setVocalParams(T, { transition: { ...DEFAULT_TRANSITION, durLeftMs: 250 } });
+    hist().commitTransaction();
+    expect(useProjectStore.getState().tracks[0]!.vocalParams!.transition.durLeftMs).toBe(250);
+    // 2b. a SECOND track-default edit with MANY mid-drag sets inside one transaction (real fader drag) → 1 step
+    hist().beginTransaction();
+    for (const v of [260, 275, 300, 330, 360]) setVocalParams(T, { transition: { ...DEFAULT_TRANSITION, durLeftMs: v } });
+    hist().commitTransaction();
+    expect(useProjectStore.getState().tracks[0]!.vocalParams!.transition.durLeftMs).toBe(360);
+    // 3. undo → reverts the 2b drag to 250 (the whole multi-set drag = ONE step); note intact
+    hist().undo();
+    expect(useProjectStore.getState().tracks[0]!.vocalParams!.transition.durLeftMs).toBe(250);
+    expect(notes()[0]!.detune).toBe(20);
+    // 3b. undo again → reverts the first track-default edit; 3c. redo re-applies it
+    hist().undo();
+    expect(useProjectStore.getState().tracks[0]!.vocalParams?.transition?.durLeftMs ?? 100).toBe(100);
+    expect(useHistoryStore.getState().canRedo).toBe(true);
+    hist().redo();
+    expect(useProjectStore.getState().tracks[0]!.vocalParams!.transition.durLeftMs).toBe(250);
+  });
+
+  it("track default transition edit is captured by vocalParamsSig + reverts", () => {
+    const { setVocalParams } = useProjectStore.getState();
+    setVocalParams(T, { transition: { offsetMs: 0, durLeftMs: 250, durRightMs: 70, depthLeftCents: 15, depthRightCents: 15, openEdgeCents: 50 } });
+    expect(useProjectStore.getState().tracks[0]!.vocalParams!.transition.durLeftMs).toBe(250);
+    expect(useHistoryStore.getState().canUndo).toBe(true); // vocalParamsSig captures the transition
+    useHistoryStore.getState().undo();
+    expect(useProjectStore.getState().tracks[0]!.vocalParams?.transition?.durLeftMs).toBeUndefined(); // seeded had no params
   });
 });

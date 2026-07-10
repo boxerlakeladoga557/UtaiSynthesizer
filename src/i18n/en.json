@@ -321,6 +321,28 @@
     "restore": "Restore",
     "preview": "Preview",
     "stop": "Stop",
-    "close": "Close"
+    "close": "Close",
+    "sidebar": {
+      "noteTransition": "Note transition",
+      "selectNoteHint": "Select a note to edit",
+      "vibrato": "Vibrato",
+      "addVibrato": "Add vibrato",
+      "removeVibrato": "Remove vibrato",
+      "trackTransition": "Track default transition",
+      "resetTrack": "Reset to default",
+      "resetInherit": "Reset to track default",
+      "tr_offsetMs": "Offset",
+      "tr_durLeftMs": "Arrive",
+      "tr_durRightMs": "Leave",
+      "tr_depthLeftCents": "Overshoot in",
+      "tr_depthRightCents": "Overshoot out",
+      "tr_openEdgeCents": "Edge scoop",
+      "vib_depthCents": "Depth",
+      "vib_freqHz": "Rate",
+      "vib_phase": "Phase",
+      "vib_startMs": "Onset",
+      "vib_easeInMs": "Fade in",
+      "vib_easeOutMs": "Fade out"
+    }
   }
 }

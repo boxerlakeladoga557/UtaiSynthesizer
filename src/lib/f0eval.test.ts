@@ -3,7 +3,7 @@
 // command exists (Option A: Rust consumes the TS cents array).
 import { describe, it, expect } from "vitest";
 import { interpShape } from "./interpolateShape";
-import { evalF0CentsAt, evalF0CentsFrames } from "./f0eval";
+import { evalF0CentsAt, evalF0CentsFrames, paintedDev } from "./f0eval";
 import type { Note, NoteTransition } from "../types/project";
 
 describe("interpolateShape", () => {
@@ -25,10 +25,14 @@ describe("evalF0Cents (SynthV-aligned layering §10.3)", () => {
   const mk = (id: string, tick: number, dur: number, pitch: number, extra: Partial<Note> = {}): Note =>
     ({ id, tick, duration: dur, pitch, lyric: "あ", velocity: 100, ...extra });
   // Pure staircase (all transition durations 0) = the back-end parity anchor.
-  const flat: Required<NoteTransition> = { offsetMs: 0, durLeftMs: 0, durRightMs: 0, depthLeftCents: 0, depthRightCents: 0 };
-  const smooth: Required<NoteTransition> = { offsetMs: 0, durLeftMs: 100, durRightMs: 70, depthLeftCents: 15, depthRightCents: 15 };
+  // openEdgeCents 0 on flat/smooth so the EXISTING tests keep their pre-§10.5 flat isolated onsets/releases.
+  const flat: Required<NoteTransition> = { offsetMs: 0, durLeftMs: 0, durRightMs: 0, depthLeftCents: 0, depthRightCents: 0, openEdgeCents: 0 };
+  const smooth: Required<NoteTransition> = { offsetMs: 0, durLeftMs: 100, durRightMs: 70, depthLeftCents: 15, depthRightCents: 15, openEdgeCents: 0 };
   const optsFlat = { tempo: 120, defaultTransition: flat };
   const optsSmooth = { tempo: 120, defaultTransition: smooth };
+  // scoop: the §10.5 open-edge behaviour ON (100¢ reference below target) for the lead/release tests.
+  const scoop: Required<NoteTransition> = { offsetMs: 0, durLeftMs: 100, durRightMs: 100, depthLeftCents: 15, depthRightCents: 15, openEdgeCents: 100 };
+  const optsScoop = { tempo: 120, defaultTransition: scoop };
 
   it("flat transition = stepped base (pitch*100 + detune); a gap tick = unvoiced", () => {
     const notes = [mk("a", 0, 480, 60), mk("b", 480, 480, 62, { detune: 20 })];
@@ -113,11 +117,79 @@ describe("evalF0Cents (SynthV-aligned layering §10.3)", () => {
     expect(evalF0CentsAt(notes, undefined, 960, optsFlat).cents).toBe(6000);
   });
 
+  it("REGRESSION: vibrato on a lone/tail note (no next) modulates the line in its body (§user 尾音加不了颤音)", () => {
+    // A note with NO following note must still wiggle. Uses the shipped default's small onset/ease so it's
+    // visible without a multi-beat note (the old 250 ms onset + 200 ms fades suppressed it below ~2 beats).
+    const vib = { depthCents: 100, freqHz: 5.5, phase: 0, startMs: 0, easeInMs: 80, easeOutMs: 120 };
+    const notes = [mk("a", 0, 480, 60, { vibrato: vib })]; // a single 1-beat note, no neighbor
+    expect(Math.abs(evalF0CentsAt(notes, undefined, 240, optsFlat).cents - 6000)).toBeGreaterThan(20); // not flat
+  });
+
   it("evalF0CentsFrames yields the per-frame cents array + voiced mask", () => {
     const notes = [mk("a", 0, 100, 60)];
     const { cents, voiced } = evalF0CentsFrames(notes, undefined, { frameStartTick: 0, ticksPerFrame: 50, frameCount: 4 }, optsFlat);
     expect(cents.length).toBe(4);
     expect(Array.from(voiced)).toEqual([1, 1, 0, 0]); // ticks 0,50 ∈ [0,100); 100,150 rest
     expect(cents[0]).toBe(6000);
+  });
+
+  // ── §10.5 open-edge scoop-in / drift-out (isolated onset & release) ──
+  it("open-edge ONSET: an isolated first note scoops UP from below, then SNAPS to pitch (snappier than a glide)", () => {
+    const notes = [mk("a", 0, 480, 60)]; // single isolated note; openEdge 100¢, durLeft 100ms ≈ 96 ticks
+    const onset = evalF0CentsAt(notes, undefined, 4, optsScoop).cents; // just after the start
+    expect(onset).toBeLessThan(6000); // scooped BELOW the written pitch
+    expect(onset).toBeGreaterThan(6000 - 100 - 1); // but not past the reference (tone − 100)
+    // SNAP: the scoop is durLeft·OPEN_EDGE_SNAP (a fraction of the ~96-tick glide) — fully settled by tick 60,
+    // long before a note-to-note glide (durLeft ≈96) would. A full-duration scoop would still be mid-rise here.
+    expect(evalF0CentsAt(notes, undefined, 60, optsScoop).cents).toBeCloseTo(6000, 6);
+  });
+
+  it("open-edge RELEASE: an isolated last note drifts DOWN below its written pitch at the very end", () => {
+    const notes = [mk("a", 0, 480, 60)];
+    expect(evalF0CentsAt(notes, undefined, 479, optsScoop).cents).toBeLessThan(6000); // drifted below at the end
+    expect(evalF0CentsAt(notes, undefined, 200, optsScoop).cents).toBeCloseTo(6000, 6); // body still flat
+  });
+
+  it("REGRESSION F1: a large negative offset can't tear the lead↔cross handoff (no pitch jump)", () => {
+    // short A (isolated onset → leadCents) abuts B; B's big durLeft + very negative offset used to pull the
+    // A→B glide back into A's scoop region → a huge one-tick jump. The midpoint-bounded offset clamp fixes it.
+    const A = mk("a", 0, 100, 60);
+    const B = mk("b", 100, 480, 67, { transition: { durLeftMs: 400, offsetMs: -400 } });
+    const notes = [A, B];
+    let prev = evalF0CentsAt(notes, undefined, 0, optsScoop).cents;
+    let maxJump = 0;
+    for (let x = 1; x <= 100; x++) { // sweep A's whole span
+      const c = evalF0CentsAt(notes, undefined, x, optsScoop).cents;
+      maxJump = Math.max(maxJump, Math.abs(c - prev));
+      prev = c;
+    }
+    expect(maxJump).toBeLessThan(30); // continuous (a real glide moves <30¢ per tick here); pre-fix was ~665¢
+  });
+
+  it("open-edge scoop is OFF at 0 (parity) and never fires at a CONNECTED boundary", () => {
+    const notes = [mk("a", 0, 480, 60)];
+    const off = { tempo: 120, defaultTransition: { ...scoop, openEdgeCents: 0 } };
+    expect(evalF0CentsAt(notes, undefined, 4, off).cents).toBeCloseTo(6000, 6); // openEdge 0 → flat onset
+    // b abuts p → b's onset GLIDES from p (crossCents, above b's pitch), NOT a scoop from below
+    const seq = [mk("p", 0, 240, 62), mk("b", 240, 240, 60)];
+    expect(evalF0CentsAt(seq, undefined, 244, optsScoop).cents).toBeGreaterThan(6000);
+  });
+
+  // ── paintedDev: SynthV-pencil interval-replace with a fixed non-bleeding edge reconnect ──
+  it("paintedDev: stores the painted delta; edges return to 0 (no 整条平移 bleed)", () => {
+    const notes = [mk("a", 0, 480, 60)]; // flat auto-line = 6000¢
+    const c = paintedDev(notes, { xs: [240], ys: [6200] }, undefined, optsFlat); // +200¢ at tick 240
+    expect(c.ys[0]).toBe(0); // leftmost edge = original pitch (zero anchor a pad outside)
+    expect(c.ys[c.ys.length - 1]).toBe(0); // rightmost edge = original pitch
+    expect(Math.max(...c.ys)).toBe(200); // painted delta stored exactly (interval-replace)
+    expect(c.xs.length).toBe(3); // loA(0), painted(240,+200), hiA(0)
+  });
+
+  it("paintedDev: a multi-point stroke keeps its interior points + zero edges", () => {
+    const notes = [mk("a", 0, 480, 60)];
+    const c = paintedDev(notes, { xs: [200, 240, 280], ys: [6100, 6300, 6100] }, undefined, optsFlat);
+    expect(c.ys[0]).toBe(0);
+    expect(c.ys[c.ys.length - 1]).toBe(0);
+    expect(Math.max(...c.ys)).toBe(300); // +300¢ peak preserved exactly
   });
 });

@@ -321,6 +321,28 @@
     "restore": "元に戻す",
     "preview": "試聴",
     "stop": "停止",
-    "close": "閉じる"
+    "close": "閉じる",
+    "sidebar": {
+      "noteTransition": "ノート間の遷移",
+      "selectNoteHint": "編集するノートを選択",
+      "vibrato": "ビブラート",
+      "addVibrato": "ビブラート追加",
+      "removeVibrato": "ビブラート削除",
+      "trackTransition": "トラック既定の遷移",
+      "resetTrack": "既定値に戻す",
+      "resetInherit": "トラック既定に戻す",
+      "tr_offsetMs": "オフセット",
+      "tr_durLeftMs": "入り",
+      "tr_durRightMs": "抜け",
+      "tr_depthLeftCents": "入りの行き過ぎ",
+      "tr_depthRightCents": "抜けの行き過ぎ",
+      "tr_openEdgeCents": "端のすくい",
+      "vib_depthCents": "深さ",
+      "vib_freqHz": "速さ",
+      "vib_phase": "位相",
+      "vib_startMs": "開始",
+      "vib_easeInMs": "フェードイン",
+      "vib_easeOutMs": "フェードアウト"
+    }
   }
 }

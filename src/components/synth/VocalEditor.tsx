@@ -13,13 +13,14 @@ import { msToTicks } from "../../lib/audio/laneOps";
 import { TimeAxis } from "../../lib/timeAxis";
 import * as playback from "../../lib/audio/playback";
 import { resolveOverlaps, DEFAULT_TRANSITION } from "../../lib/vocalNotes";
-import { evalF0CentsAt } from "../../lib/f0eval";
+import { evalF0CentsAt, paintedDev } from "../../lib/f0eval";
 import {
   type VocalView, V_PITCH_MIN, V_PITCH_MAX, V_ROW_H_MIN, V_ROW_H_MAX,
   tickToX, xToTick, noteTickToX, xToNoteTick, pitchToY, yToPitch, centsToY, yToCents,
   rowsContentHeight, snapFloor, snapRound, isBlackKey, pitchName, pitchToHz, centsToHz,
 } from "../../lib/vocalGeometry";
-import type { Note, PitchCurve, NoteTransition } from "../../types/project";
+import type { Note } from "../../types/project";
+import { VocalSidebar } from "./VocalSidebar";
 import "./VocalEditor.css";
 
 type Tool = "arrow" | "pen" | "pitch" | "delete";
@@ -154,13 +155,16 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     if (!part) return;
     if (playRafRef.current) { cancelAnimationFrame(playRafRef.current); playRafRef.current = 0; } // clear any orphan
     const startMs = performance.now();
-    const opts = { tempo: tempoRef.current, defaultTransition: transitionRef.current };
     playback.playPreviewTone(centsToHz(6000), 0); // seed a sustained tone; retuned each frame
     setPlaying(true);
     const tick = () => {
       const rel = msToTicks(performance.now() - startMs, tempoRef.current);
       if (rel > durRef.current) { stopPreviewPlay(); return; } // reached the segment end
       const sorted = [...notesRef.current].sort((a, b) => a.tick - b.tick);
+      // Build opts PER-FRAME from the live refs so a sidebar edit to the TRACK-DEFAULT transition (or tempo)
+      // retunes the RUNNING preview immediately — else only the overlay updates and the audio stays stale
+      // until stop+replay (review finding E).
+      const opts = { tempo: tempoRef.current, defaultTransition: transitionRef.current };
       const r = evalF0CentsAt(sorted, pitchDevRef.current, rel, opts);
       playback.setPreviewToneHz(r.voiced ? centsToHz(r.cents) : 20); // rest → near-silent low freq
       playRafRef.current = requestAnimationFrame(tick);
@@ -1005,6 +1009,13 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
             />
           )}
         </div>
+        <VocalSidebar
+          trackId={part.trackId}
+          segmentId={segmentId}
+          notes={part.notes}
+          selectedIds={selectedNotes}
+          trackTransition={part.transition}
+        />
       </div>
     </div>
   );
@@ -1012,49 +1023,13 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
 
 // ── module helpers ──
 
-/** Merge a pitch-paint drag into the segment's pitchDev: each drawn (relTick, absCents) point becomes a
- *  DELTA vs the AUTOMATIC line (evalF0Cents with pitchDev=undefined — base ⊕ transition + vibrato), and the
- *  drawn x-span REPLACES that interval of the base curve (SynthV Pencil = interval-replace). Points outside
- *  the span are kept. Deduped by x (last wins); the store's normalizeCurve does the final rounding/quantize. */
-const PAINT_SMOOTH_PAD = 30; // ticks — PLACEHOLDER "reconnect" distance; the real pitch-smoothing is a future
-// tunable param (§10.4). The painted deviation eases back to 0 (the original pitch) over this pad on each side.
-function paintedDev(
-  notes: Note[],
-  paint: { xs: number[]; ys: number[] },
-  base: PitchCurve | undefined,
-  opts: { tempo: number; defaultTransition: Required<NoteTransition> },
-): PitchCurve {
-  // Each drawn (relTick, absCents) → the DELTA vs the automatic line (pitchDev=undefined); last sample per x.
-  const map = new Map<number, number>();
-  for (let i = 0; i < paint.xs.length; i++) {
-    const x = Math.round(paint.xs[i]!);
-    map.set(x, paint.ys[i]! - evalF0CentsAt(notes, undefined, x, opts).cents);
-  }
-  const dxs = [...map.keys()].sort((a, b) => a - b);
-  const xMin = dxs[0]!, xMax = dxs[dxs.length - 1]!;
-  // OUTSIDE the painted span the deviation returns to 0 (keep the un-edited pitch — §user: "the un-tuned part
-  // stays put; the tuned part follows the edit, then eases smoothly back to the original pitch at the ends").
-  // A pad on each side lets it ease back instead of stepping. Base points outside the padded span are kept.
-  const loA = Math.max(0, xMin - PAINT_SMOOTH_PAD), hiA = xMax + PAINT_SMOOTH_PAD;
-  const merged = new Map<number, number>();
-  if (base) for (let i = 0; i < base.xs.length; i++) {
-    const x = base.xs[i]!;
-    if (x < loA || x > hiA) merged.set(x, base.ys[i]!);
-  }
-  merged.set(loA, 0); // ease-in anchor at the original pitch
-  merged.set(hiA, 0); // ease-out anchor
-  for (const x of dxs) merged.set(x, map.get(x)!); // painted span overrides (incl. an anchor at the same x)
-  const xs = [...merged.keys()].sort((a, b) => a - b);
-  return { xs, ys: xs.map((x) => merged.get(x)!) };
-}
-
 /** Full per-note content signature for the commit diff (mirrors history.ts noteSig, minus id which is the
  *  diff key). ⚠ MUST cover EVERY editable field: commitNotes drops an edit whose sig is unchanged, so a
  *  transition/vibrato/pitchAuto-only edit would be SILENTLY lost if the sig omitted them (silent-regression
  *  class). Keep in lockstep with history.ts noteSig. */
 function noteSig(n: Note): string {
   const t = n.transition;
-  const tr = t ? `${t.offsetMs ?? ""}|${t.durLeftMs ?? ""}|${t.durRightMs ?? ""}|${t.depthLeftCents ?? ""}|${t.depthRightCents ?? ""}` : "";
+  const tr = t ? `${t.offsetMs ?? ""}|${t.durLeftMs ?? ""}|${t.durRightMs ?? ""}|${t.depthLeftCents ?? ""}|${t.depthRightCents ?? ""}|${t.openEdgeCents ?? ""}` : "";
   const v = n.vibrato;
   const vib = v ? `${v.depthCents},${v.freqHz},${v.phase},${v.startMs},${v.easeInMs},${v.easeOutMs}` : "";
   return (

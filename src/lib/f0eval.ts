@@ -53,8 +53,9 @@ function findNoteAt(notes: readonly Note[], relTick: number): number {
 /** Note's WRITTEN base pitch in cents (tone + fine detune). */
 const noteCents = (n: Note): number => n.pitch * 100 + (n.detune ?? 0);
 
-/** Effective transition for a note = track default ⊕ per-note override (per field). */
-function effTransition(n: Note, def: Required<NoteTransition>): Required<NoteTransition> {
+/** Effective transition for a note = track default ⊕ per-note override (per field). Exported so the property
+ *  sidebar shows the SAME effective values it evaluates with (one definition, no drift). */
+export function effTransition(n: Note, def: Required<NoteTransition>): Required<NoteTransition> {
   const t = n.transition;
   if (!t) return def;
   return {
@@ -63,6 +64,7 @@ function effTransition(n: Note, def: Required<NoteTransition>): Required<NoteTra
     durRightMs: t.durRightMs ?? def.durRightMs,
     depthLeftCents: t.depthLeftCents ?? def.depthLeftCents,
     depthRightCents: t.depthRightCents ?? def.depthRightCents,
+    openEdgeCents: t.openEdgeCents ?? def.openEdgeCents,
   };
 }
 
@@ -87,9 +89,14 @@ function crossCents(A: Note, B: Note, relTick: number, opts: F0EvalOpts): number
   const tB = effTransition(B, opts.defaultTransition);
   const durR = Math.min(msToTicks(tA.durRightMs, opts.tempo), A.duration / 2); // A leaves early, ≤ half of A
   const durL = Math.min(msToTicks(tB.durLeftMs, opts.tempo), B.duration / 2); // B arrives late, ≤ half of B
-  // SynthV Offset shifts the crossover in time (B owns the seam); CLAMP it so the glide always straddles the
-  // boundary — a larger offset would detach the glide from the note edge and jump discontinuously.
-  const off = Math.max(-durL, Math.min(durR, msToTicks(tB.offsetMs, opts.tempo)));
+  // SynthV Offset shifts the crossover in time (B owns the seam). CLAMP it so the glide stays within BOTH notes'
+  // INNER halves — never past A's or B's midpoint. Beyond simply keeping the glide on the boundary, this stops a
+  // departure/arrival from overrunning into the neighbour's §10.5 onset-scoop / release-drift region, which would
+  // otherwise leave a discontinuity at the lead/release↔cross handoff (verify F1). For normal (long) notes it is
+  // identical to the old [-durL, durR] clamp; it only tightens when a short note's half is the binding limit.
+  const loOff = Math.max(-durL, durR - A.duration / 2);
+  const hiOff = Math.min(durR, B.duration / 2 - durL);
+  const off = Math.max(loOff, Math.min(hiOff, msToTicks(tB.offsetMs, opts.tempo)));
   const t0 = A.tick + A.duration - durR + off;
   const t1 = B.tick + durL + off;
   const span = t1 - t0;
@@ -101,6 +108,50 @@ function crossCents(A: Note, B: Note, relTick: number, opts: F0EvalOpts): number
   // SAME-pitch seam (dir 0) gets NO bump, so a sustained/tie seam stays flat (审查 #2/#4).
   const dir = Math.sign(cB - cA);
   return base + dir * (tA.depthRightCents * departBump(s) + tB.depthLeftCents * arriveBump(s));
+}
+
+// The open-edge scoop/drift is much SNAPPIER than a note-to-note glide (§user; SynthV's AI attack is ~30–80 ms
+// vs the ~100 ms portamento). It reuses durLeft/durRight but scaled by this factor AND with a front-loaded ease,
+// so a phrase's first/last note SNAPS to pitch instead of a slow portamento (which reads as out-of-tune). The
+// note↔note crossCents glide is untouched — it keeps the full duration + smooth sineInOut S-curve.
+const OPEN_EDGE_SNAP = 0.2;
+
+/**
+ * ② Isolated-ONSET scoop (§10.5): a note with NO connected previous note doesn't start flat at its written pitch
+ * — over a SHORT durLeft·OPEN_EDGE_SNAP it scoops UP (fast/near-vertical `sineOut`) from `tone − openEdgeCents`
+ * to `tone` with the depthLeft overshoot (SynthV's AI attack, synthesized). Confined to the scoop span (≤ half
+ * the note); null outside / when disabled (durLeft=0 or openEdgeCents=0 → flat onset = pre-§10.5 parity).
+ */
+function leadCents(note: Note, relTick: number, opts: F0EvalOpts): number | null {
+  const t = effTransition(note, opts.defaultTransition);
+  const durL = Math.min(msToTicks(t.durLeftMs, opts.tempo) * OPEN_EDGE_SNAP, note.duration / 2);
+  if (durL <= 0 || t.openEdgeCents <= 0) return null;
+  const t1 = note.tick + durL;
+  if (relTick < note.tick || relTick > t1) return null;
+  const tone = noteCents(note);
+  const from = tone - t.openEdgeCents; // scoop reference below the target
+  const s = (relTick - note.tick) / durL;
+  const base = from + (tone - from) * interpShape(s, "sineOut"); // FAST rise (near-vertical) then settle
+  return base + t.depthLeftCents * arriveBump(s); // dir = +1 (scoop up) → overshoot above target, settle at s=1
+}
+
+/**
+ * ② Isolated-RELEASE drift (§10.5): a note with NO connected next note doesn't end flat — over a SHORT
+ * durRight·OPEN_EDGE_SNAP it holds, then falls STEEPLY (`sineIn`) from `tone` DOWN to `tone − openEdgeCents` with
+ * the depthRight bump (SynthV's AI release, synthesized; vibrato rides on top). Confined to the release span
+ * (≤ half the note); null outside / when disabled.
+ */
+function releaseCents(note: Note, relTick: number, opts: F0EvalOpts): number | null {
+  const t = effTransition(note, opts.defaultTransition);
+  const durR = Math.min(msToTicks(t.durRightMs, opts.tempo) * OPEN_EDGE_SNAP, note.duration / 2);
+  if (durR <= 0 || t.openEdgeCents <= 0) return null;
+  const end = note.tick + note.duration, t0 = end - durR;
+  if (relTick < t0 || relTick > end) return null;
+  const tone = noteCents(note);
+  const to = tone - t.openEdgeCents; // drift reference below the target
+  const s = (relTick - t0) / durR; // 0 at the start of the release, 1 at the note end
+  const base = tone + (to - tone) * interpShape(s, "sineIn"); // long hold then STEEP fall at the very end
+  return base - t.depthRightCents * departBump(s); // dir = −1 (drift down) → overshoot below mid-release
 }
 
 /** ④ Vibrato (SynthV): starts after `startMs` (short notes stay flat), oscillates at `freqHz` with `phase`
@@ -138,12 +189,15 @@ export function evalF0CentsAt(
   const idx = findNoteAt(notes, relTick);
   if (idx < 0) return { cents: dev, voiced: false };
   const note = notes[idx]!;
-  // ② transition OVERRIDES the staircase in its span: try the incoming (prev→note) then outgoing (note→next)
-  //    boundary; the half-note clamps keep the two spans from overlapping inside the note, so at most one
-  //    applies. (Neighbor selection notes[idx±1] relies on tick-sorted input, as findNoteAt does.)
-  let cents: number | null = null;
-  if (idx > 0) cents = crossCents(notes[idx - 1]!, note, relTick, opts);
-  if (cents === null && idx < notes.length - 1) cents = crossCents(note, notes[idx + 1]!, relTick, opts);
+  // ② transition OVERRIDES the staircase near a boundary. CONNECTED (abutting) boundary → crossCents glides
+  //    to/from the real neighbour; OPEN boundary (no abutting neighbour) → lead/releaseCents synthesize the
+  //    SynthV scoop-in / drift-out from the openEdge reference (§10.5). The half-note clamps keep this note's own
+  //    onset & release spans from overlapping, and crossCents' midpoint-bounded offset keeps a neighbour's glide
+  //    off this note's scoop/drift region, so the hand-offs stay continuous. (Neighbour selection needs sorted input.)
+  const prevAbut = idx > 0 && notes[idx - 1]!.tick + notes[idx - 1]!.duration === note.tick;
+  const nextAbut = idx < notes.length - 1 && notes[idx + 1]!.tick === note.tick + note.duration;
+  let cents: number | null = prevAbut ? crossCents(notes[idx - 1]!, note, relTick, opts) : leadCents(note, relTick, opts);
+  if (cents === null) cents = nextAbut ? crossCents(note, notes[idx + 1]!, relTick, opts) : releaseCents(note, relTick, opts);
   if (cents === null) cents = noteCents(note); // ① stable staircase
   cents += dev; // ③
   if (note.vibrato) cents += evalVibrato(note, relTick - note.tick, opts.tempo); // ④
@@ -174,4 +228,42 @@ export function evalF0CentsFrames(
     voiced[f] = r.voiced ? 1 : 0;
   }
   return { cents, voiced };
+}
+
+const PAINT_EDGE_PAD = 30; // ticks — fixed reconnection pad: a painted pitchDev eases (linearly) back to the
+// original pitch over this pad on each side, so it never bleeds a constant offset out to the segment start.
+
+/**
+ * Merge a pitch-paint drag into a segment's pitchDev curve (SynthV Pencil = interval-replace). Each drawn
+ * (relTick, absCents) point becomes a DELTA vs the AUTOMATIC line (evalF0Cents with pitchDev=undefined —
+ * base ⊕ transition + vibrato); the drawn x-span REPLACES that interval, and a zero anchor a fixed pad outside
+ * each end makes the deviation ease (linearly, via evalCurveAt) back to the original pitch — so a painted
+ * deviation can never bleed a constant offset out to the segment start (the S51 整条平移 bug). Base points
+ * outside the padded span are kept; the store's normalizeCurve does the final round/quantize/dedup. Pure.
+ */
+export function paintedDev(
+  notes: readonly Note[],
+  paint: { xs: number[]; ys: number[] },
+  base: PitchCurve | undefined,
+  opts: F0EvalOpts,
+): PitchCurve {
+  // Each drawn (relTick, absCents) → the DELTA vs the automatic line (pitchDev=undefined); last sample per x.
+  const map = new Map<number, number>();
+  for (let i = 0; i < paint.xs.length; i++) {
+    const x = Math.round(paint.xs[i]!);
+    map.set(x, paint.ys[i]! - evalF0CentsAt(notes, undefined, x, opts).cents);
+  }
+  const dxs = [...map.keys()].sort((a, b) => a - b);
+  const xMin = dxs[0]!, xMax = dxs[dxs.length - 1]!;
+  const loA = Math.max(0, xMin - PAINT_EDGE_PAD), hiA = xMax + PAINT_EDGE_PAD;
+  const merged = new Map<number, number>();
+  if (base) for (let i = 0; i < base.xs.length; i++) {
+    const x = base.xs[i]!;
+    if (x < loA || x > hiA) merged.set(x, base.ys[i]!);
+  }
+  merged.set(loA, 0); // zero anchors just outside → linear ease back to the original pitch (no 整条平移 bleed)
+  merged.set(hiA, 0);
+  for (const x of dxs) merged.set(x, map.get(x)!); // painted points (interval-replace); an anchor at xMin is overridden
+  const xs = [...merged.keys()].sort((a, b) => a - b);
+  return { xs, ys: xs.map((x) => merged.get(x)!) };
 }
