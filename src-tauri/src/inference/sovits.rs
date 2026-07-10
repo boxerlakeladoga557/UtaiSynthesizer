@@ -292,27 +292,9 @@ fn infer_segment(
     let mut c = repeat_expand_2d(&c_raw, n_frames, expand_mode)?;
     report(p_cv); // content features done
 
-    // ── cluster / feature retrieval (get_unit_f0 cluster_infer_ratio path) ──
-    if options.cluster_ratio > 0.0 {
-        match m.cluster {
-            Some(ClusterAsset::FeatureIndex(index)) => {
-                // identical weighting to RVC retrieval (original squared-L2 metric —
-                // the cosine option is RVC-only); blend handled inside knn_blend
-                c = knn_blend(&c, index, options.cluster_ratio, false);
-            }
-            Some(ClusterAsset::KmeansCenters(centers)) => {
-                let cluster_c = nearest_cluster_centers(&c, centers);
-                let r = options.cluster_ratio;
-                c.zip_mut_with(&cluster_c, |orig, &cl| *orig = r * cl + (1.0 - r) * *orig);
-            }
-            None => {
-                tracing::warn!(
-                    "cluster_ratio={} 但该模型没有可用的聚类/检索资产——跳过（与原版缺文件时的行为一致）",
-                    options.cluster_ratio
-                );
-            }
-        }
-    }
+    // ── cluster / feature retrieval (get_unit_f0 cluster_infer_ratio path) — extracted to
+    //    apply_cluster_blend so the ② score render blends the SAME retrieval asset identically ──
+    apply_cluster_blend(&mut c, m.cluster, options.cluster_ratio);
 
     // ── vol (utils.Volume_Extractor on the padded model-sr signal, iff vol_embedding) ──
     let vol = if m.vol_embedding {
@@ -329,6 +311,51 @@ fn infer_segment(
         None
     };
 
+    // ── quality-path decode (shared with the ② score render — see decode_features) ──
+    let mut out = decode_features(
+        m, c, f0, uv, vol, &wav_m, seg_idx, n_frames, has_diff, p_vits, options, report, cancel,
+    )?;
+
+    // ── loudness envelope: original applies change_rms INSIDE infer(), i.e. on the
+    //    still-PADDED input/output, BEFORE slice_inference trims — mirror that order ──
+    if options.loudness_envelope != 1.0 {
+        change_rms(&wav_m, m.sample_rate, &mut out, m.sample_rate, options.loudness_envelope);
+    }
+
+    // ── slice_inference output handling: trim int(target_sample·pad_seconds). (The
+    //    per_length pad_array is the caller's — matches _audio = pad_array(_audio, per).) ──
+    if out.len() <= 2 * pad_out {
+        // Unreachable given the guard above (kept defensive), treat as degenerate.
+        report(1.0);
+        return Ok(Vec::new());
+    }
+    let trimmed = out[pad_out..out.len() - pad_out].to_vec();
+    report(1.0);
+    Ok(trimmed)
+}
+
+/// Decode already-extracted content/f0/uv/vol through the SoVITS quality path → UNtrimmed wav.
+/// Verbatim tail of `infer_segment` (spk_mix feed → auto-f0 → VITS net_g → shallow/only diffusion
+/// → NSF enhancer), pulled out so the ② score render (`render_score_sovits`) drives the SAME
+/// quality path instead of a bespoke net_g-only copy. `wav_m` is only read by the only_diffusion
+/// no-vol basis (score always passes vol=Some → unused there). Byte-identical to the inlined
+/// version — proven at the source (scratchpad/verbatim_check.py) since the net_g graph is stochastic.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_features(
+    m: &SovitsModel,
+    mut c: Array2<f32>,
+    mut f0: Vec<f32>,
+    uv: Vec<f32>,
+    vol: Option<Vec<f32>>,
+    wav_m: &[f32],
+    seg_idx: u64,
+    n_frames: usize,
+    has_diff: bool,
+    p_vits: f32,
+    options: &SovitsOptions,
+    report: &dyn Fn(f32),
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<Vec<f32>> {
     let t = n_frames as i64;
 
     // ── ①c speaker feed: a multi-speaker graph (m.spk_mix = Some(n_spk)) takes a dense
@@ -497,7 +524,7 @@ fn infer_segment(
                 None => {
                     let basis: &[f32] = match &vits_out {
                         Some(a) => a,
-                        None => &wav_m,
+                        None => wav_m,
                     };
                     extract_volume(basis, m.hop_size)
                 }
@@ -546,22 +573,31 @@ fn infer_segment(
     }
     report(0.95);
 
-    // ── loudness envelope: original applies change_rms INSIDE infer(), i.e. on the
-    //    still-PADDED input/output, BEFORE slice_inference trims — mirror that order ──
-    if options.loudness_envelope != 1.0 {
-        change_rms(&wav_m, m.sample_rate, &mut out, m.sample_rate, options.loudness_envelope);
-    }
+    Ok(out)
+}
 
-    // ── slice_inference output handling: trim int(target_sample·pad_seconds). (The
-    //    per_length pad_array is the caller's — matches _audio = pad_array(_audio, per).) ──
-    if out.len() <= 2 * pad_out {
-        // Unreachable given the guard above (kept defensive), treat as degenerate.
-        report(1.0);
-        return Ok(Vec::new());
+/// cluster / feature-retrieval blend (get_unit_f0 cluster_infer_ratio) — mutate `c` in place.
+/// Shared by the cover pipeline AND the ② score render so both blend the retrieval asset the
+/// exact same way (DRY; the S36 squared-L2 metric, cosine is RVC-only).
+pub(crate) fn apply_cluster_blend(c: &mut Array2<f32>, cluster: Option<&ClusterAsset>, cluster_ratio: f32) {
+    if cluster_ratio > 0.0 {
+        match cluster {
+            Some(ClusterAsset::FeatureIndex(index)) => {
+                *c = knn_blend(c, index, cluster_ratio, false);
+            }
+            Some(ClusterAsset::KmeansCenters(centers)) => {
+                let cluster_c = nearest_cluster_centers(c, centers);
+                let r = cluster_ratio;
+                c.zip_mut_with(&cluster_c, |orig, &cl| *orig = r * cl + (1.0 - r) * *orig);
+            }
+            None => {
+                tracing::warn!(
+                    "cluster_ratio={} 但该模型没有可用的聚类/检索资产——跳过（与原版缺文件时的行为一致）",
+                    cluster_ratio
+                );
+            }
+        }
     }
-    let trimmed = out[pad_out..out.len() - pad_out].to_vec();
-    report(1.0);
-    Ok(trimmed)
 }
 
 /// Domain-separation constant XORed into the user seed for the DIFFUSION noise stream —

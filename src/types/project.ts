@@ -1,3 +1,5 @@
+import type { RvcOptions, SovitsOptions } from "../lib/workflow/voiceDefaults";
+
 export interface LaneControl {
   volumeDb: number;
   pan: number;
@@ -205,6 +207,16 @@ export interface VocalTrackParams {
   /** Track-level DEFAULT note transition — every field concrete. A note's NoteTransition overrides it
    *  per-field, so every note has a smooth SynthV-style glide by default (§10.3). */
   transition: Required<NoteTransition>;
+  /** Item-1 quality-path overrides — only the keys the user CHANGED from the contract default are stored
+   *  (absent = SOVITS_DEFAULTS/RVC_DEFAULTS). The render (render_vocal_segment) fills the full contract and
+   *  force-neutralizes the params that would break the ② render (auto_f0 / f0_shift / loudness / only_diff /
+   *  rms_mix). `backend` picks which one is used. */
+  sovits?: Partial<SovitsOptions>;
+  rvc?: Partial<RvcOptions>;
+  /** M3 breath: the lyric token that means "audible inhale". Mapped to the canonical `AP` phone at render
+   *  time, so the user can pick a convenient trigger without the breath function stealing a glyph they need
+   *  as a real lyric. Absent = "AP" (the default; `ap` also works, being AP's case variant Rust-side). */
+  breathToken?: string;
 }
 
 export interface Workflow {

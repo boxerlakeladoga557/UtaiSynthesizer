@@ -42,6 +42,11 @@ export function contentEndTick(tracks: Track[]): number {
   for (const t of tracks) {
     for (const s of t.segments) {
       if (s.loading || (s.content.type !== "audioClip" && !segmentPlaysLanes(t, s))) continue;
+      // The segment BOX (durationTicks) is the content extent playback runs to — for a ② vocal segment
+      // whose baked stem is SHORTER than the box (the notes don't fill it), playback continues through the
+      // silent tail to the box end rather than stopping the instant the last note's audio finishes (the
+      // premature-pause ghost). The transport stops when the PLAYHEAD reaches here (Toolbar rAF), NOT when
+      // the audio sources end — see the natural-end guard.
       const e = s.startTick + s.durationTicks;
       if (e > end) end = e;
     }

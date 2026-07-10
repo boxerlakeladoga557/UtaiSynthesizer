@@ -36,6 +36,11 @@ export function Toolbar() {
   const baseTimeRef = useRef(0);
   const animatingRef = useRef(false);
   const wasPlayingRef = useRef(false);
+  // Content extent (last segment box end) the playhead runs to — the transport stops when the PLAYHEAD
+  // reaches here, NOT when the audio sources end, so a ② vocal stem shorter than its box plays through the
+  // silent tail to the segment end instead of pausing mid-segment (the premature-pause ghost). Cached +
+  // refreshed at play-start / on a structural (scheduleVersion) edit so the rAF doesn't recompute per frame.
+  const contentEndRef = useRef(0);
 
   // Playhead advance loop during playback.
   useEffect(() => {
@@ -52,6 +57,7 @@ export function Toolbar() {
       : playback.getContextTime();
     wasPlayingRef.current = true;
     animatingRef.current = true;
+    contentEndRef.current = contentEndTick(useProjectStore.getState().tracks);
 
     const animate = () => {
       if (!animatingRef.current) return;
@@ -62,7 +68,17 @@ export function Toolbar() {
         baseTimeRef.current = playback.getContextTime();
       } else {
         const elapsed = playback.getContextTime() - baseTimeRef.current;
-        setPlayhead(Math.round(baseTickRef.current + playback.secondsToTicks(elapsed, tempo)));
+        const tick = Math.round(baseTickRef.current + playback.secondsToTicks(elapsed, tempo));
+        setPlayhead(tick);
+        // Natural end = the PLAYHEAD reaching the content extent (segment box end), not the audio sources
+        // ending. This plays THROUGH a silent tail (a ② vocal stem shorter than its box) to the segment
+        // end instead of pausing the instant the last note finished (the reported premature-pause ghost).
+        const end = contentEndRef.current;
+        if (end > 0 && tick >= end) {
+          animatingRef.current = false;
+          onPlaybackEnded();
+          return;
+        }
       }
       animRef.current = requestAnimationFrame(animate);
     };
@@ -85,8 +101,15 @@ export function Toolbar() {
     // Ignore a natural end that fires mid-seek — the seek reschedules from the new position on
     // release; stopping/snapping here would clobber the drag and silently kill playback.
     if (useAudioStore.getState().seeking) return;
-    setPlaying(false);
     const end = contentEndTick(useProjectStore.getState().tracks);
+    // The natural end is the PLAYHEAD reaching the content extent, NOT the audio sources ending. When the
+    // audio finishes BEFORE the content extent (a ② vocal stem shorter than its segment box), the sources'
+    // onAllEnded fires mid-segment — IGNORE it and keep playing; the rAF advances the playhead through the
+    // silent tail and calls back here once it actually reaches `end`. This fixes the premature pause +
+    // playhead jump the instant the last note finished.
+    if (end > 0 && useProjectStore.getState().playheadTick < end - 1) return;
+    animatingRef.current = false;
+    setPlaying(false);
     if (end > 0) setPlayhead(end);
   }, [setPlaying, setPlayhead]);
 
@@ -147,6 +170,7 @@ export function Toolbar() {
   // Reschedule when a committed clip edit (move/resize/delete) changed segment timing mid-playback.
   useEffect(() => {
     if (scheduleVersion === 0) return; // initial mount — nothing scheduled yet
+    contentEndRef.current = contentEndTick(useProjectStore.getState().tracks); // structural edit moved the end
     if (useAudioStore.getState().seeking) return; // an active seek reschedules on its own release
     rescheduleNow();
     // eslint-disable-next-line react-hooks/exhaustive-deps

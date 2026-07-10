@@ -6,7 +6,9 @@
 //   3. deposit the baked wav as a processedOutputs OVERLAY — non-undoable (sig-invisible) and it rides
 //      the SAME lane machinery as an audio track's sub-lanes, so it plays back / persists / mutes for free.
 import { invoke } from "@tauri-apps/api/core";
+import type { RvcOptions, SovitsOptions } from "../workflow/voiceDefaults";
 import { evalF0CentsFrames } from "../f0eval";
+import { isBreathLyric } from "../vocalNotes";
 import { msToTicks } from "../audio/laneOps";
 import { useProjectStore } from "../../store/project";
 import { useAppStore } from "../../store/app";
@@ -26,15 +28,17 @@ export interface ScoreTriple {
   frames: number;
 }
 
-/** Wire options mirroring Rust `VocalRenderOptions` (snake_case — Tauri passes them through verbatim). */
+/** Wire options mirroring Rust `VocalRenderOptions` (snake_case — Tauri passes them through verbatim).
+ *  Item-1: the backend-specific quality knobs REUSE the SoVITS/RVC contracts (`sovits`/`rvc`), the FULL
+ *  object each (defaults + the user's overrides). The command force-neutralizes auto_f0/f0_shift/loudness/
+ *  only_diffusion/rms_mix (they'd break the ② render). */
 export interface VocalRenderOptions {
   backend: "sovits" | "rvc";
   cv_speaker_id: number;
   lang_id: number;
   transpose: number;
-  noise_scale: number;
-  seed: number;
-  gpu_extract: boolean;
+  sovits: SovitsOptions;
+  rvc: RvcOptions;
 }
 
 /**
@@ -49,10 +53,15 @@ export function buildVocalScore(
   pitchDev: PitchCurve | undefined,
   tempo: number,
   defaultTransition: Required<NoteTransition>,
+  breathToken: string,
 ): { triples: ScoreTriple[]; f0Cents: number[]; f0Voiced: number[] } {
   const ticksPerFrame = msToTicks(1000 / RENDER_FPS, tempo); // 20 ms per 50fps frame
   const frameOf = (relTick: number) => Math.round(relTick / ticksPerFrame);
   const sorted = [...notes].sort((a, b) => a.tick - b.tick || (a.id < b.id ? -1 : 1));
+  // M3 breath: a breath lyric (canonical AP/ap or the track's trigger) maps to the `AP` phone Rust
+  // recognizes. It is also UNVOICED — dropped from the pitch chain below so it breaks the line and the
+  // neighbours get the §10.5 release/scoop (段中尾音) instead of gliding into/out of the breath.
+  const mapLyric = (l: string) => (isBreathLyric(l, breathToken) ? "AP" : l);
 
   const triples: ScoreTriple[] = [];
   let cursor = 0; // segment-relative tick covered so far
@@ -65,13 +74,17 @@ export function buildVocalScore(
       if (restFrames > 0) triples.push({ lyric: "R", note_num: 0, frames: restFrames });
     }
     const noteFrames = frameOf(end) - frameOf(start);
-    if (noteFrames > 0) triples.push({ lyric: n.lyric, note_num: n.pitch, frames: noteFrames });
+    if (noteFrames > 0) triples.push({ lyric: mapLyric(n.lyric), note_num: n.pitch, frames: noteFrames });
     cursor = end;
   }
 
   const frameCount = frameOf(cursor); // cursor == last note end == Σ(triple frames)
+  // f0 sees the notes WITHOUT breaths (they're unvoiced): a breath's frames fall in a rest gap → voiced 0,
+  // and its neighbours become phrase edges (release-drift before, onset-scoop after). frameCount is unchanged
+  // (it's the triple cursor incl. breath frames), so the array length still equals Σ(triple frames).
+  const pitchNotes = sorted.filter((n) => !isBreathLyric(n.lyric, breathToken));
   const { cents, voiced } = evalF0CentsFrames(
-    sorted,
+    pitchNotes,
     pitchDev,
     { frameStartTick: 0, ticksPerFrame, frameCount },
     { tempo, defaultTransition },

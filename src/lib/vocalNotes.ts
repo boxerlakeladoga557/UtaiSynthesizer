@@ -9,6 +9,7 @@
 // and the loader without a cycle. The reserved-token / OOV classifier that decides rest/sustain/绿-render
 // is Rust `validate_lyrics` (§9.5) — NOT here; the tie-mirror invariant lands in Phase 6 with render.
 import type { Note, PitchCurve, NoteTransition, VocalTrackParams } from "../types/project";
+import { RVC_DEFAULTS, SOVITS_DEFAULTS } from "./workflow/voiceDefaults";
 
 // ── bounds (defensive; valid editor input never trips them, a corrupt file does) ──
 export const PITCH_MIN = 0;
@@ -203,6 +204,19 @@ export function resolveOverlaps(notes: Note[], activeIds: Set<string>, minTicks:
 }
 
 /**
+ * M3 breath: whether a lyric token renders as an audible INHALE — the canonical `AP`/`ap` the Rust
+ * classifier hard-wires, OR the track's user-chosen breath trigger (VocalTrackParams.breathToken). A breath
+ * is UNVOICED and breaks the pitch line: f0eval + the render drop it from the connected pitch chain, so the
+ * previous note gets the §10.5 release-drift (段中尾音) and the next note the onset-scoop. Dynamic — changing
+ * breathToken re-classifies the OLD token's notes (they become normal, connected lyrics again).
+ */
+export function isBreathLyric(lyric: string, breathToken: string): boolean {
+  const l = lyric.trim();
+  const bt = breathToken.trim();
+  return l === "AP" || l === "ap" || (bt !== "" && l === bt);
+}
+
+/**
  * Sanitize loaded track vocal params (§9.8.1): a corrupt `.usp` can carry a bad backend / out-of-range
  * speaker or lang id / non-finite transpose that later mis-indexes a ScoreToCV input. Absent → undefined.
  */
@@ -222,5 +236,23 @@ export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrack
       depthRightCents: clampNum(tr.depthRightCents ?? NaN, -1200, 1200, DEFAULT_TRANSITION.depthRightCents),
       openEdgeCents: clampNum(tr.openEdgeCents ?? NaN, 0, 1200, DEFAULT_TRANSITION.openEdgeCents),
     },
+    sovits: sanitizeOpts(p.sovits, SOVITS_DEFAULTS),
+    rvc: sanitizeOpts(p.rvc, RVC_DEFAULTS),
+    breathToken: typeof p.breathToken === "string" && p.breathToken.trim() ? p.breathToken : "AP",
   };
+}
+
+/** Keep only known contract keys from a quality-override bag + drop non-finite numbers; the Rust serde
+ *  re-validates the full shape (an unknown-shape value errors loudly there). Absent → undefined. */
+function sanitizeOpts<T extends object>(raw: unknown, defaults: T): Partial<T> | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const src = raw as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(defaults)) {
+    if (!(k in src)) continue;
+    const v = src[k];
+    if (typeof v === "number" && !Number.isFinite(v)) continue;
+    out[k] = v;
+  }
+  return Object.keys(out).length ? (out as Partial<T>) : undefined;
 }

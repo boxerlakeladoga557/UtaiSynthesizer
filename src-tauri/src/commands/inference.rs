@@ -820,6 +820,64 @@ pub async fn run_rvc(
     .map_err(|e| format!("推理任务失败: {}", e))?
 }
 
+/// Resolve the SoVITS cluster / feature-retrieval asset (`<stem>.cluster/` sibling npy) for the dominant
+/// speaker — SHARED by 翻唱 (run_sovits) AND 自己唱 (render_vocal_segment). Returns None when cluster_ratio
+/// ≤ 0, no asset exists, or a present file is unreadable (the blend is optional — a bad file must not abort
+/// the render, matching the original's missing-file skip). ①c: under a blend the asset follows the
+/// max-weight speaker; without a blend it's just `speaker_id` (fallback 0).
+fn resolve_cluster_asset(
+    app: &Arc<AppState>,
+    entry: &crate::models::ModelEntry,
+    spk_mix: &[crate::inference::SpkMixEntry],
+    speaker_id: Option<u32>,
+    cluster_ratio: f32,
+) -> Option<sovits::ClusterAsset> {
+    if cluster_ratio <= 0.0 {
+        return None;
+    }
+    let spk = crate::inference::dominant_speaker(spk_mix, speaker_id);
+    let parent = entry.path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let stem = entry.path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let model_dir = parent.join(format!("{}.cluster", stem)); // primary probe; falls back to `parent`
+    let safe = |name: &str| -> String {
+        name.chars()
+            .map(|c| if matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+            .collect()
+    };
+
+    let mut found = None;
+    'dirs: for dir in [&model_dir, &parent] {
+        let index_path = dir.join(format!("{}.index_vectors.npy", spk));
+        if index_path.exists() {
+            match app.inference.load_npy(&index_path) {
+                Ok(arr) => {
+                    found = Some(sovits::ClusterAsset::FeatureIndex(
+                        crate::inference::features::KnnIndex::new((*arr).clone()),
+                    ));
+                    break;
+                }
+                Err(e) => tracing::warn!("retrieval asset {} failed to load — skipping cluster blend: {}", index_path.display(), e),
+            }
+        }
+        // kmeans 文件名用 speaker 名（config.speakers 反查 id）
+        for (name, _) in entry.config.speakers.iter().filter(|(_, &id)| id == spk) {
+            let kmeans_path = dir.join(format!("{}.centers.npy", safe(name)));
+            if kmeans_path.exists() {
+                match app.inference.load_npy(&kmeans_path) {
+                    Ok(arr) => {
+                        found = Some(sovits::ClusterAsset::KmeansCenters(
+                            crate::inference::features::KnnIndex::new((*arr).clone()),
+                        ));
+                        break 'dirs;
+                    }
+                    Err(e) => tracing::warn!("cluster asset {} failed to load — skipping cluster blend: {}", kmeans_path.display(), e),
+                }
+            }
+        }
+    }
+    found
+}
+
 // ─── run_sovits ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -925,57 +983,8 @@ pub async fn run_sovits(
     //   kmeans： <speaker_name>.centers.npy（speaker 名字键，可能是中文；
     //             路径非法字符按 export_cluster 的 _safe_name 规则 →'_'，[K, dim]）
     // 兼容手动平铺在模型旁的旧摆法。
-    let cluster = if options.cluster_ratio > 0.0 {
-        // ①c: under a blend, the retrieval/cluster asset follows the DOMINANT (max-weight)
-        // speaker; without a blend this is just speaker_id (fallback 0) — unchanged behavior.
-        let spk = crate::inference::dominant_speaker(&options.spk_mix, options.speaker_id);
-        let parent = entry.path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        let stem = entry.path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-        let cluster_dir = parent.join(format!("{}.cluster", stem));
-        let model_dir = cluster_dir; // primary probe location; falls back to `parent` below
-        let safe = |name: &str| -> String {
-            name.chars()
-                .map(|c| if matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
-                .collect()
-        };
-
-        let mut found = None;
-        // A present-but-unreadable cluster asset (wrong dtype/rank) is treated as ABSENT — the
-        // cluster blend is optional, so a bad file must not abort the whole 翻唱 (matches the
-        // original's missing-file skip). Warn and fall through to None.
-        'dirs: for dir in [&model_dir, &parent] {
-            let index_path = dir.join(format!("{}.index_vectors.npy", spk));
-            if index_path.exists() {
-                match app.inference.load_npy(&index_path) {
-                    Ok(arr) => {
-                        found = Some(sovits::ClusterAsset::FeatureIndex(
-                            crate::inference::features::KnnIndex::new((*arr).clone()),
-                        ));
-                        break;
-                    }
-                    Err(e) => tracing::warn!("retrieval asset {} failed to load — skipping cluster blend: {}", index_path.display(), e),
-                }
-            }
-            // kmeans 文件名用 speaker 名（config.speakers 反查 id）
-            for (name, _) in entry.config.speakers.iter().filter(|(_, &id)| id == spk) {
-                let kmeans_path = dir.join(format!("{}.centers.npy", safe(name)));
-                if kmeans_path.exists() {
-                    match app.inference.load_npy(&kmeans_path) {
-                        Ok(arr) => {
-                            found = Some(sovits::ClusterAsset::KmeansCenters(
-                                crate::inference::features::KnnIndex::new((*arr).clone()),
-                            ));
-                            break 'dirs;
-                        }
-                        Err(e) => tracing::warn!("cluster asset {} failed to load — skipping cluster blend: {}", kmeans_path.display(), e),
-                    }
-                }
-            }
-        }
-        found // None → pipeline logs the skip (mirrors the original's missing-file behavior)
-    } else {
-        None
-    };
+    // cluster/retrieval asset — shared with 自己唱 (render_vocal_segment) via resolve_cluster_asset.
+    let cluster = resolve_cluster_asset(&app, &entry, &options.spk_mix, options.speaker_id, options.cluster_ratio);
 
     let audio_buf =
         crate::audio::load_audio(&PathBuf::from(&audio_path)).map_err(|e| e.to_string())?;
@@ -1086,6 +1095,9 @@ pub struct ScoreNote {
 }
 
 /// Wire-contract options for render_vocal_segment — mirrored by src\lib\vocal\vocalRender.ts (VocalRenderOptions).
+/// Item-1: the score render now drives the SAME quality path as 翻唱, so the backend-specific knobs REUSE the
+/// existing `SovitsOptions`/`RvcOptions` contracts (no third source of truth). The command layer force-
+/// neutralizes the params that would break the ② render (see `render_vocal_segment`).
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default)]
 pub struct VocalRenderOptions {
@@ -1097,10 +1109,14 @@ pub struct VocalRenderOptions {
     pub lang_id: i64,
     /// Track-level transpose in semitones (applied to content note_pitch AND f0, Rust-side).
     pub transpose: i64,
-    pub noise_scale: f32,
-    pub seed: u64,
-    /// Run ScoreToCV on the global GPU device instead of the forced-CPU default (faster, costs VRAM).
-    pub gpu_extract: bool,
+    /// Reused SoVITS quality contract (backend=="sovits"): noise_scale/seed/cluster_ratio/spk_mix/speaker_id
+    /// + the shallow/only-diffusion group + NSF enhancer + vocoder + gpu_extract. auto_f0/f0_shift/
+    /// loudness_envelope/only_diffusion are force-neutralized by the command (they'd break Option-A / need
+    /// a source wav the score doesn't have).
+    pub sovits: crate::inference::SovitsOptions,
+    /// Reused RVC quality contract (backend=="rvc"): index_ratio/protect/l2_normalize/noise_scale/seed/
+    /// speaker_id/spk_mix/gpu_extract. f0_shift/rms_mix_rate are force-neutralized (redundant / no source wav).
+    pub rvc: crate::inference::RvcOptions,
 }
 
 impl Default for VocalRenderOptions {
@@ -1110,9 +1126,8 @@ impl Default for VocalRenderOptions {
             cv_speaker_id: 49,
             lang_id: 2,
             transpose: 0,
-            noise_scale: 0.4,
-            seed: 0,
-            gpu_extract: false,
+            sovits: Default::default(),
+            rvc: Default::default(),
         }
     }
 }
@@ -1187,17 +1202,9 @@ pub async fn render_vocal_segment(
         other => return Err(format!("未知后端 '{}'（仅 sovits / rvc）", other)),
     };
 
-    // ── resolve the voice + ScoreToCV facts ──
+    // ── resolve the voice + ScoreToCV facts ── (Item-1: builds a REAL SovitsModel/RvcModel and drives the
+    // SHARED quality path — decode_features/vc_decode — mirroring run_sovits/run_rvc's load flow.)
     let entry = get_entry(&app, &voice_name)?;
-    // ①c multi-speaker (spk_mix) voices rename the scalar `sid` graph input to a dense blend. The score
-    // render feeds a scalar sid=0, so a spk_mix export would fail with a raw ORT "Invalid Feed Input Name".
-    // 自己唱 is single-speaker for now (multi-speaker vocal = a later feature) — fail with a friendly message.
-    if sidecar_has_input(&entry, "spk_mix") == Some(true) {
-        return Err(format!(
-            "歌手模型 '{}' 是多歌手声线（spk_mix）模型，自己唱暂不支持，请选择单歌手模型",
-            voice_name
-        ));
-    }
     let dim = features_dim(&entry.config)?; // 768 → SoVITS4.1/RVCv2, 256 → SoVITS4.0
     let nch = noise_channels(&entry.config);
     let sample_rate = entry.sample_rate;
@@ -1207,26 +1214,20 @@ pub async fn render_vocal_segment(
     };
     require_input(&entry, noise_input)?;
     let min_t = min_frames(&entry.config, min_default);
-    let hop_size = entry.config.hop_size.unwrap_or(512) as usize;
-    if matches!(backend_type, VoiceBackendType::SoVits) && hop_size == 0 {
-        return Err(format!("模型 '{}' 配置的 hop_size 为 0，无法推理", voice_name));
-    }
-    let vol_embedding = sidecar_has_input(&entry, "vol")
-        .unwrap_or_else(|| entry.config.vol_embedding.unwrap_or(false));
+    // ①c: a genuine multi-speaker export renames scalar `sid` to a dense `spk_mix` [1,n_spk] blend. The
+    // shared decode tail already branches spk_mix, so 自己唱 now SUPPORTS multi-speaker singers (the M1
+    // hard-block is gone) — feed the blend iff the graph carries the input.
+    let spk_mix = if sidecar_has_input(&entry, "spk_mix") == Some(true) && entry.config.n_speakers > 0 {
+        Some(entry.config.n_speakers as usize)
+    } else {
+        None
+    };
 
     let s2cv_path = score2cv_for_dim(&app, dim)?;
-
-    // ── load: evict foreign GPU sessions (keep this voice), load voice + ScoreToCV aux ──
+    let cv_path = contentvec_for_dim(&app, dim)?; // second_encoding needs it; struct requires it regardless
+    let rmvpe_path = aux_path(&app, AUX_RMVPE, "音高检测模型")?; // unused by the decode tail; struct field
+    let mel_path = aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?;
     let path = PathBuf::from(&model_path);
-    app.inference.engine.release_gpu_sessions_except(&[path.clone()]);
-    app.inference
-        .load_voice(&voice_name, &path, backend_type.clone(), sample_rate, None)
-        .map_err(|e| e.to_string())?;
-    let s2cv_sid = app
-        .inference
-        .ensure_aux_loaded_on(&s2cv_path, options.gpu_extract)
-        .map_err(|e| e.to_string())?;
-    let handle = app.inference.voice_handle(&voice_name).map_err(|e| e.to_string())?;
 
     // own the score strings so the render can borrow them as &[(&str, i64, i64)] inside spawn_blocking.
     let score_owned: Vec<(String, i64, i64)> =
@@ -1234,51 +1235,135 @@ pub async fn render_vocal_segment(
     let cv_speaker_id = options.cv_speaker_id;
     let lang_id = options.lang_id;
     let transpose = options.transpose;
-    let noise_scale = options.noise_scale;
-    let seed = options.seed;
-
     let progress = progress_emitter(app_handle, app.clone(), run_epoch, node_id);
-    tauri::async_runtime::spawn_blocking(move || {
-        let cancel = || app.inference.voice_cancelled(run_epoch);
-        let score_ref: Vec<(&str, i64, i64)> =
-            score_owned.iter().map(|(l, n, f)| (l.as_str(), *n, *f)).collect();
-        let f0 = if f0_cents.is_empty() {
-            None
-        } else {
-            Some(score2svc::VocalF0 { cents: f0_cents.as_slice(), voiced: f0_voiced.as_slice() })
-        };
-        let engine = &app.inference.engine;
-        match backend_type {
-            VoiceBackendType::SoVits => {
-                let voice = score2svc::SovitsVoice {
-                    features_dim: dim,
-                    noise_channels: nch,
-                    vol_embedding,
-                    sample_rate,
+
+    match backend_type {
+        VoiceBackendType::SoVits => {
+            let hop_size = entry.config.hop_size.unwrap_or(512) as usize;
+            if hop_size == 0 {
+                return Err(format!("模型 '{}' 配置的 hop_size 为 0，无法推理", voice_name));
+            }
+            let vol_embedding = sidecar_has_input(&entry, "vol")
+                .unwrap_or_else(|| entry.config.vol_embedding.unwrap_or(false));
+            let unit_interpolate_mode = entry
+                .config
+                .unit_interpolate_mode
+                .clone()
+                .unwrap_or_else(|| "left".to_string());
+
+            // §P5/P6 force-neutralize the params that would break the ② render (NOT just hidden in the UI).
+            let mut sv = options.sovits.clone();
+            sv.auto_f0 = false; // an f0 predictor would OVERWRITE the DAW f0 (Option-A head trap)
+            sv.f0_shift = 0.0; // pitch shift is the Rust-side `transpose` (double-apply otherwise)
+            sv.loudness_envelope = 1.0; // change_rms needs a source wav — the score has none
+            sv.only_diffusion = false; // self-sing keeps the VITS synthesis of its own content
+
+            // mirror run_sovits: evict foreign GPU sessions, keep this model's own family.
+            {
+                let mut keep = vec![path.clone()];
+                if let (Some(dir), Some(stem)) = (path.parent(), path.file_stem()) {
+                    let stem = stem.to_string_lossy();
+                    keep.push(dir.join(format!("{}.f0.onnx", stem)));
+                    keep.push(dir.join(format!("{}.diffusion", stem)));
+                }
+                app.inference.engine.release_gpu_sessions_except(&keep);
+            }
+            app.inference
+                .load_voice(&voice_name, &path, VoiceBackendType::SoVits, sample_rate, None)
+                .map_err(|e| e.to_string())?;
+            // resolve diffusion/vocoder AFTER load_voice; f0_predictor resolves to None (auto_f0 forced off).
+            let (diffusion, vocoder, f0_predictor) =
+                resolve_sovits_quality(&app, &entry, dim, hop_size, &mut sv, None)?;
+            let cv_sid = app.inference.ensure_aux_loaded_on(&cv_path, sv.gpu_extract).map_err(|e| e.to_string())?;
+            let rmvpe_sid = app.inference.ensure_aux_loaded_on(&rmvpe_path, sv.gpu_extract).map_err(|e| e.to_string())?;
+            let mel = app.inference.load_npy(&mel_path).map_err(|e| e.to_string())?;
+            let s2cv_sid = app.inference.ensure_aux_loaded_on(&s2cv_path, sv.gpu_extract).map_err(|e| e.to_string())?;
+            let handle = app.inference.voice_handle(&voice_name).map_err(|e| e.to_string())?;
+            let cluster = resolve_cluster_asset(&app, &entry, &sv.spk_mix, sv.speaker_id, sv.cluster_ratio);
+
+            tauri::async_runtime::spawn_blocking(move || {
+                let cancel = || app.inference.voice_cancelled(run_epoch);
+                let score_ref: Vec<(&str, i64, i64)> =
+                    score_owned.iter().map(|(l, n, f)| (l.as_str(), *n, *f)).collect();
+                let f0 = if f0_cents.is_empty() {
+                    None
+                } else {
+                    Some(score2svc::VocalF0 { cents: f0_cents.as_slice(), voiced: f0_voiced.as_slice() })
+                };
+                let model = sovits::SovitsModel {
+                    engine: &app.inference.engine,
+                    voice_session: &handle.session_id,
+                    contentvec_session: &cv_sid,
+                    rmvpe_session: &rmvpe_sid,
+                    mel_filters: mel.as_ref(),
+                    cluster: cluster.as_ref(),
+                    diffusion,
+                    vocoder,
+                    f0_predictor_session: f0_predictor,
+                    sample_rate: handle.sample_rate,
                     hop_size,
+                    features_dim: dim,
+                    vol_embedding,
+                    spk_mix,
+                    unit_interpolate_mode,
+                    noise_channels: nch,
                     min_frames: min_t,
                 };
                 score2svc::render_score_sovits(
-                    engine, &s2cv_sid, &handle.session_id, &score_ref, dim, cv_speaker_id, lang_id,
-                    &voice, 0, VOCAL_FLAT_VOL, seed, noise_scale, transpose, f0.as_ref(), &cancel,
-                    &progress,
+                    &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, lang_id, &sv, VOCAL_FLAT_VOL,
+                    transpose, f0.as_ref(), &cancel, &progress,
                 )
-            }
-            VoiceBackendType::Rvc => {
-                let voice = score2svc::RvcVoice {
+                .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| format!("渲染任务失败: {}", e))?
+        }
+        VoiceBackendType::Rvc => {
+            // §P5 force-neutralize (redundant with transpose / no source wav — no-ops on the score path).
+            let mut rv = options.rvc.clone();
+            rv.f0_shift = 0.0;
+            rv.rms_mix_rate = 1.0;
+
+            app.inference.engine.release_gpu_sessions_except(&[path.clone()]);
+            app.inference
+                .load_voice(&voice_name, &path, VoiceBackendType::Rvc, sample_rate, entry.index_path.as_ref())
+                .map_err(|e| e.to_string())?;
+            let cv_sid = app.inference.ensure_aux_loaded_on(&cv_path, rv.gpu_extract).map_err(|e| e.to_string())?;
+            let rmvpe_sid = app.inference.ensure_aux_loaded_on(&rmvpe_path, rv.gpu_extract).map_err(|e| e.to_string())?;
+            let mel = app.inference.load_npy(&mel_path).map_err(|e| e.to_string())?;
+            let s2cv_sid = app.inference.ensure_aux_loaded_on(&s2cv_path, rv.gpu_extract).map_err(|e| e.to_string())?;
+            let handle = app.inference.voice_handle(&voice_name).map_err(|e| e.to_string())?;
+
+            tauri::async_runtime::spawn_blocking(move || {
+                let cancel = || app.inference.voice_cancelled(run_epoch);
+                let score_ref: Vec<(&str, i64, i64)> =
+                    score_owned.iter().map(|(l, n, f)| (l.as_str(), *n, *f)).collect();
+                let f0 = if f0_cents.is_empty() {
+                    None
+                } else {
+                    Some(score2svc::VocalF0 { cents: f0_cents.as_slice(), voiced: f0_voiced.as_slice() })
+                };
+                let model = rvc::RvcModel {
+                    engine: &app.inference.engine,
+                    voice_session: &handle.session_id,
+                    contentvec_session: &cv_sid,
+                    rmvpe_session: &rmvpe_sid,
+                    mel_filters: mel.as_ref(),
+                    index: handle.index.as_deref(),
+                    sample_rate: handle.sample_rate,
                     features_dim: dim,
+                    spk_mix,
                     noise_channels: nch,
-                    sample_rate,
                     min_frames: min_t,
                 };
                 score2svc::render_score_rvc(
-                    engine, &s2cv_sid, &handle.session_id, &score_ref, dim, cv_speaker_id, lang_id,
-                    &voice, 0, seed, noise_scale, transpose, f0.as_ref(), &cancel, &progress,
+                    &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, lang_id, &rv, transpose,
+                    f0.as_ref(), &cancel, &progress,
                 )
-            }
+                .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| format!("渲染任务失败: {}", e))?
         }
-        .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| format!("渲染任务失败: {}", e))?
+    }
 }

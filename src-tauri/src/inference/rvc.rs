@@ -263,7 +263,28 @@ fn vc_chunk(
     chunk_idx: u64,
 ) -> Result<Vec<f32>> {
     // ContentVec @ 50 fps
-    let mut feats = contentvec_extract(m.engine, m.contentvec_session, chunk, m.features_dim)?;
+    let feats = contentvec_extract(m.engine, m.contentvec_session, chunk, m.features_dim)?;
+    vc_decode(m, feats, pitch, pitchf, sid, spk_mix, options, chunk_idx, chunk.len() / WINDOW)
+}
+
+/// Decode one chunk's already-extracted ContentVec (50 fps) through the RVC net_g → UNtrimmed wav.
+/// Verbatim tail of `vc_chunk` (feats0/protect basis → index blend → 2x upsample → protect blend →
+/// rnd noise → net_g), pulled out so the ② score render (`render_score_rvc`) drives the SAME
+/// retrieval/protect path. `windows_bound` = the caller's frame cap (cover: chunk.len()/WINDOW;
+/// score: usize::MAX = feats/pitch bound only). Byte-identical to the inlined version — proven at the
+/// source (scratchpad/verbatim_check.py) since the net_g graph is stochastic (RandomNormalLike/Uniform).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn vc_decode(
+    m: &RvcModel,
+    mut feats: Array2<f32>,
+    pitch: &[i64],
+    pitchf: &[f32],
+    sid: i64,
+    spk_mix: Option<&[f32]>,
+    options: &RvcOptions,
+    chunk_idx: u64,
+    windows_bound: usize,
+) -> Result<Vec<f32>> {
     // feats0 clone happens BEFORE retrieval (original line 221-222)
     let feats0 = if options.protect < 0.5 {
         Some(feats.clone())
@@ -281,9 +302,10 @@ fn vc_chunk(
     let feats = upsample_2x_nearest(&feats);
     let feats0 = feats0.map(|f| upsample_2x_nearest(&f));
 
-    // p_len = min(chunk_len//window, feats_T) (feats_T is < chunk_len//window in practice);
-    // also bounded by the caller's pitch slice for safety.
-    let mut p_len = chunk.len() / WINDOW;
+    // p_len = min(windows_bound, feats_T, pitch_len). `windows_bound` is the caller's frame cap:
+    // the cover path passes chunk_len//window (feats_T is < it in practice); the ② score path passes
+    // usize::MAX (no source-audio window — bounded by the upsampled cv / pitch length only).
+    let mut p_len = windows_bound;
     if feats.nrows() < p_len {
         p_len = feats.nrows();
     }

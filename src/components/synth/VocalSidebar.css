@@ -157,3 +157,44 @@
   border-color: var(--border-default);
   background: transparent;
 }
+
+/* Item-1 quality knobs: an inline label + control (checkbox toggle / sampler select) on one row. */
+.vsb-inline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 0;
+}
+.vsb-check {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  flex: none;
+  accent-color: var(--accent-primary);
+  cursor: pointer;
+}
+/* higher specificity than `.vsb-section .sep-model-select { width: 100% }` so the inline vocoder select
+   stays a compact box (a long vocoder name is shown full in the dropdown, truncated in the closed box). */
+.vsb-section .vsb-inline-select {
+  width: auto;
+  min-width: 0;
+  max-width: 130px;
+  flex: 0 1 auto;
+  margin-bottom: 0;
+  text-overflow: ellipsis;
+}
+.vsb-text {
+  width: 96px;
+  flex: none;
+  padding: 3px 6px;
+  font-size: 11px;
+  color: var(--text-primary);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: 0;
+}
+.vsb-text:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+}

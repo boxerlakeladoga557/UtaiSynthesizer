@@ -108,7 +108,7 @@ describe("Phase 3 — .usp save/load round-trips every vocal field (GATE C)", ()
       ],
       { pitchDev: { xs: [0, 240], ys: [0, 50] }, paramCurves: { loudness: { xs: [0, 480], ys: [0, -3] } } },
     ),
-    { backend: "sovits", speakerId: 49, langId: 2, transpose: 2,
+    { backend: "sovits", speakerId: 49, langId: 2, transpose: 2, breathToken: "AP",
       transition: { offsetMs: 0, durLeftMs: 100, durRightMs: 70, depthLeftCents: 15, depthRightCents: 15, openEdgeCents: 50 } },
   );
 

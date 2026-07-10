@@ -138,11 +138,20 @@ function contentSig(c: SegmentContent): string {
 }
 
 /** Deterministic signature of a track's vocal params (undoable, like voiceModel). */
+/** Canonical (sorted-key) sig of a quality-param override bag so an undo/redo of a knob is caught and a
+ *  re-serialized-but-equal bag never reads dirty (§Phase-3 假脏 discipline). */
+function sigOpts(o?: Record<string, unknown>): string {
+  if (!o) return "";
+  return Object.keys(o)
+    .sort()
+    .map((k) => `${k}=${JSON.stringify(o[k])}`)
+    .join(",");
+}
 function vocalParamsSig(p?: VocalTrackParams): string {
   if (!p) return "";
   const t = p.transition;
   const tr = t ? `${t.offsetMs},${t.durLeftMs},${t.durRightMs},${t.depthLeftCents},${t.depthRightCents},${t.openEdgeCents}` : "";
-  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${tr}`;
+  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|bt:${p.breathToken ?? ""}`;
 }
 
 function laneSig(lc: Record<string, LaneControl>, mutes?: Record<string, boolean>): string {

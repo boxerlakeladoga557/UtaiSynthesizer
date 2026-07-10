@@ -12,10 +12,11 @@ import { PIXELS_PER_TICK, TICKS_PER_BEAT } from "../../lib/constants";
 import { msToTicks } from "../../lib/audio/laneOps";
 import { TimeAxis } from "../../lib/timeAxis";
 import * as playback from "../../lib/audio/playback";
-import { resolveOverlaps, DEFAULT_TRANSITION } from "../../lib/vocalNotes";
+import { resolveOverlaps, DEFAULT_TRANSITION, isBreathLyric } from "../../lib/vocalNotes";
 import { DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useVoiceModelStore } from "../../store/voice-models";
 import { buildVocalScore, renderVocalSegment, VOCAL_RENDER_BUSY } from "../../lib/vocal/vocalRender";
+import { RVC_DEFAULTS, SOVITS_DEFAULTS } from "../../lib/workflow/voiceDefaults";
 import { evalF0CentsAt, paintedDev } from "../../lib/f0eval";
 import {
   type VocalView, V_PITCH_MIN, V_PITCH_MAX, V_ROW_H_MIN, V_ROW_H_MAX,
@@ -120,6 +121,10 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   pitchDevRef.current = part?.pitchDev;
   const transitionRef = useRef(part?.transition ?? DEFAULT_TRANSITION);
   transitionRef.current = part?.transition ?? DEFAULT_TRANSITION;
+  // M3 breath: the pitch line skips breath notes (unvoiced — they break the line so the prev note releases /
+  // the next scoops, §10.5). Dynamic: editing the token re-connects the OLD token's notes.
+  const breathTokenRef = useRef(part?.vocalParams?.breathToken ?? "AP");
+  breathTokenRef.current = part?.vocalParams?.breathToken ?? "AP";
   const startRef = useRef(part?.start ?? 0);
   startRef.current = part?.start ?? 0;
   const durRef = useRef(part?.dur ?? 0);
@@ -136,7 +141,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       useAppStore.getState().showToast(t("vocalEditor.render.noVoice"), "error");
       return;
     }
-    const { triples, f0Cents, f0Voiced } = buildVocalScore(part.notes, part.pitchDev, tempoRef.current, transitionRef.current);
+    const { triples, f0Cents, f0Voiced } = buildVocalScore(part.notes, part.pitchDev, tempoRef.current, transitionRef.current, vp.breathToken ?? "AP");
     if (triples.length === 0) {
       useAppStore.getState().showToast(t("vocalEditor.render.empty"), "error");
       return;
@@ -156,9 +161,9 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
           cv_speaker_id: vp.speakerId,
           lang_id: vp.langId,
           transpose: vp.transpose,
-          noise_scale: vp.backend === "rvc" ? 0.66666 : 0.4,
-          seed: 0,
-          gpu_extract: false,
+          // full backend contracts = defaults overlaid with the track's quality overrides (Item-1).
+          sovits: { ...SOVITS_DEFAULTS, ...(vp.sovits ?? {}) },
+          rvc: { ...RVC_DEFAULTS, ...(vp.rvc ?? {}) },
         },
       });
     } catch (e) {
@@ -217,7 +222,8 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     const tick = () => {
       const rel = msToTicks(performance.now() - startMs, tempoRef.current);
       if (rel > durRef.current) { stopPreviewPlay(); return; } // reached the segment end
-      const sorted = [...notesRef.current].sort((a, b) => a.tick - b.tick);
+      // skip breath notes — unvoiced, they break the pitch chain (the preview tone silences over them).
+      const sorted = notesRef.current.filter((n) => !isBreathLyric(n.lyric, breathTokenRef.current)).sort((a, b) => a.tick - b.tick);
       // Build opts PER-FRAME from the live refs so a sidebar edit to the TRACK-DEFAULT transition (or tempo)
       // retunes the RUNNING preview immediately — else only the overlay updates and the audio stays stale
       // until stop+replay (review finding E).
@@ -402,7 +408,10 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       //    + vibrato, all summed by the single evalF0Cents). Sampled across the note area every few px; an
       //    unvoiced (rest) sample BREAKS the line (carrier-aware, §9.3). Emphasized under the Pitch tool. ──
       {
-        const sorted = [...drawNotes].sort((a, b) => a.tick - b.tick);
+        // the pitch LINE skips breath notes (unvoiced) — the line breaks over a breath, and its neighbours
+        // become phrase edges (prev note release-drift 段中尾音, next note onset-scoop). The note RECTANGLES
+        // above (drawNotes) still show the breath note; only the sung-pitch chain drops it.
+        const sorted = drawNotes.filter((n) => !isBreathLyric(n.lyric, breathTokenRef.current)).sort((a, b) => a.tick - b.tick);
         const opts = { tempo: tempoRef.current, defaultTransition: transitionRef.current };
         const dr0 = dragRef.current; // live pitch-paint → preview the drawn curve on the line
         const dev = dr0?.kind === "pitch-paint" && dr0.paint ? paintedDev(sorted, dr0.paint, pitchDevRef.current, opts) : pitchDevRef.current;
@@ -537,7 +546,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // re-run — without this the boundary line only "happens" to refresh when some other redraw fires (hover/
   // scroll), which is the reported intermittent staleness. The draw closure reads start/dur/axis via refs,
   // so re-invoking it is enough (no rebuild).
-  useEffect(() => { requestRedraw(); }, [part?.start, part?.dur, part?.pitchDev, part?.transition, timeSignature, tempo, requestRedraw]);
+  useEffect(() => { requestRedraw(); }, [part?.start, part?.dur, part?.pitchDev, part?.transition, part?.vocalParams?.breathToken, timeSignature, tempo, requestRedraw]);
 
   // Attach the live preview-notes closure to the drag state (draw reads it).
   const withPreview = (d: DragState): DragState & { previewNotes: () => Note[] } => {

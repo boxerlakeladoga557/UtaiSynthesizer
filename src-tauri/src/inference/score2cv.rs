@@ -40,6 +40,8 @@ fn r2ipa_map() -> &'static HashMap<&'static str, &'static [&'static str]> {
 /// `Unknown` for an OOV lyric (the DAW must LOUD-error, never the reference's silent SP fallback).
 enum Lyric {
     Rest,
+    /// A breath token (`AP`/`ap`) — an audible intake (`AP` id), NOT silence (M3, §11.3). Unvoiced.
+    Breath,
     Sustain,
     Phones(Vec<&'static str>),
     Unknown,
@@ -51,6 +53,12 @@ fn lyric_to_phones(lyr: &str) -> Lyric {
     let s0 = lyr.trim();
     if matches!(s0, "R" | "r" | "" | "rest" | "sil" | "pau") {
         return Lyric::Rest;
+    }
+    // M3 breath: the CANONICAL inhale token → the `AP` phone. Only `AP`/`ap` (the vocab's own breath
+    // token, never a sung phoneme) are hard-wired; the DAW lets the user pick a convenient trigger that the
+    // frontend maps to `AP` (VocalTrackParams.breathToken), so a common glyph is never stolen for breath.
+    if matches!(s0, "AP" | "ap") {
+        return Lyric::Breath;
     }
     if matches!(s0, "-" | "ー" | "+") {
         return Lyric::Sustain;
@@ -109,6 +117,10 @@ fn lyric_to_phones(lyr: &str) -> Lyric {
 pub enum LyricClass {
     /// A rest token (`R`/`r`/``/`rest`/`sil`/`pau`) — silence, no phones.
     Rest,
+    /// A breath token (`AP`/`ap`) — an audible inhale (`AP`), unvoiced (M3). The editor may show it
+    /// distinctly from a rest; the render emits the `AP` phone (not silence). The DAW maps a user-chosen
+    /// trigger (VocalTrackParams.breathToken) to `AP` before classifying, so a common glyph isn't stolen.
+    Breath,
     /// A sustain token (`-`/`ー`/`+`) — continues the previous vowel (承前元音 legato).
     Sustain,
     /// A pronounceable lyric → its IPA phones (all in the 210-token vocab).
@@ -121,6 +133,7 @@ pub enum LyricClass {
 pub fn classify_lyric(lyr: &str) -> LyricClass {
     match lyric_to_phones(lyr) {
         Lyric::Rest => LyricClass::Rest,
+        Lyric::Breath => LyricClass::Breath,
         Lyric::Sustain => LyricClass::Sustain,
         Lyric::Phones(ph) => LyricClass::Phones { phones: ph },
         Lyric::Unknown => LyricClass::Unknown,
@@ -159,8 +172,12 @@ pub struct ScoreArrays {
 /// v1 "啊啊啊" regression). This is the Phase-1c PARITY entry (rest-capped, == render_ust); the ② vocal
 /// DAW render uses `build_arrays_daw` (rests uncapped) so the rendered stem aligns to the segment timeline.
 pub fn build_arrays(score: &[(&str, i64, i64)]) -> Result<ScoreArrays> {
-    build_arrays_impl(score, true)
+    build_arrays_impl(score, true, false) // Phase-1c PARITY: rest-capped, no borrow-time
 }
+
+/// M3 minimum cv frames a SUNG vowel gets (via borrow-time in the DAW render) so net_g renders an audible
+/// vowel rather than a 1-frame smear. ~100 ms @50fps; kept small so a normal note is never inflated.
+const VOWEL_MIN_FRAMES: i64 = 5;
 
 /// ② 自己唱 DAW render entry: identical to `build_arrays` EXCEPT rest frames are NOT capped, so the cv
 /// frame count == the DAW frame count (a rest holds its full duration) and the rendered stem stays
@@ -170,10 +187,10 @@ pub fn build_arrays(score: &[(&str, i64, i64)]) -> Result<ScoreArrays> {
 /// the running count exceeds max_frames), so one very long rest becomes one big chunk — the TOTAL frame
 /// count is bounded upstream by `render_vocal_segment`'s `MAX_TOTAL_FRAMES`, not here.
 pub fn build_arrays_daw(score: &[(&str, i64, i64)]) -> Result<ScoreArrays> {
-    build_arrays_impl(score, false)
+    build_arrays_impl(score, false, true) // ② DAW: rests uncapped + short-note borrow-time (M3)
 }
 
-fn build_arrays_impl(score: &[(&str, i64, i64)], cap_rests: bool) -> Result<ScoreArrays> {
+fn build_arrays_impl(score: &[(&str, i64, i64)], cap_rests: bool, borrow_time: bool) -> Result<ScoreArrays> {
     let m = score.len();
     let mut phon: Vec<&'static str> = Vec::new();
     let mut pdur: Vec<i64> = Vec::new();
@@ -191,6 +208,21 @@ fn build_arrays_impl(score: &[(&str, i64, i64)], cap_rests: bool) -> Result<Scor
                     tbl::CAP_MID
                 };
                 phon.push("SP");
+                pdur.push(fr.min(cap).max(1));
+                npitch.push(0);
+                prev_vowel = None;
+            }
+            Lyric::Breath => {
+                // audible inhale — same duration policy as a rest (capped for parity, uncapped for the DAW),
+                // npitch 0 (unvoiced), resets the sustain vowel; emits the `AP` phone instead of `SP`.
+                let cap = if !cap_rests {
+                    i64::MAX
+                } else if k == 0 || k == m - 1 {
+                    tbl::CAP_LEAD
+                } else {
+                    tbl::CAP_MID
+                };
+                phon.push("AP");
                 pdur.push(fr.min(cap).max(1));
                 npitch.push(0);
                 prev_vowel = None;
@@ -218,6 +250,25 @@ fn build_arrays_impl(score: &[(&str, i64, i64)], cap_rests: bool) -> Result<Scor
                     "歌词 “{}” 无法映射到音素（OOV）——请检查歌词或语言设置（绝不静默兜底为静音）",
                     lyr
                 )));
+            }
+        }
+    }
+
+    // M3 short-note borrow-time (DAW render only): give each SUNG vowel at least VOWEL_MIN_FRAMES cv frames
+    // by borrowing from an IMMEDIATELY-FOLLOWING rest/breath (SP/AP), keeping that ≥1 frame. The borrow only
+    // shifts the vowel↔rest boundary LATER — the total frame count and every note ONSET are preserved — so
+    // the rendered stem stays aligned to the DAW tick timeline (节奏不变). A short note with no trailing rest
+    // is left as-is (extending it would eat the next note's onset; the decode pad-and-trim covers the hard
+    // sub-min-frames floor). Deliberate fork from Phase-1c parity (build_arrays keeps borrow_time=false).
+    if borrow_time {
+        for i in 0..phon.len() {
+            if npitch[i] > 0 && tbl::VOWEL_SET.contains(&phon[i]) && pdur[i] < VOWEL_MIN_FRAMES {
+                let deficit = VOWEL_MIN_FRAMES - pdur[i];
+                if i + 1 < phon.len() && matches!(phon[i + 1], "SP" | "AP") {
+                    let take = deficit.min((pdur[i + 1] - 1).max(0));
+                    pdur[i] += take;
+                    pdur[i + 1] -= take;
+                }
             }
         }
     }
@@ -413,6 +464,31 @@ mod tests {
         assert_eq!(sp_daw, Some(300), "DAW build keeps the full 300-frame rest");
     }
 
+    // M3 breath (fork from Phase-1c parity — pr::SCORE has no breath): a breath token emits the AP phone
+    // (id AP_ID), npitch 0 (unvoiced), classified distinctly from a rest.
+    #[test]
+    fn breath_emits_ap() {
+        let arr = build_arrays_daw(&[("か", 60, 80), ("AP", 0, 60), ("お", 67, 80)]).unwrap();
+        let ap = arr.phon.iter().position(|&p| p == "AP").expect("breath emits an AP phone");
+        assert_eq!(arr.note_pitch[ap], 0, "breath is unvoiced (npitch 0)");
+        assert_eq!(arr.phonemes[ap], tbl::AP_ID, "AP phone maps to AP_ID");
+    }
+
+    // M3 borrow-time (fork from parity): a short sung vowel followed by a rest borrows frames from the rest
+    // up to VOWEL_MIN_FRAMES, keeping the rest ≥1 and the TOTAL frame count (timeline) unchanged. The parity
+    // build (build_arrays) does NOT borrow.
+    #[test]
+    fn borrow_time_extends_short_vowel() {
+        let score = [("お", 60, 3), ("R", 0, 40)]; // a 3-frame vowel then a rest
+        let daw = build_arrays_daw(&score).unwrap();
+        assert_eq!(daw.phon[0], "o");
+        assert_eq!(daw.phone_dur[0], VOWEL_MIN_FRAMES, "short vowel borrowed up to the floor");
+        assert_eq!(daw.phone_dur[1], 40 - (VOWEL_MIN_FRAMES - 3), "the rest shrank by the borrowed amount");
+        assert_eq!(daw.phone_dur[0] + daw.phone_dur[1], 3 + 40, "total frames (timeline) preserved");
+        // parity build: no borrow (the vowel keeps its 3 frames).
+        assert_eq!(build_arrays(&score).unwrap().phone_dur[0], 3, "parity build does not borrow-time");
+    }
+
     // §9.5 single Rust classifier: `classify_lyric` (exposed via the validate_lyrics command) MUST agree
     // with `lyric_to_phones` (which build_arrays uses) so the editor's verdict == the render's.
     #[test]
@@ -420,6 +496,8 @@ mod tests {
         assert!(matches!(classify_lyric("R"), LyricClass::Rest));
         assert!(matches!(classify_lyric(""), LyricClass::Rest));
         assert!(matches!(classify_lyric("ー"), LyricClass::Sustain));
+        assert!(matches!(classify_lyric("AP"), LyricClass::Breath));
+        assert!(matches!(classify_lyric("ap"), LyricClass::Breath));
         assert!(matches!(classify_lyric("zzzz"), LyricClass::Unknown));
         match classify_lyric("か") {
             LyricClass::Phones { phones } => assert_eq!(phones, vec!["k", "a"]),

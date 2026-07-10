@@ -17,9 +17,11 @@ import { VolumeFader } from "../common/VolumeFader";
 import { useProjectStore } from "../../store/project";
 import { useHistoryStore } from "../../store/history";
 import { useAppStore } from "../../store/app";
-import { useVoiceModelStore, type VoiceModelEntry } from "../../store/voice-models";
+import { useVoiceModelStore, voiceHasDiffusion, type VoiceModelEntry } from "../../store/voice-models";
 import { effTransition } from "../../lib/f0eval";
 import { DEFAULT_TRANSITION } from "../../lib/vocalNotes";
+import { DIFFUSION_METHODS, RVC_DEFAULTS, SOVITS_DEFAULTS, type RvcOptions, type SovitsOptions } from "../../lib/workflow/voiceDefaults";
+import { VocoderSelect } from "../workflow/nodes/VoiceModelPicker";
 import type { Note, NoteTransition, VibratoSpec, VocalTrackParams } from "../../types/project";
 import "./VocalSidebar.css";
 
@@ -73,7 +75,7 @@ interface Props {
 }
 
 export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTransition, vocalParams, voiceModel, onRender, rendering }: Props) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const applyNoteEdits = useProjectStore((s) => s.applyNoteEdits);
   const setVocalParams = useProjectStore((s) => s.setVocalParams);
   const updateTrack = useProjectStore((s) => s.updateTrack);
@@ -130,6 +132,20 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
   const eff = anchor ? effTransition(anchor, trackTransition) : trackTransition;
   const vib = anchor?.vibrato; // the anchor's vibrato (fills the sliders; edits apply to all selected)
 
+  // ── Item-1 quality knobs: only the CHANGED keys live on vocalParams.sovits/.rvc (absent = contract
+  //    default). A drag/toggle = one setVocalParams (one undo step). Asset-gated rows hide when the singer
+  //    lacks the asset (mirrors the 翻唱 SoVITS/RVC node). ──
+  const sv = (vocalParams.sovits ?? {}) as Partial<SovitsOptions>;
+  const rv = (vocalParams.rvc ?? {}) as Partial<RvcOptions>;
+  const svGet = <K extends keyof SovitsOptions>(k: K): SovitsOptions[K] => (sv[k] ?? SOVITS_DEFAULTS[k]) as SovitsOptions[K];
+  const rvGet = <K extends keyof RvcOptions>(k: K): RvcOptions[K] => (rv[k] ?? RVC_DEFAULTS[k]) as RvcOptions[K];
+  const setSv = (patch: Partial<SovitsOptions>) => setVocalParams(trackId, { sovits: { ...sv, ...patch } });
+  const setRv = (patch: Partial<RvcOptions>) => setVocalParams(trackId, { rvc: { ...rv, ...patch } });
+  const hasRetrieval = !!selectedVoice?.index_path; // cluster (SoVITS) / feature index (RVC) sibling asset
+  const hasDiffusion = voiceHasDiffusion(selectedVoice);
+  const diffusionOn = !!svGet("shallow_diffusion") && hasDiffusion;
+  const ratioCfg = { min: 0, max: 1, step: 0.01, unit: "", bipolar: false };
+
   return (
     <div className="vocal-sidebar">
       {/* ⓪ track · VOICE + render — ONE unified singer list (SoVITS + RVC); the picked model's TYPE drives
@@ -169,6 +185,18 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
           cfg={{ min: -24, max: 24, step: 1, unit: "st", bipolar: true }}
           onChange={(v) => setVocalParams(trackId, { transpose: v })}
         />
+        {/* M3 breath token: the lyric that means "audible inhale" (mapped to AP at render). Editable so a
+            custom trigger never steals a glyph the user needs as a real lyric. */}
+        <div className="vsb-inline">
+          <label className="vsb-label" title={t("vocalEditor.sidebar.breathTokenTip")}>{t("vocalEditor.sidebar.breathToken")}</label>
+          <input
+            className="vsb-text"
+            type="text"
+            spellCheck={false}
+            value={vocalParams.breathToken ?? "AP"}
+            onChange={(e) => setVocalParams(trackId, { breathToken: e.target.value })}
+          />
+        </div>
         <button
           className="snap-toggle vsb-render"
           disabled={rendering || !selectedVoice || notes.length === 0}
@@ -176,6 +204,63 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
         >
           {rendering ? t("vocalEditor.render.rendering") : t("vocalEditor.render.render")}
         </button>
+      </div>
+
+      {/* ⓪.5 音质 (Item-1): the singer's quality knobs — SoVITS = cluster + shallow diffusion + NSF
+          enhancer; RVC = feature index + protect (+ noise for both). Only changed keys are stored; asset-
+          gated rows hide when the singer lacks the asset. auto_f0/loudness/f0_shift are force-off Rust-side. */}
+      <div className="vsb-section">
+        <div className="vsb-head">
+          <span>{t("vocalEditor.sidebar.quality")}</span>
+          {selectedVoice && <span className="vsb-backend-tag">{backendLabel(selectedVoice)}</span>}
+        </div>
+        {!selectedVoice ? (
+          <div className="vsb-hint">{t("vocalEditor.sidebar.selectVoiceHint")}</div>
+        ) : vocalParams.backend === "sovits" ? (
+          <>
+            <Slider label={t("vocalEditor.sidebar.q_noise")} value={svGet("noise_scale")} cfg={ratioCfg} onChange={(v) => setSv({ noise_scale: v })} />
+            {hasRetrieval && (
+              <Slider label={t("vocalEditor.sidebar.q_cluster")} value={svGet("cluster_ratio")} cfg={ratioCfg} onChange={(v) => setSv({ cluster_ratio: v })} />
+            )}
+            {hasDiffusion && (
+              <ToggleRow
+                label={t("vocalEditor.sidebar.q_diffusion")}
+                checked={diffusionOn}
+                onChange={(c) => setSv(c ? { shallow_diffusion: true } : { shallow_diffusion: false, only_diffusion: false })}
+              />
+            )}
+            {diffusionOn && (
+              <>
+                <SelectRow label={t("vocalEditor.sidebar.q_sampler")} value={svGet("diffusion_method")} options={DIFFUSION_METHODS} onChange={(v) => setSv({ diffusion_method: v })} />
+                <Slider label={t("vocalEditor.sidebar.q_kstep")} value={svGet("k_step")} cfg={{ min: 10, max: 1000, step: 10, unit: "", bipolar: false }} onChange={(v) => setSv({ k_step: v })} />
+                <Slider label={t("vocalEditor.sidebar.q_speedup")} value={svGet("diffusion_speedup")} cfg={{ min: 1, max: 100, step: 1, unit: "×", bipolar: false }} onChange={(v) => setSv({ diffusion_speedup: v })} />
+              </>
+            )}
+            {!diffusionOn && (
+              <ToggleRow label={t("vocalEditor.sidebar.q_enhancer")} checked={!!svGet("nsf_enhance")} onChange={(c) => setSv({ nsf_enhance: c })} />
+            )}
+            {/* fine-tuned NSF-HiFiGAN vocoder — meaningful only on the mel→audio paths (shallow diffusion /
+                enhancer). Backend already honors vocoder_name for the ② render (resolve_sovits_quality). */}
+            {(diffusionOn || !!svGet("nsf_enhance")) && (
+              <VocoderSelect
+                value={svGet("vocoder_name") ?? null}
+                lang={i18n.language}
+                onChange={(v) => setSv({ vocoder_name: v })}
+                rowClass="vsb-inline"
+                selectClass="sep-model-select vsb-inline-select"
+                labelClass="vsb-label"
+              />
+            )}
+          </>
+        ) : (
+          <>
+            <Slider label={t("vocalEditor.sidebar.q_noise")} value={rvGet("noise_scale")} cfg={ratioCfg} onChange={(v) => setRv({ noise_scale: v })} />
+            {hasRetrieval && (
+              <Slider label={t("vocalEditor.sidebar.q_index")} value={rvGet("index_ratio")} cfg={ratioCfg} onChange={(v) => setRv({ index_ratio: v })} />
+            )}
+            <Slider label={t("vocalEditor.sidebar.q_protect")} value={rvGet("protect")} cfg={{ min: 0, max: 0.5, step: 0.01, unit: "", bipolar: false }} onChange={(v) => setRv({ protect: v })} />
+          </>
+        )}
       </div>
 
       {/* ① selected-note transition override (glide / portamento between notes) */}
@@ -288,6 +373,28 @@ function Slider({ label, value, cfg, overridden, onReset, resetTitle, onChange }
           <button className="vsb-reset" disabled={!overridden} title={resetTitle} onClick={onReset}>↺</button>
         )}
       </div>
+    </div>
+  );
+}
+
+// ── a labeled checkbox row (a toggle = one setVocalParams = one undo step; no fader gesture) ──
+function ToggleRow({ label, checked, onChange }: { label: string; checked: boolean; onChange: (c: boolean) => void }) {
+  return (
+    <div className="vsb-inline">
+      <label className="vsb-label">{label}</label>
+      <input type="checkbox" className="vsb-check" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+    </div>
+  );
+}
+
+// ── a labeled <select> row (diffusion sampler pick) ──
+function SelectRow({ label, value, options, onChange }: { label: string; value: string; options: readonly string[]; onChange: (v: string) => void }) {
+  return (
+    <div className="vsb-inline">
+      <label className="vsb-label">{label}</label>
+      <select className="sep-model-select vsb-inline-select" value={value} onChange={(e) => onChange(e.target.value)}>
+        {options.map((o) => <option key={o} value={o}>{o}</option>)}
+      </select>
     </div>
   );
 }

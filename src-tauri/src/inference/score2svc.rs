@@ -25,12 +25,15 @@
 
 use ndarray::Array2;
 
-use super::engine::{InputTensor, OnnxEngine};
-use super::features::{repeat_expand_2d, torch_interp_nearest, upsample_2x_nearest};
+#[cfg(test)]
+use super::engine::OnnxEngine; // only the #[ignore] gates name the engine type; the render fns use m.engine
+use super::features::{repeat_expand_2d, torch_interp_nearest};
+use super::rvc::{f0_to_coarse, vc_decode, RvcModel};
 use super::score2cv::{
     build_arrays_daw, chunk_at_sp, classify_lyric, run_score2cv, LyricClass, ScoreArrays,
 };
-use super::SynthesisResult;
+use super::sovits::{apply_cluster_blend, decode_features, SovitsModel};
+use super::{build_spk_mix_dense, RvcOptions, SovitsOptions, SynthesisResult};
 use crate::{Result, UtaiError};
 
 /// ScoreToCV frame rate (score2cv sidecar `fps`). The per-phone `phone_dur` frames are 20 ms.
@@ -168,7 +171,7 @@ pub fn build_note_hz(
         let mut cursor = 0usize;
         let mut seen = vec![false; ng];
         for &(lyr, nn, fr) in score {
-            let npitch = if matches!(classify_lyric(lyr), LyricClass::Rest) { 0 } else { nn };
+            let npitch = if matches!(classify_lyric(lyr), LyricClass::Rest | LyricClass::Breath) { 0 } else { nn };
             if prev != Some(npitch) {
                 g += 1;
                 prev = Some(npitch);
@@ -274,99 +277,52 @@ pub fn resample_to_sovits_grid(cv: &Array2<f32>, note_hz: &[f32], sr: u32, hop: 
     Ok(SovitsFeed { cv: cv_rs, f0: f0_rs, uv: uv_rs, t_tgt })
 }
 
-// ─── SoVITS net_g decode (mirrors sovits::infer_segment's VITS input build, score inputs only) ───
+// ─── score → SoVITS render (Item-1: reuses the SHARED cover-path decode tail) ─────────────────────
 
-/// The facts a Phase-2 SoVITS decode needs from the voice sidecar (a subset of `SovitsModel`; the score
-/// path skips ContentVec/RMVPE/cluster/auto-f0 entirely).
-pub struct SovitsVoice {
-    pub features_dim: usize,
-    /// inter_channels of the explicit `noise` input (192 for 4.0/4.1).
-    pub noise_channels: usize,
-    /// Whether the exported graph HAS a `vol` input (sidecar vol_embedding).
-    pub vol_embedding: bool,
-    pub sample_rate: u32,
-    pub hop_size: usize,
-    /// Minimum frame count the exported net_g accepts (sidecar `min_frames`, 6 for SoVITS). A chunk
-    /// shorter than this cannot be decoded — the cover path guards it (sovits.rs:255); the score path
-    /// LOUD-errors (a too-short note) rather than feeding net_g a shape it rejects.
-    pub min_frames: usize,
-}
-
-/// Decode ONE chunk's feed through the SoVITS net_g → wav. Feeds `c/f0/uv/noise/sid[,vol]` (the same
-/// contract `sovits::infer_segment` uses at 426-481); `noise` is the shared `sovits::seg_noise` draw so
-/// it is byte-identical to the cover path. `vol` is required iff `voice.vol_embedding` (the graph has
-/// the input); Phase 2 has no loudness UI yet, so the caller passes a flat placeholder (real vol lane =
-/// Phase 5). Non-deterministic across ONNX-vs-PyTorch/seeded-noise — validated by ear, not bit-parity.
-#[allow(clippy::too_many_arguments)]
-pub fn sovits_decode_chunk(
-    engine: &OnnxEngine,
-    voice_session: &str,
-    feed: &SovitsFeed,
-    sid: i64,
-    voice: &SovitsVoice,
-    vol: Option<&[f32]>,
-    seed: u64,
-    seg_idx: u64,
-    noise_scale: f32,
-) -> Result<Vec<f32>> {
-    let t = feed.t_tgt as i64;
-    if feed.cv.nrows() != feed.t_tgt || feed.f0.len() != feed.t_tgt || feed.uv.len() != feed.t_tgt {
-        return Err(UtaiError::Inference("score2svc: cv/f0/uv 帧数不一致".into()));
+/// Pad a sub-`min` SoVITS feed (a short trailing chunk) up to `min` frames by REPEATING the last frame
+/// of cv/f0/uv so net_g accepts the shape; returns the ORIGINAL t_tgt so the caller trims the pad off the
+/// decoded wav. A no-op (returns t_tgt) when already ≥ min or empty. M3 short-note handling.
+fn pad_sovits_feed(feed: &mut SovitsFeed, min: usize) -> usize {
+    let orig = feed.t_tgt;
+    if orig >= min || orig == 0 {
+        return orig;
     }
-    // min_frames guard (net_g rejects a sub-min chunk; the cover path guards this at sovits.rs:255).
-    if feed.t_tgt < voice.min_frames {
-        return Err(UtaiError::Inference(format!(
-            "score2svc: 片段过短，帧数 {} 小于模型最小帧数 {}（音符太短，请延长）",
-            feed.t_tgt, voice.min_frames
-        )));
+    let dim = feed.cv.ncols();
+    let mut cv = Array2::<f32>::zeros((min, dim));
+    for i in 0..min {
+        cv.row_mut(i).assign(&feed.cv.row(i.min(orig - 1)));
     }
-    let noise = super::sovits::seg_noise(voice.noise_channels, feed.t_tgt, seed, seg_idx, noise_scale);
-    let mut inputs = vec![
-        ("c", InputTensor::F32 { data: feed.cv.iter().copied().collect(), shape: vec![1, t, voice.features_dim as i64] }),
-        ("f0", InputTensor::F32 { data: feed.f0.clone(), shape: vec![1, t] }),
-        ("uv", InputTensor::F32 { data: feed.uv.clone(), shape: vec![1, t] }),
-        ("noise", InputTensor::F32 { data: noise, shape: vec![1, voice.noise_channels as i64, t] }),
-        ("sid", InputTensor::I64 { data: vec![sid], shape: vec![1] }),
-    ];
-    if voice.vol_embedding {
-        let v = vol.ok_or_else(|| {
-            UtaiError::Inference("该 SoVITS 模型需要 vol 输入（vol_embedding=true），但未提供".into())
-        })?;
-        if v.len() != feed.t_tgt {
-            return Err(UtaiError::Inference(format!("vol 帧数异常：{} != {}", v.len(), feed.t_tgt)));
-        }
-        inputs.push(("vol", InputTensor::F32 { data: v.to_vec(), shape: vec![1, t] }));
-    }
-    let outputs = engine.run(voice_session, inputs)?;
-    outputs
-        .into_iter()
-        .next()
-        .ok_or_else(|| UtaiError::Inference("SoVITS 模型没有返回输出".into()))
+    feed.cv = cv;
+    let last_f0 = *feed.f0.last().unwrap_or(&0.0);
+    let last_uv = *feed.uv.last().unwrap_or(&0.0);
+    feed.f0.resize(min, last_f0);
+    feed.uv.resize(min, last_uv);
+    feed.t_tgt = min;
+    orig
 }
 
 /// Full score → SoVITS wav (自己唱). build_arrays_daw (rests uncapped → stem aligns to the timeline) →
 /// SP-chunk (≤400) → per chunk: run_score2cv → cv; f0 from `build_note_hz` (bare noteonly when `f0` is
-/// None, else the DAW's layered Option-A pitch); resample to the hop grid; net_g decode. Chunk wavs are
-/// concatenated then peak-normalized to 0.92. `transpose` (semitones) shifts both the content note_pitch
-/// and the f0 (§9.3, Rust-only). `flat_vol` seeds the placeholder vol tensor for vol_embedding models.
-/// `cancel`/`progress` are polled per chunk (a multi-chunk render aborts at the next boundary).
+/// None, else the DAW's layered Option-A pitch); resample to the hop grid; cluster/retrieval blend; then
+/// the SHARED `decode_features` (spk_mix + shallow/only diffusion + NSF enhancer — the SAME quality path
+/// the 翻唱 render uses, no longer a net_g-only copy). Chunk wavs are concatenated then peak-normalized to
+/// 0.92. `transpose` (semitones) shifts both content note_pitch and f0 (§9.3, Rust-only). `flat_vol` seeds
+/// the placeholder vol tensor for vol_embedding models. A sub-min chunk is padded then trimmed (M3).
+/// `cancel`/`progress` are polled per chunk. ⚠ `options.auto_f0`/`f0_shift`/`loudness_envelope` MUST be
+/// neutralized by the caller (the command layer) — auto-f0 would overwrite the DAW f0 (Option-A).
 #[allow(clippy::too_many_arguments)]
 pub fn render_score_sovits(
-    engine: &OnnxEngine,
+    m: &SovitsModel,
     score2cv_session: &str,
-    voice_session: &str,
     score: &[(&str, i64, i64)],
     dim: usize,
     cv_speaker_id: i64,
     lang_id: i64,
-    voice: &SovitsVoice,
-    sid: i64,
+    options: &SovitsOptions,
     flat_vol: f32,
-    seed: u64,
-    noise_scale: f32,
     transpose: i64,
     f0: Option<&VocalF0>,
-    cancel: &dyn Fn() -> bool,
+    cancel: &(dyn Fn() -> bool + Sync),
     progress: &dyn Fn(f32),
 ) -> Result<SynthesisResult> {
     let mut arr = build_arrays_daw(score)?;
@@ -376,121 +332,91 @@ pub fn render_score_sovits(
     transpose_note_pitch(&mut arr.note_pitch, transpose);
     let chunks = chunk_at_sp(&arr, 400);
     let n_chunks = chunks.len().max(1);
+    let has_diff = m.diffusion.is_some();
+    let p_vits = if has_diff { 0.5 } else { 0.95 };
+    let noop = |_: f32| {}; // decode_features' internal sub-progress is ignored (per-chunk coarse below)
     let mut audio: Vec<f32> = Vec::new();
     let mut cv_cursor = 0usize;
     for (ci, chunk) in chunks.iter().enumerate() {
         if cancel() {
             return Err(UtaiError::Inference("已取消".into()));
         }
-        let cv = run_score2cv(engine, score2cv_session, chunk, dim, cv_speaker_id, lang_id)?;
+        let cv = run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, lang_id)?;
         let note_hz = &note_hz_full[cv_cursor..(cv_cursor + chunk.t).min(note_hz_full.len())];
-        let feed = resample_to_sovits_grid(&cv, note_hz, voice.sample_rate, voice.hop_size)?;
-        let vol = if voice.vol_embedding { Some(vec![flat_vol; feed.t_tgt]) } else { None };
-        let wav = sovits_decode_chunk(
-            engine, voice_session, &feed, sid, voice, vol.as_deref(), seed, ci as u64, noise_scale,
+        let mut feed = resample_to_sovits_grid(&cv, note_hz, m.sample_rate, m.hop_size)?;
+        let real_t = pad_sovits_feed(&mut feed, m.min_frames); // M3: short trailing chunk
+        apply_cluster_blend(&mut feed.cv, m.cluster, options.cluster_ratio); // SHARED retrieval blend
+        let vol = if m.vol_embedding { Some(vec![flat_vol; feed.t_tgt]) } else { None };
+        let padded_t = feed.t_tgt;
+        // score has no source wav → wav_m is `&[]` (only read by only_diffusion + no-vol, which the
+        // command layer disallows for the score path).
+        let mut wav = decode_features(
+            m, feed.cv, feed.f0, feed.uv, vol, &[], ci as u64, padded_t, has_diff, p_vits, options,
+            &noop, cancel,
         )?;
+        if padded_t > real_t {
+            wav.truncate((real_t * m.hop_size).min(wav.len())); // drop the pad samples
+        }
         audio.extend_from_slice(&wav);
         cv_cursor += chunk.t;
         progress((ci + 1) as f32 / n_chunks as f32);
     }
     peak_normalize(&mut audio, 0.92);
-    Ok(SynthesisResult { audio, sample_rate: voice.sample_rate })
+    Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
 }
 
-// ─── RVC net_g decode (mirrors rvc::vc_chunk's input build, score inputs only) ───────────────────
+// ─── score → RVC render (Item-1: reuses the SHARED cover-path `vc_decode` tail) ───────────────────
 
-/// The facts a Phase-2 RVC decode needs from the voice sidecar (subset of `RvcModel`).
-pub struct RvcVoice {
-    pub features_dim: usize,
-    /// inter_channels of the explicit `rnd` input (192 for v1/v2).
-    pub noise_channels: usize,
-    pub sample_rate: u32,
-    /// Minimum frame count the exported net_g accepts (sidecar `min_frames`, 12 for RVC). The cover path
-    /// hard-errors below it (rvc.rs:291); the score path does the same (a too-short note).
-    pub min_frames: usize,
-}
-
-/// The RVC net_g feed on the 100 fps grid (cv 50→100 via 2× nearest; f0 likewise).
-pub struct RvcFeed {
-    pub phone: Array2<f32>, // [t, dim] @100fps
-    pub pitchf: Vec<f32>,   // Hz per 100fps frame
-    pub pitch: Vec<i64>,    // coarse bin per frame
-    pub t: usize,
-}
-
-/// Resample a chunk's `(cv @50fps, note_hz @50fps)` to the RVC 100 fps grid: cv → `upsample_2x_nearest`;
-/// f0 → repeat each frame twice (the SAME 2× nearest, keeping cv/f0 on one grid); pitch = coarse bins.
-/// RVC has NO uv input — unvoiced is implicit (f0==0 → coarse bin 1). No Python A/B reference exists for
-/// RVC; the glue is validated by the (torch-tested) `upsample_2x_nearest`/`f0_to_coarse` + audible wav.
-pub fn resample_to_rvc_grid(cv: &Array2<f32>, note_hz: &[f32]) -> RvcFeed {
-    let phone = upsample_2x_nearest(cv); // [2·T50, dim]
-    let mut pitchf: Vec<f32> = Vec::with_capacity(note_hz.len() * 2);
-    for &f in note_hz {
+/// Build the RVC 100 fps pitch grid from a chunk's `(cv @50fps, note_hz @50fps)`: each note_hz frame is
+/// repeated twice (pitchf), coarse-binned (pitch). cv stays 50 fps — `vc_decode` upsamples it 2× itself
+/// (so the retrieval/protect blend runs on the same 50 fps features the cover path uses). M3: if
+/// `2·T50 < min` (a short trailing note), cv is padded (repeat last frame) to `ceil(min/2)` and the pitch
+/// grid to `2·ceil(min/2)`. Returns `(cv, pitch, pitchf, real_100fps_frames)` — the last is the pre-pad
+/// 100 fps length so the caller trims the pad off the decoded wav.
+fn rvc_feed_100(mut cv: Array2<f32>, note_hz: &[f32], min: usize) -> (Array2<f32>, Vec<i64>, Vec<f32>, usize) {
+    let t50 = cv.nrows();
+    // Defensive: a 0-row cv (unreachable — chunk_at_sp emits only s<e ranges with pdur≥1, and run_score2cv
+    // errors before yielding 0 rows) would panic the pad loop's `cv.row(0)`. Symmetric with the SoVITS
+    // path's t_tgt==0 guard (resample_to_sovits_grid); vc_decode then LOUD-errors on the sub-min frame count.
+    if t50 == 0 {
+        return (cv, Vec::new(), Vec::new(), 0);
+    }
+    let real_100 = t50 * 2;
+    let pad50 = if real_100 < min { min.div_ceil(2) } else { t50 };
+    if pad50 > t50 {
+        let dim = cv.ncols();
+        let mut padded = Array2::<f32>::zeros((pad50, dim));
+        for i in 0..pad50 {
+            padded.row_mut(i).assign(&cv.row(i.min(t50.saturating_sub(1))));
+        }
+        cv = padded;
+    }
+    let mut pitchf: Vec<f32> = Vec::with_capacity(pad50 * 2);
+    for i in 0..pad50 {
+        let f = note_hz.get(i.min(note_hz.len().saturating_sub(1))).copied().unwrap_or(0.0);
         pitchf.push(f);
         pitchf.push(f);
     }
-    let t = phone.nrows().min(pitchf.len());
-    pitchf.truncate(t);
-    let pitch: Vec<i64> = pitchf.iter().map(|&f| super::rvc::f0_to_coarse(f)).collect();
-    RvcFeed { phone, pitchf, pitch, t }
+    let pitch: Vec<i64> = pitchf.iter().map(|&f| f0_to_coarse(f)).collect();
+    (cv, pitch, pitchf, real_100)
 }
 
-/// Decode ONE chunk's RVC feed → wav. Feeds `phone/phone_lengths/pitch/pitchf/sid/rnd` (the contract
-/// `rvc::vc_chunk` uses at 325-380); `rnd` is the shared `rvc::chunk_noise` draw. Skips the audio-only
-/// retrieval/protect (meaningless for generated content).
-#[allow(clippy::too_many_arguments)]
-pub fn rvc_decode_chunk(
-    engine: &OnnxEngine,
-    voice_session: &str,
-    feed: &RvcFeed,
-    sid: i64,
-    voice: &RvcVoice,
-    seed: u64,
-    chunk_idx: u64,
-    noise_scale: f32,
-) -> Result<Vec<f32>> {
-    let t = feed.t as i64;
-    if feed.t < voice.min_frames {
-        return Err(UtaiError::Inference(format!(
-            "score2svc: 片段过短，帧数 {} 小于模型最小帧数 {}（音符太短，请延长）",
-            feed.t, voice.min_frames
-        )));
-    }
-    let rnd = super::rvc::chunk_noise(voice.noise_channels, feed.t, seed, chunk_idx, noise_scale);
-    let phone_flat: Vec<f32> = feed.phone.slice(ndarray::s![..feed.t, ..]).iter().copied().collect();
-    let inputs = vec![
-        ("phone", InputTensor::F32 { data: phone_flat, shape: vec![1, t, voice.features_dim as i64] }),
-        ("phone_lengths", InputTensor::I64 { data: vec![t], shape: vec![1] }),
-        ("pitch", InputTensor::I64 { data: feed.pitch.clone(), shape: vec![1, t] }),
-        ("pitchf", InputTensor::F32 { data: feed.pitchf.clone(), shape: vec![1, t] }),
-        ("sid", InputTensor::I64 { data: vec![sid], shape: vec![1] }),
-        ("rnd", InputTensor::F32 { data: rnd, shape: vec![1, voice.noise_channels as i64, t] }),
-    ];
-    let outputs = engine.run(voice_session, inputs)?;
-    outputs
-        .into_iter()
-        .next()
-        .ok_or_else(|| UtaiError::Inference("RVC 模型没有返回输出".into()))
-}
-
-/// Full score → RVC wav (自己唱). Same shape as `render_score_sovits` but on the 100 fps grid and with
-/// no uv/vol. RVC v2 uses cv768 (dim=768), same as SoVITS 4.1.
+/// Full score → RVC wav (自己唱). Same shape as `render_score_sovits` but on the 100 fps grid, no uv/vol,
+/// and the SHARED `vc_decode` tail (index retrieval + protect + net_g — the SAME the 翻唱 render uses).
+/// RVC v2 uses cv768 (dim=768), same as SoVITS 4.1. A sub-min chunk is padded then trimmed (M3). ⚠ the
+/// command layer neutralizes `options.f0_shift`/`rms_mix_rate` (redundant with transpose / no source wav).
 #[allow(clippy::too_many_arguments)]
 pub fn render_score_rvc(
-    engine: &OnnxEngine,
+    m: &RvcModel,
     score2cv_session: &str,
-    voice_session: &str,
     score: &[(&str, i64, i64)],
     dim: usize,
     cv_speaker_id: i64,
     lang_id: i64,
-    voice: &RvcVoice,
-    sid: i64,
-    seed: u64,
-    noise_scale: f32,
+    options: &RvcOptions,
     transpose: i64,
     f0: Option<&VocalF0>,
-    cancel: &dyn Fn() -> bool,
+    cancel: &(dyn Fn() -> bool + Sync),
     progress: &dyn Fn(f32),
 ) -> Result<SynthesisResult> {
     let mut arr = build_arrays_daw(score)?;
@@ -498,22 +424,33 @@ pub fn render_score_rvc(
     transpose_note_pitch(&mut arr.note_pitch, transpose);
     let chunks = chunk_at_sp(&arr, 400);
     let n_chunks = chunks.len().max(1);
+    let sid = options.speaker_id.unwrap_or(0) as i64;
+    // ①c: a genuine multi-speaker RVC export takes a dense spk_mix blend in place of scalar sid.
+    let spk_mix_dense = m
+        .spk_mix
+        .map(|n| build_spk_mix_dense(&options.spk_mix, options.speaker_id, n));
     let mut audio: Vec<f32> = Vec::new();
     let mut cv_cursor = 0usize;
     for (ci, chunk) in chunks.iter().enumerate() {
         if cancel() {
             return Err(UtaiError::Inference("已取消".into()));
         }
-        let cv = run_score2cv(engine, score2cv_session, chunk, dim, cv_speaker_id, lang_id)?;
+        let cv = run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, lang_id)?;
         let note_hz = &note_hz_full[cv_cursor..(cv_cursor + chunk.t).min(note_hz_full.len())];
-        let feed = resample_to_rvc_grid(&cv, note_hz);
-        let wav = rvc_decode_chunk(engine, voice_session, &feed, sid, voice, seed, ci as u64, noise_scale)?;
+        let (cv_p, pitch, pitchf, real_t) = rvc_feed_100(cv, note_hz, m.min_frames);
+        let mut wav = vc_decode(
+            m, cv_p, &pitch, &pitchf, sid, spk_mix_dense.as_deref(), options, ci as u64, usize::MAX,
+        )?;
+        if pitchf.len() > real_t {
+            // RVC net_g emits ~ p_len·(sr/100) samples; keep only the pre-pad span.
+            wav.truncate((real_t * (m.sample_rate as usize / 100)).min(wav.len()));
+        }
         audio.extend_from_slice(&wav);
         cv_cursor += chunk.t;
         progress((ci + 1) as f32 / n_chunks as f32);
     }
     peak_normalize(&mut audio, 0.92);
-    Ok(SynthesisResult { audio, sample_rate: voice.sample_rate })
+    Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
 }
 
 /// `w *= peak / (max|w| + 1e-9)` — render_ust.render_song's final output normalization.
@@ -578,30 +515,32 @@ mod tests {
 
     #[test]
     fn build_note_hz_option_a_rest_and_unvoiced() {
-        // note / rest / note — the rest group is silent, and cv↔DAW frames align (uncapped rest).
-        let score = [("あ", 60, 4), ("R", 0, 4), ("い", 62, 4)];
+        // note / rest / note — the rest group is silent, and cv↔DAW frames align (uncapped rest). Each note
+        // is ≥ VOWEL_MIN_FRAMES so the M3 borrow-time leaves the boundaries clean (a separate test covers
+        // the short-note borrow); [0..5]=note0, [5..10]=rest, [10..15]=note2.
+        let score = [("あ", 60, 5), ("R", 0, 5), ("い", 62, 5)];
         let arr = build_arrays_daw(&score).unwrap();
-        assert_eq!(arr.phone_dur.iter().sum::<i64>(), 12, "1+1+1 phones, 4+4(uncapped SP)+4 frames");
-        let mut cents = vec![0.0f32; 12];
-        let mut voiced = vec![0u8; 12];
-        for c in cents.iter_mut().take(4) {
+        assert_eq!(arr.phone_dur.iter().sum::<i64>(), 15, "1+1+1 phones, 5+5(uncapped SP)+5 frames");
+        let mut cents = vec![0.0f32; 15];
+        let mut voiced = vec![0u8; 15];
+        for c in cents.iter_mut().take(5) {
             *c = 6000.0;
         }
-        for v in voiced.iter_mut().take(4) {
+        for v in voiced.iter_mut().take(5) {
             *v = 1;
         }
-        for c in cents.iter_mut().skip(8) {
+        for c in cents.iter_mut().skip(10) {
             *c = 6200.0;
         }
-        for v in voiced.iter_mut().skip(8) {
+        for v in voiced.iter_mut().skip(10) {
             *v = 1;
         }
         let f0 = VocalF0 { cents: &cents, voiced: &voiced };
         let hz = build_note_hz(&arr, &score, 0, Some(&f0));
-        assert_eq!(hz.len(), 12);
-        assert!(hz[0..4].iter().all(|&h| h > 200.0), "note0 voiced, got {:?}", &hz[0..4]);
-        assert!(hz[4..8].iter().all(|&h| h == 0.0), "rest group → silent, got {:?}", &hz[4..8]);
-        assert!(hz[8..12].iter().all(|&h| h > 200.0), "note2 voiced, got {:?}", &hz[8..12]);
+        assert_eq!(hz.len(), 15);
+        assert!(hz[0..5].iter().all(|&h| h > 200.0), "note0 voiced, got {:?}", &hz[0..5]);
+        assert!(hz[5..10].iter().all(|&h| h == 0.0), "rest group → silent, got {:?}", &hz[5..10]);
+        assert!(hz[10..15].iter().all(|&h| h > 200.0), "note2 voiced, got {:?}", &hz[10..15]);
     }
 
     // Note-model contrast (user Q, 2026-07-09): `ー` sustain (prolongation) vs a repeated `か` token
@@ -628,26 +567,40 @@ mod tests {
         assert_eq!(round_half_even(2.5), 2); // half → even
     }
 
-    // A sub-min_frames chunk must LOUD-error at the guard, BEFORE net_g is ever run (no model needed —
-    // the guard returns first). Mirrors the cover paths' short-piece guards (sovits.rs:255 / rvc.rs:291).
+    // M3 short-note handling: a sub-min_frames chunk is PADDED (repeat the last frame) so net_g accepts
+    // the shape, then the pad is trimmed off the decoded wav — NOT errored (the old hard-error is gone).
     #[test]
-    fn sovits_short_chunk_errors_before_decode() {
-        let engine = OnnxEngine::new();
-        let feed = SovitsFeed { cv: Array2::zeros((3, 768)), f0: vec![0.0; 3], uv: vec![1.0; 3], t_tgt: 3 };
-        let voice = SovitsVoice { features_dim: 768, noise_channels: 192, vol_embedding: false, sample_rate: 44100, hop_size: 512, min_frames: 6 };
-        let r = sovits_decode_chunk(&engine, "no-such-session", &feed, 0, &voice, None, 0, 0, 0.4);
-        let msg = format!("{}", r.expect_err("t_tgt=3 < min_frames=6 must error"));
-        assert!(msg.contains("片段过短"), "expected the min_frames guard, got: {msg}");
+    fn pad_sovits_feed_short_chunk() {
+        let mut feed = SovitsFeed {
+            cv: Array2::from_shape_fn((3, 4), |(i, _)| i as f32),
+            f0: vec![100.0, 200.0, 300.0],
+            uv: vec![0.0, 0.0, 0.0],
+            t_tgt: 3,
+        };
+        let orig = pad_sovits_feed(&mut feed, 6);
+        assert_eq!(orig, 3, "returns the pre-pad frame count (for the trim)");
+        assert_eq!((feed.t_tgt, feed.cv.nrows(), feed.f0.len(), feed.uv.len()), (6, 6, 6, 6));
+        assert_eq!(feed.f0[5], 300.0, "padded frames repeat the last real f0");
+        assert_eq!(feed.cv[[5, 0]], 2.0, "padded rows repeat the last real cv row");
+        // already ≥ min → untouched
+        let mut ok = SovitsFeed { cv: Array2::zeros((8, 4)), f0: vec![0.0; 8], uv: vec![0.0; 8], t_tgt: 8 };
+        assert_eq!(pad_sovits_feed(&mut ok, 6), 8);
+        assert_eq!(ok.t_tgt, 8);
     }
 
     #[test]
-    fn rvc_short_chunk_errors_before_decode() {
-        let engine = OnnxEngine::new();
-        let feed = RvcFeed { phone: Array2::zeros((8, 768)), pitchf: vec![0.0; 8], pitch: vec![1; 8], t: 8 };
-        let voice = RvcVoice { features_dim: 768, noise_channels: 192, sample_rate: 48000, min_frames: 12 };
-        let r = rvc_decode_chunk(&engine, "no-such-session", &feed, 0, &voice, 0, 0, 0.66666);
-        let msg = format!("{}", r.expect_err("t=8 < min_frames=12 must error"));
-        assert!(msg.contains("片段过短"), "expected the min_frames guard, got: {msg}");
+    fn rvc_feed_100_pads_short_chunk() {
+        // T50=3 → real_100=6 < min=12 → pad50=6 → cv 6 rows, 12 pitch frames.
+        let cv = Array2::from_shape_fn((3, 4), |(i, _)| i as f32);
+        let (cv_p, pitch, pitchf, real_t) = rvc_feed_100(cv, &[110.0, 220.0, 330.0], 12);
+        assert_eq!(real_t, 6, "pre-pad 100fps length = 2·T50");
+        assert_eq!((cv_p.nrows(), pitch.len(), pitchf.len()), (6, 12, 12));
+        assert_eq!((pitchf[0], pitchf[1]), (110.0, 110.0), "each note_hz frame repeated 2×");
+        assert_eq!(pitchf[11], 330.0, "padded frames repeat the last note_hz");
+        assert_eq!(cv_p[[5, 0]], 2.0, "padded cv rows repeat the last real row");
+        // already ≥ min → not padded
+        let (cv2, _, pf, rt) = rvc_feed_100(Array2::zeros((10, 4)), &vec![100.0; 10], 12);
+        assert_eq!((rt, cv2.nrows(), pf.len()), (20, 10, 20));
     }
 
     // ── Phase 2 GATE (Tier-1): the deterministic net_g INPUT tensors reproduce the Python reference
@@ -789,24 +742,51 @@ mod tests {
             wrote.push((name.to_string(), r.audio.len(), peak, r.sample_rate));
         };
 
+        // Item-1: the score render now drives the SHARED quality path (decode_features / vc_decode), so
+        // the audition builds REAL SovitsModel/RvcModel (contentvec/rmvpe/mel loaded; diffusion/cluster off
+        // for a clean plain-path demo). ContentVec/RMVPE are unused by the score decode tail but the model
+        // struct requires them (auto-f0 off → f0.onnx never loaded → the DAW/noteonly f0 is preserved).
+        let cv256 = engine.load_model_with(&aux.join("contentvec_256l9.onnx"), false).unwrap();
+        let cv768 = engine.load_model_with(&aux.join("contentvec_768l12.onnx"), false).unwrap();
+        let rmvpe = engine.load_model_with(&aux.join("rmvpe_e2e.onnx"), false).unwrap();
+        let rmvpe_mel: Array2<f32> = ndarray_npy::read_npy(&aux.join("rmvpe_mel_filters.npy")).unwrap();
+        let sopts = SovitsOptions { seed: 0, noise_scale: 0.4, ..Default::default() };
+        let ropts = RvcOptions { seed: 0, index_ratio: 0.0, protect: 0.5, ..Default::default() };
+        fn sov_model<'a>(
+            engine: &'a OnnxEngine, voice: &'a str, cv: &'a str, rmvpe: &'a str, mel: &'a Array2<f32>,
+            dim: usize, vol: bool,
+        ) -> SovitsModel<'a> {
+            SovitsModel {
+                engine, voice_session: voice, contentvec_session: cv, rmvpe_session: rmvpe,
+                mel_filters: mel, cluster: None, diffusion: None, vocoder: None,
+                f0_predictor_session: None, sample_rate: 44100, hop_size: 512, features_dim: dim,
+                vol_embedding: vol, spk_mix: None, unit_interpolate_mode: "left".into(),
+                noise_channels: 192, min_frames: 6,
+            }
+        }
+
         // akiko 4.0 / 256 (vol-free — cleanest audible on the 256 path)
         let akiko = engine.load_model_with(&sov.join("akiko_320000.onnx"), false).unwrap();
-        let av = SovitsVoice { features_dim: 256, noise_channels: 192, vol_embedding: false, sample_rate: 44100, hop_size: 512, min_frames: 6 };
-        save("p2_akiko256_main", &render_score_sovits(&engine, &s2cv256, &akiko, pr::SCORE, 256, 49, 2, &av, 0, 0.0, 0, 0.4, 0, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_legato", &render_score_sovits(&engine, &s2cv256, &akiko, LEGATO, 256, 49, 2, &av, 0, 0.0, 0, 0.4, 0, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_rest", &render_score_sovits(&engine, &s2cv256, &akiko, REST, 256, 49, 2, &av, 0, 0.0, 0, 0.4, 0, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&engine, &s2cv256, &akiko, SUSTAIN, 256, 49, 2, &av, 0, 0.0, 0, 0.4, 0, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&engine, &s2cv256, &akiko, REARTIC, 256, 49, 2, &av, 0, 0.0, 0, 0.4, 0, None, &no_cancel, &no_prog).unwrap());
+        let am = sov_model(&engine, &akiko, &cv256, &rmvpe, &rmvpe_mel, 256, false);
+        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, pr::SCORE, 256, 49, 2, &sopts, 0.0, 0, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, LEGATO, 256, 49, 2, &sopts, 0.0, 0, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, REST, 256, 49, 2, &sopts, 0.0, 0, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, SUSTAIN, 256, 49, 2, &sopts, 0.0, 0, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, REARTIC, 256, 49, 2, &sopts, 0.0, 0, None, &no_cancel, &no_prog).unwrap());
 
         // 东雪莲 4.1 / 768 (SAME voice as the Python reference; vol_embedding → flat placeholder vol)
         let dx = engine.load_model_with(&sov.join("Sovits4.1东雪莲主模型.onnx"), false).unwrap();
-        let dv = SovitsVoice { features_dim: 768, noise_channels: 192, vol_embedding: true, sample_rate: 44100, hop_size: 512, min_frames: 6 };
-        save("p2_dongxuelian768_main", &render_score_sovits(&engine, &s2cv768, &dx, pr::SCORE, 768, 49, 2, &dv, 0, 0.1, 0, 0.4, 0, None, &no_cancel, &no_prog).unwrap());
+        let dm = sov_model(&engine, &dx, &cv768, &rmvpe, &rmvpe_mel, 768, true);
+        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, pr::SCORE, 768, 49, 2, &sopts, 0.1, 0, None, &no_cancel, &no_prog).unwrap());
 
         // RVC v2 lengv2 / 768 (100 fps grid; no Python A/B reference — audible + glue self-consistency)
         let leng = engine.load_model_with(&rvcd.join("lengv2.3.onnx"), false).unwrap();
-        let rv = RvcVoice { features_dim: 768, noise_channels: 192, sample_rate: 48000, min_frames: 12 };
-        save("p2_rvc_lengv2_main", &render_score_rvc(&engine, &s2cv768, &leng, pr::SCORE, 768, 49, 2, &rv, 0, 0, 0.66666, 0, None, &no_cancel, &no_prog).unwrap());
+        let rm = RvcModel {
+            engine: &engine, voice_session: &leng, contentvec_session: &cv768, rmvpe_session: &rmvpe,
+            mel_filters: &rmvpe_mel, index: None, sample_rate: 48000, features_dim: 768, spk_mix: None,
+            noise_channels: 192, min_frames: 12,
+        };
+        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, pr::SCORE, 768, 49, 2, &ropts, 0, None, &no_cancel, &no_prog).unwrap());
 
         drop(save); // release the &mut wrote borrow before reading it back
         eprintln!("\n[P2/Tier2] wrote {} wavs to {}", wrote.len(), out.display());
@@ -828,5 +808,227 @@ mod tests {
             w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16).unwrap();
         }
         w.finalize().unwrap();
+    }
+
+    // ── STEP 0 (Item-1) COVER DECODE SMOKE (all branches) ────────────────────────────────────────
+    //    Runs the REAL cover pipeline (sovits/rvc run_pipeline) end-to-end on a fixed synthetic input,
+    //    exercising EVERY branch of the extracted decode tail: plain VITS · vol_embedding · auto-f0 ·
+    //    cluster blend (apply_cluster_blend) · NSF enhancer · shallow diffusion (±second_encoding) ·
+    //    RVC plain · RVC index+protect. Asserts each branch still runs and yields non-silent audio of
+    //    the (deterministic) frame-derived length — a smoke gate that the decode_features / vc_decode
+    //    extraction did not break the pipeline shape.
+    //    ⚠ The AUDIO ITSELF is NOT bit-reproducible run-to-run: the net_g ONNX graphs carry
+    //    RandomNormalLike/RandomUniform nodes (VITS flow z-sampling) with NO seed attribute, so ORT
+    //    draws fresh randomness each run (score2svc.rs's own note: "validated by ear, not bit-parity";
+    //    empirically confirmed here — two identical runs differ). The extraction's byte fidelity is
+    //    therefore proven at the SOURCE level (the moved fn bodies are character-identical to the
+    //    originals — see scratchpad/verbatim_check.py) + the deterministic feed-builder gate
+    //    (score2svc_glue_parity_cpu) + ear. Needs the voice models + dev ORT dll — hence #[ignore]:
+    //      cargo test --lib inference::score2svc::tests::cover_decode_smoke -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn cover_decode_smoke() {
+        use super::super::engine::DeviceConfig;
+        use super::super::{diffusion, rvc, sovits, RvcOptions, SovitsOptions};
+        use crate::audio::AudioBuffer;
+        use ndarray::Array2;
+        use std::path::Path;
+        use std::sync::Arc;
+
+        let read_npy2 = |p: &Path| -> Array2<f32> { ndarray_npy::read_npy(p).unwrap() };
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dll = root.join("../runtime/ort/onnxruntime.dll");
+        assert!(dll.exists(), "ORT dll missing at {}", dll.display());
+        if let Ok(b) = ort::init_from(&dll) {
+            let _ = b.commit();
+        }
+        let engine = OnnxEngine::new();
+        engine.set_device(DeviceConfig::Cpu); // deterministic + matches the parity gate
+
+        let aux = root.join("../data/models/aux");
+        let sov = root.join("../data/models/sovits");
+        let rvcd = root.join("../data/models/rvc");
+
+        // shared aux sessions + filterbanks
+        let cv768 = engine.load_model_with(&aux.join("contentvec_768l12.onnx"), false).unwrap();
+        let cv256 = engine.load_model_with(&aux.join("contentvec_256l9.onnx"), false).unwrap();
+        let rmvpe = engine.load_model_with(&aux.join("rmvpe_e2e.onnx"), false).unwrap();
+        let rmvpe_mel = read_npy2(&aux.join("rmvpe_mel_filters.npy"));
+        let nsf_mel = Arc::new(read_npy2(&aux.join("nsf_hifigan_mel.npy")));
+        let nsf_sid = engine.load_model_with(&aux.join("nsf_hifigan.onnx"), false).unwrap();
+
+        // voice sessions
+        let akiko = engine.load_model_with(&sov.join("akiko_320000.onnx"), false).unwrap();
+        let akiko_f0 = engine.load_model_with(&sov.join("akiko_320000.f0.onnx"), false).unwrap();
+        let dx = engine.load_model_with(&sov.join("Sovits4.1东雪莲主模型.onnx"), false).unwrap();
+        let dxdiff = sov.join("Sovits4.1东雪莲主模型.diffusion");
+        let dx_enc = engine.load_model_with(&dxdiff.join("encoder.onnx"), false).unwrap();
+        let dx_den = engine.load_model_with(&dxdiff.join("denoiser.onnx"), false).unwrap();
+        let leng = engine.load_model_with(&rvcd.join("lengv2.3.onnx"), false).unwrap();
+        // かざね 4.0/256 carries a feature-retrieval index → the cluster branch (apply_cluster_blend).
+        // 东雪莲 has no .cluster dir, so a separate 256 voice hosts the cluster case.
+        let kazane = engine.load_model_with(&sov.join("かざねsayo（测试）_best.onnx"), false).unwrap();
+        let kazane_cluster = sovits::ClusterAsset::FeatureIndex(super::super::features::KnnIndex::new(
+            read_npy2(&sov.join("かざねsayo（测试）_best.cluster").join("0.index_vectors.npy")),
+        ));
+        // RVC leng retrieval index
+        let leng_index = rvc::RvcIndex::load(&rvcd.join("lengv2.3.npy")).unwrap();
+
+        // vocoder / diffusion runtime builders (fresh per case; cloned session ids share the graph)
+        let mk_voc = || sovits::VocoderRuntime {
+            session: nsf_sid.clone(),
+            mel_filters: nsf_mel.clone(),
+            cfg: super::super::nsf_hifigan::VocoderConfig { sample_rate: 44100, hop_size: 512, num_mels: 128 },
+        };
+        let mk_diff = || sovits::DiffusionRuntime {
+            encoder_session: dx_enc.clone(),
+            denoiser_session: dx_den.clone(),
+            schedule: diffusion::DiffusionSchedule::linear(1000, 0.02, &[-12.0], &[2.0], 1000),
+            method: diffusion::SamplerMethod::parse("dpm-solver++").unwrap(),
+            n_hidden: 256,
+            n_spk: 1,
+            unit_interpolate_mode: "nearest".into(),
+        };
+
+        // fixed synthetic input: 1.2 s of a 220 Hz sine (clear pitch → RMVPE detects f0, voiced path runs).
+        let sr_in = 44100u32;
+        let ns = (sr_in as f64 * 1.2) as usize;
+        let input: Vec<f32> = (0..ns)
+            .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 220.0 * i as f32 / sr_in as f32).sin())
+            .collect();
+        let buf = AudioBuffer::new_mono(input, sr_in);
+        let noop = |_: f32| {};
+        let live = || false;
+
+        // base SoVITS model (nested fn = explicit lifetimes, no transmute). A case tweaks fields after.
+        fn sov_base<'a>(
+            engine: &'a OnnxEngine,
+            voice: &'a str,
+            cv: &'a str,
+            rmvpe: &'a str,
+            mel: &'a Array2<f32>,
+            dim: usize,
+            vol: bool,
+        ) -> sovits::SovitsModel<'a> {
+            sovits::SovitsModel {
+                engine,
+                voice_session: voice,
+                contentvec_session: cv,
+                rmvpe_session: rmvpe,
+                mel_filters: mel,
+                cluster: None,
+                diffusion: None,
+                vocoder: None,
+                f0_predictor_session: None,
+                sample_rate: 44100,
+                hop_size: 512,
+                features_dim: dim,
+                vol_embedding: vol,
+                spk_mix: None,
+                unit_interpolate_mode: "left".into(),
+                noise_channels: 192,
+                min_frames: 6,
+            }
+        }
+        let dopts = |noise: f32| SovitsOptions { seed: 0, noise_scale: noise, ..Default::default() };
+        // each case must run end-to-end and produce non-silent audio (peak > 1e-3); returns the sample
+        // length (deterministic — set by the frame count, unaffected by the graph's internal randomness).
+        let run_sov = |m: &sovits::SovitsModel, o: &SovitsOptions| -> u64 {
+            let a = sovits::run_pipeline(m, &buf, o, &noop, &live).unwrap().audio;
+            let peak = a.iter().fold(0.0f32, |p, &v| p.max(v.abs()));
+            assert!(peak > 1e-3, "cover render is silent (peak {peak})");
+            a.len() as u64
+        };
+        let akiko256 = || sov_base(&engine, &akiko, &cv256, &rmvpe, &rmvpe_mel, 256, false);
+        let dx768 = || sov_base(&engine, &dx, &cv768, &rmvpe, &rmvpe_mel, 768, true);
+
+        let mut results: Vec<(&str, u64)> = Vec::new();
+
+        // 1) akiko 4.0/256 plain VITS (sid path, vits_out passthrough)
+        results.push(("sov_akiko256_plain", run_sov(&akiko256(), &dopts(0.4))));
+        // 2) 东雪莲 4.1/768 plain (vol_embedding tensor fed)
+        results.push(("sov_dx768_plain", run_sov(&dx768(), &dopts(0.4))));
+        // 3) akiko + auto-f0 (f0_predictor block REPLACES f0)
+        {
+            let mut m = akiko256();
+            m.f0_predictor_session = Some(akiko_f0.clone());
+            results.push(("sov_akiko256_autof0", run_sov(&m, &dopts(0.4))));
+        }
+        // 4) かざね 4.0/256 + cluster/retrieval blend (apply_cluster_blend, FeatureIndex)
+        {
+            let mut m = sov_base(&engine, &kazane, &cv256, &rmvpe, &rmvpe_mel, 256, false);
+            m.cluster = Some(&kazane_cluster);
+            let o = SovitsOptions { seed: 0, noise_scale: 0.4, cluster_ratio: 0.5, ..Default::default() };
+            results.push(("sov_kazane256_cluster", run_sov(&m, &o)));
+        }
+        // 5) akiko + NSF enhancer (plain path enhancer branch)
+        {
+            let mut m = akiko256();
+            m.vocoder = Some(mk_voc());
+            let o = SovitsOptions { seed: 0, noise_scale: 0.4, nsf_enhance: true, enhancer_adaptive_key: 0, ..Default::default() };
+            results.push(("sov_akiko256_enhancer", run_sov(&m, &o)));
+        }
+        // 6) 东雪莲 + shallow diffusion (dpm-solver++), no second encoding
+        {
+            let mut m = dx768();
+            m.diffusion = Some(mk_diff());
+            m.vocoder = Some(mk_voc());
+            let o = SovitsOptions { seed: 0, noise_scale: 0.4, shallow_diffusion: true, k_step: 100, diffusion_method: "dpm-solver++".into(), diffusion_speedup: 10, ..Default::default() };
+            results.push(("sov_dx768_diffusion", run_sov(&m, &o)));
+        }
+        // 6b) 东雪莲 + shallow diffusion + second_encoding (re-extract ContentVec from VITS out)
+        {
+            let mut m = dx768();
+            m.diffusion = Some(mk_diff());
+            m.vocoder = Some(mk_voc());
+            let o = SovitsOptions { seed: 0, noise_scale: 0.4, shallow_diffusion: true, second_encoding: true, k_step: 100, diffusion_method: "dpm-solver++".into(), diffusion_speedup: 10, ..Default::default() };
+            results.push(("sov_dx768_diffusion_2enc", run_sov(&m, &o)));
+        }
+
+        // 7/8) RVC (100 fps grid). Plain (no retrieval, protect≥0.5) then index+protect (<0.5 → feats0 blend).
+        fn rvc_base<'a>(
+            engine: &'a OnnxEngine,
+            voice: &'a str,
+            cv: &'a str,
+            rmvpe: &'a str,
+            mel: &'a Array2<f32>,
+            index: Option<&'a rvc::RvcIndex>,
+        ) -> rvc::RvcModel<'a> {
+            rvc::RvcModel {
+                engine,
+                voice_session: voice,
+                contentvec_session: cv,
+                rmvpe_session: rmvpe,
+                mel_filters: mel,
+                index,
+                sample_rate: 48000,
+                features_dim: 768,
+                spk_mix: None,
+                noise_channels: 192,
+                min_frames: 12,
+            }
+        }
+        let run_rvc = |m: &rvc::RvcModel, o: &RvcOptions| -> u64 {
+            let a = rvc::run_pipeline(m, &buf, o, &noop, &live).unwrap().audio;
+            let peak = a.iter().fold(0.0f32, |p, &v| p.max(v.abs()));
+            assert!(peak > 1e-3, "cover render is silent (peak {peak})");
+            a.len() as u64
+        };
+        {
+            let o = RvcOptions { seed: 0, index_ratio: 0.0, protect: 0.5, ..Default::default() };
+            results.push(("rvc_leng_plain", run_rvc(&rvc_base(&engine, &leng, &cv768, &rmvpe, &rmvpe_mel, None), &o)));
+        }
+        {
+            let o = RvcOptions { seed: 0, index_ratio: 0.5, protect: 0.33, ..Default::default() };
+            results.push(("rvc_leng_index_protect", run_rvc(&rvc_base(&engine, &leng, &cv768, &rmvpe, &rmvpe_mel, Some(&leng_index)), &o)));
+        }
+
+        eprintln!("\n[smoke] cover decode — all branches ran + non-silent (length in samples):");
+        for (name, len) in &results {
+            eprintln!("    {name:<28} len={len}");
+            assert!(*len > 0, "{name}: empty render");
+        }
+        eprintln!("[smoke] ✓ all {} decode branches ran non-silent", results.len());
     }
 }

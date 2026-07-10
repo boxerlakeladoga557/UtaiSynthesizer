@@ -5,6 +5,7 @@ import {
   voiceVersionBadge,
   voiceSpeakerOptions,
   formatSampleRateKhz,
+  vocoderFormatMatches,
   type VoiceModelEntry,
   type VoiceType,
 } from "../../../store/voice-models";
@@ -248,6 +249,47 @@ export function SpeakerBlend({ model, value, onChange, lang }: {
           </select>
         </div>
       )}
+    </div>
+  );
+}
+
+/** Shared NSF-HiFiGAN vocoder picker (S40) — used by the 翻唱 SoVITS node AND the ② vocal sidebar (Item-1:
+ *  a fine-tuned vocoder applies to the MIDI track too — the backend `resolve_sovits_quality` already honors
+ *  `vocoder_name` for both). Only meaningful on the mel→audio paths (shallow diffusion / enhancer); the
+ *  CALLER gates visibility. `rowClass`/`selectClass` let each host use its own layout. A deleted/format-
+ *  mismatched pick stays visible as「已缺失」/「格式不匹配」rather than auto-cleared (the async list would
+ *  transiently flip a valid pick to the default — Rust errors loudly on a dangling name as the backstop). */
+export function VocoderSelect({ value, lang, onChange, rowClass = "sep-param-row", selectClass, labelClass }: {
+  value: string | null;
+  lang: string;
+  onChange: (v: string | null) => void;
+  rowClass?: string;
+  selectClass?: string;
+  labelClass?: string;
+}) {
+  const vocoders = useVoiceModelStore((s) => s.models.vocoder);
+  const matched = vocoders.filter(vocoderFormatMatches);
+  const dangling =
+    value && !matched.some((v) => v.name === value)
+      ? value +
+        (vocoders.some((v) => v.name === value)
+          ? t18({ zh: "（格式不匹配）", en: " (format mismatch)", ja: "（フォーマット不一致）" }, lang)
+          : t18({ zh: "（已缺失）", en: " (missing)", ja: "（欠落）" }, lang))
+      : null;
+  return (
+    <div className={rowClass}>
+      <label className={labelClass} title={t18({
+        zh: "浅扩散/增强器使用的 NSF-HiFiGAN 声码器。可选资源管理中已微调/导入的声码器（同一歌手的声码器可被其所有 SoVITS 模型共享；仅列出频谱格式一致的）；默认 = 内置通用声码器",
+        en: "NSF-HiFiGAN vocoder used by shallow diffusion / the enhancer. Pick a fine-tuned/imported vocoder from the Resource Manager (one singer's vocoder is shared by all their SoVITS models; only format-matching ones are listed); default = the built-in general vocoder",
+        ja: "浅い拡散/エンハンサーが使う NSF-HiFiGAN ボコーダー。リソース管理で微調整/取り込んだボコーダーを選択可能（同じ歌手のボコーダーは全 SoVITS モデルで共有可。フォーマット一致のもののみ表示）。既定 = 内蔵汎用ボコーダー",
+      }, lang)}>
+        {t18({ zh: "声码器", en: "Vocoder", ja: "ボコーダー" }, lang)}
+      </label>
+      <select className={selectClass} value={value ?? ""} onChange={(e) => onChange(e.target.value === "" ? null : e.target.value)}>
+        <option value="">{t18({ zh: "默认声码器", en: "Default vocoder", ja: "既定ボコーダー" }, lang)}</option>
+        {matched.map((v) => <option key={v.name} value={v.name}>{v.name}</option>)}
+        {dangling && <option value={value ?? ""}>{dangling}</option>}
+      </select>
     </div>
   );
 }
