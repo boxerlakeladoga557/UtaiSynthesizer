@@ -25,6 +25,12 @@ export function formatPan(v: number): string {
   return v < 0 ? `L${Math.round(-v * 100)}` : `R${Math.round(v * 100)}`;
 }
 
+/** Volume-fader dB text ("-∞ dB" at/below the floor, else "+1.5 dB" / "-6.0 dB"). The ONE dB
+ *  formatter shared by the fader tooltip AND the always-on TrackList numeric readout. */
+export function formatDb(v: number, min: number): string {
+  return v <= min ? "-∞ dB" : `${v > 0 ? "+" : ""}${v.toFixed(1)} dB`;
+}
+
 export function VolumeFader({ value, min, max, onChange, onGestureStart, onGestureEnd, width = 48, step = 0.5, fillFrom = "left", format }: Props) {
   const trackRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
@@ -112,7 +118,7 @@ export function VolumeFader({ value, min, max, onChange, onGestureStart, onGestu
       onClick={(e) => e.stopPropagation()}
       // Default dB formatter: the fader BOTTOM reads −∞ (mute — see FADER_MIN_DB); a custom `format`
       // (the pan fader) is never affected.
-      title={format ? format(value) : value <= min ? "-∞ dB" : `${value > 0 ? "+" : ""}${value.toFixed(1)} dB`}
+      title={format ? format(value) : formatDb(value, min)}
     >
       <div className="vol-track" />
       <div className="vol-zero" style={{ left: `${zeroRatio * 100}%` }} />

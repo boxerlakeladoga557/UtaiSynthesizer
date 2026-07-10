@@ -5,12 +5,12 @@ import { useHistoryStore } from "../../store/history";
 import { useTranslation } from "react-i18next";
 import { open } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, TRACK_HEADER_HEIGHT, FADER_MIN_DB, AUDIO_EXTENSIONS } from "../../lib/constants";
+import { LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, TRACK_HEADER_HEIGHT, FADER_MIN_DB, FADER_MAX_DB, AUDIO_EXTENSIONS } from "../../lib/constants";
 import { computeTrackHeight, computeTrackYOffsets, computeTotalTracksHeight, findTrackAtY, getLanes, getLaneLayout, isLaneRowMuted, laneControlFor, type LaneGroupRun, type LaneMember } from "../../lib/trackLayout";
 import { laneLabelParts } from "../../lib/audio/laneOps";
 import { trackTypeCssVar, LANE_COLORS } from "../../lib/trackColors";
 import { importAudioToNewTrack } from "../../lib/audio/import";
-import { VolumeFader, formatPan } from "../common/VolumeFader";
+import { VolumeFader, formatPan, formatDb } from "../common/VolumeFader";
 import { ContextMenu, type MenuItem } from "../common/ContextMenu";
 import * as playback from "../../lib/audio/playback";
 import type { Track } from "../../types/project";
@@ -456,11 +456,12 @@ function TrackItem({
               <VolumeFader
                 value={track.volumeDb}
                 min={FADER_MIN_DB}
-                max={6}
+                max={FADER_MAX_DB}
                 onChange={onVolumeChange}
                 onGestureStart={() => useHistoryStore.getState().beginTransaction()}
                 onGestureEnd={() => useHistoryStore.getState().commitTransaction()}
               />
+              <span className="fader-val">{formatDb(track.volumeDb, FADER_MIN_DB)}</span>
             </div>
             <div className="fader-row">
               <span className="fader-tag">P</span>
@@ -475,6 +476,7 @@ function TrackItem({
                 onGestureStart={() => useHistoryStore.getState().beginTransaction()}
                 onGestureEnd={() => useHistoryStore.getState().commitTransaction()}
               />
+              <span className="fader-val">{formatPan(track.pan)}</span>
             </div>
           </div>
           {/* SOURCE selector (only meaningful once lanes exist): lit = the ORIGINAL audio plays and
@@ -521,12 +523,13 @@ function TrackItem({
                   <VolumeFader
                     value={ctrl?.volumeDb ?? 0}
                     min={FADER_MIN_DB}
-                    max={6}
+                    max={FADER_MAX_DB}
                     width={42}
                     onChange={(v) => onLaneVolumeChange(run, v)}
                     onGestureStart={() => useHistoryStore.getState().beginTransaction()}
                     onGestureEnd={() => useHistoryStore.getState().commitTransaction()}
                   />
+                  <span className="fader-val">{formatDb(ctrl?.volumeDb ?? 0, FADER_MIN_DB)}</span>
                 </div>
                 <div className="fader-row">
                   <span className="fader-tag">P</span>
@@ -542,6 +545,7 @@ function TrackItem({
                     onGestureStart={() => useHistoryStore.getState().beginTransaction()}
                     onGestureEnd={() => useHistoryStore.getState().commitTransaction()}
                   />
+                  <span className="fader-val">{formatPan(ctrl?.pan ?? 0)}</span>
                 </div>
               </div>
             </div>

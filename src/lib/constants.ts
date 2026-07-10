@@ -33,3 +33,8 @@ export const AUDIO_EXT_RE = new RegExp(`\\.(${AUDIO_EXTENSIONS.join("|")})$`, "i
  *  not survive JSON). ONE constant for the faders (TrackList), the gain math (playback), and the
  *  future mixdown export. */
 export const FADER_MIN_DB = -24;
+
+/** Volume-fader ceiling (dB). Bounded upward (unlike the floor); +24 dB gives real make-up headroom
+ *  (the old +6 couldn't push a quiet stem). ONE constant for the faders (TrackList) — the gain math
+ *  (dbToLinear) has no upper clamp, so this is purely the UI travel limit. */
+export const FADER_MAX_DB = 24;

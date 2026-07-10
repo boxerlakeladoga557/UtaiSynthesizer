@@ -284,6 +284,20 @@
   user-select: none;
 }
 
+/* Always-on numeric readout after each fader (dB / pan) — the fader alone was "看着来" abstract; the
+   number is now on the UI, not just the hover tooltip. Mono + tabular so the width doesn't jitter. */
+.fader-val {
+  font-size: 8px;
+  font-family: var(--font-mono);
+  color: var(--text-tertiary, var(--text-secondary));
+  flex-shrink: 0;
+  min-width: 40px;
+  text-align: right;
+  line-height: 1;
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+}
+
 /* Group bar: breathing room BETWEEN the V and P fader pairs (each pair stays tight via .fader-row). */
 .lane-group-controls {
   gap: 14px;
