@@ -106,6 +106,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   const mouseRef = useRef<{ x: number; y: number } | null>(null);
   const clipboardRef = useRef<Note[]>([]);
   const lyricCancelRef = useRef(false); // Escape in the lyric input → suppress the unmount-blur commit
+  const lyricNavRef = useRef(false); // Tab/Shift+Tab navigating between notes → suppress the old input's unmount-blur (it already committed)
 
   // Local view state (NOT the arrangement's global scroll/zoom, §9.4).
   const viewRef = useRef<VocalView>({ scrollX: 0, scrollY: 0, ppt: PIXELS_PER_TICK * 2, rowH: 16, top: RULER_H });
@@ -837,21 +838,30 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     return out;
   };
 
+  // Notes in canonical next/prev order — tick asc, id tiebreak. ONE comparator for lyric-commit
+  // distribution AND Tab/Shift+Tab navigation (so "who's next" never drifts between the two paths).
+  const orderedNotes = () => [...(part?.notes ?? [])].sort((a, b) => a.tick - b.tick || (a.id < b.id ? -1 : 1));
+
+  // The lyric-input overlay geometry (x/y/w) for a note — shared by double-click open and Tab nav.
+  const lyricEditFor = (note: Note) => {
+    const v = viewRef.current;
+    const x0 = KEY_COL_W + noteTickToX(note.tick, part!.start, v);
+    const y = pitchToY(note.pitch, v);
+    const w = Math.max(40, noteTickToX(note.tick + note.duration, part!.start, v) - noteTickToX(note.tick, part!.start, v));
+    return { id: note.id, x: Math.max(KEY_COL_W, x0), y, w, value: note.lyric };
+  };
+
   const onDoubleClick = useCallback((e: React.MouseEvent) => {
     if (toolRef.current === "pitch" || toolRef.current === "delete") return; // lyric editing lives in Arrow/Pen only (§user)
     const hit = noteAt(e.clientX, e.clientY);
     if (!hit || !part) return;
-    const v = viewRef.current;
-    const x0 = KEY_COL_W + noteTickToX(hit.note.tick, part.start, v);
-    const y = pitchToY(hit.note.pitch, v);
-    const w = Math.max(40, noteTickToX(hit.note.tick + hit.note.duration, part.start, v) - noteTickToX(hit.note.tick, part.start, v));
-    setLyricEdit({ id: hit.note.id, x: Math.max(KEY_COL_W, x0), y, w, value: hit.note.lyric });
+    setLyricEdit(lyricEditFor(hit.note));
   }, [part]);
 
   const commitLyric = (id: string, value: string) => {
     if (!part) { setLyricEdit(null); return; }
     const tokens = splitLyricTokens(value.trim());
-    const ordered = [...part.notes].sort((a, b) => a.tick - b.tick || (a.id < b.id ? -1 : 1));
+    const ordered = orderedNotes();
     const startIdx = ordered.findIndex((n) => n.id === id);
     if (tokens.length <= 1 || startIdx < 0) {
       applyNoteEdits(part.trackId, segmentId, { update: { [id]: { lyric: tokens[0] ?? DEFAULT_LYRIC } } });
@@ -863,6 +873,19 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       applyNoteEdits(part.trackId, segmentId, { update });
     }
     setLyricEdit(null);
+  };
+
+  // Tab (dir +1) / Shift+Tab (dir −1) while editing a lyric: commit the current note, then open the
+  // adjacent note's lyric input (SynthV/OpenUTAU convention). At the ends, just commit + close.
+  const navLyric = (fromId: string, value: string, dir: 1 | -1) => {
+    if (!part) { setLyricEdit(null); return; }
+    lyricNavRef.current = true; // the old input unmounts (key change) → its blur must NOT re-commit
+    queueMicrotask(() => { lyricNavRef.current = false; });
+    const ordered = orderedNotes(); // ticks don't change on a lyric commit → pre-commit order == post
+    const idx = ordered.findIndex((n) => n.id === fromId);
+    commitLyric(fromId, value); // applyNoteEdits + setLyricEdit(null)
+    const next = idx < 0 ? undefined : ordered[idx + dir];
+    if (next) setLyricEdit(lyricEditFor(next)); // overrides the null → opens the neighbour (remounts via key)
   };
 
   // ── keyboard (own handler; MUST bail on editable targets — §9.6) ──
@@ -1036,17 +1059,20 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
           {tool === "delete" && <div className="vocal-delete-overlay" />}
           {lyricEdit && (
             <input
+              key={lyricEdit.id}
               className="vocal-lyric-input"
               autoFocus
               style={{ left: lyricEdit.x, top: lyricEdit.y, width: Math.max(40, lyricEdit.w) }}
               defaultValue={lyricEdit.value}
+              onFocus={() => { lyricCancelRef.current = false; }} // a freshly-focused input never suppresses its OWN commit
               onKeyDown={(e) => {
                 if (e.key === "Enter") commitLyric(lyricEdit.id, (e.target as HTMLInputElement).value);
                 else if (e.key === "Escape") { lyricCancelRef.current = true; setLyricEdit(null); }
+                else if (e.key === "Tab") { e.preventDefault(); navLyric(lyricEdit.id, (e.target as HTMLInputElement).value, e.shiftKey ? -1 : 1); } // preventDefault: stop the native focus-move off the input
                 e.stopPropagation();
               }}
               onBlur={(e) => {
-                if (lyricCancelRef.current) { lyricCancelRef.current = false; return; } // Escape cancelled
+                if (lyricNavRef.current || lyricCancelRef.current) { lyricCancelRef.current = false; return; } // Tab already committed / Escape cancelled
                 commitLyric(lyricEdit.id, e.target.value);
               }}
             />
