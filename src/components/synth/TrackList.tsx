@@ -10,6 +10,7 @@ import { computeTrackHeight, computeTrackYOffsets, computeTotalTracksHeight, fin
 import { laneLabelParts } from "../../lib/audio/laneOps";
 import { trackTypeCssVar, LANE_COLORS } from "../../lib/trackColors";
 import { importAudioToNewTrack } from "../../lib/audio/import";
+import { blankTrack } from "../../lib/trackFactory";
 import { VolumeFader, formatPan, formatDb } from "../common/VolumeFader";
 import { ContextMenu, type MenuItem } from "../common/ContextMenu";
 import * as playback from "../../lib/audio/playback";
@@ -141,20 +142,14 @@ export function TrackList({ width }: Props) {
   // right-click "add material" menu); omitting it appends at the bottom (the "+" menu).
   const createAudioTrack = useCallback((insertIndex?: number) => {
     setAddMenuOpen(false);
-    addTrack({
-      id: crypto.randomUUID(),
-      name: `Audio ${useProjectStore.getState().tracks.filter((tk) => tk.trackType === "audio").length + 1}`,
-      trackType: "audio", segments: [], volumeDb: 0, pan: 0, muted: false, solo: false, expanded: false, laneControls: {},
-    }, insertIndex);
+    const n = useProjectStore.getState().tracks.filter((tk) => tk.trackType === "audio").length + 1;
+    addTrack(blankTrack(crypto.randomUUID(), `Audio ${n}`, "audio"), insertIndex);
   }, [addTrack]);
 
   const createVocalTrack = useCallback((insertIndex?: number) => {
     setAddMenuOpen(false);
-    addTrack({
-      id: crypto.randomUUID(),
-      name: `Vocal ${useProjectStore.getState().tracks.filter((tk) => tk.trackType === "vocal").length + 1}`,
-      trackType: "vocal", segments: [], volumeDb: 0, pan: 0, muted: false, solo: false, expanded: false, laneControls: {},
-    }, insertIndex);
+    const n = useProjectStore.getState().tracks.filter((tk) => tk.trackType === "vocal").length + 1;
+    addTrack(blankTrack(crypto.randomUUID(), `Vocal ${n}`, "vocal"), insertIndex);
   }, [addTrack]);
 
   const importAudioAt = useCallback(async (insertIndex?: number) => {

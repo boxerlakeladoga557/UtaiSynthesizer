@@ -9,7 +9,8 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import i18n from "../../i18n";
-import type { Note, Track, VibratoSpec } from "../../types/project";
+import type { Note, VibratoSpec } from "../../types/project";
+import { blankTrack } from "../trackFactory";
 import { useProjectStore } from "../../store/project";
 import { useAppStore } from "../../store/app";
 import { useHistoryStore } from "../../store/history";
@@ -36,23 +37,6 @@ interface ImportedNote {
   pitch: number;
   lyric: string;
   vibrato: VibratoSpec | null; // camelCase from Rust == VibratoSpec shape exactly
-}
-
-/** Base for a freshly-created vocal track — the SAME literal as TrackList.createVocalTrack (kept in sync;
- *  the shared shape is the Track interface). Name + id filled per import. */
-function newVocalTrack(id: string, name: string): Track {
-  return {
-    id,
-    name,
-    trackType: "vocal",
-    segments: [],
-    volumeDb: 0,
-    pan: 0,
-    muted: false,
-    solo: false,
-    expanded: false,
-    laneControls: {},
-  };
 }
 
 // Single in-flight guard: the import opens a native dialog + mutates the document; a second invocation
@@ -96,7 +80,7 @@ export async function importScoreFile(): Promise<void> {
       for (const it of score.tracks) {
         if (!it.notes.length) continue; // defensive: Rust already skips empty tracks
         const trackId = crypto.randomUUID();
-        store.addTrack(newVocalTrack(trackId, it.name || "Vocal"));
+        store.addTrack(blankTrack(trackId, it.name || "Vocal", "vocal"));
 
         // Part spans from the first note (tick 0, rebased in Rust) to the last note's end.
         const lastEnd = it.notes.reduce((m, n) => Math.max(m, n.tick + n.duration), 0);
