@@ -13,11 +13,13 @@
 //! app-side bitwise A/B gate (converter/verify/README.md).
 
 pub mod demucs;
+pub mod formant;
 pub mod mdx;
 pub mod stft;
 pub mod vr;
 
 pub use demucs::{demucs_ispec, demucs_spec};
+pub use formant::formant_warp;
 
 use ndarray::Array3;
 

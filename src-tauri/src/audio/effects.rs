@@ -199,12 +199,26 @@ fn pitch_shift_nsf(
 }
 
 fn formant_shift_world(buffer: &AudioBuffer, ratio: f32) -> Result<AudioBuffer> {
-    if (ratio - 1.0).abs() < 0.001 {
+    if (ratio - 1.0).abs() < 0.001 || buffer.channels == 0 {
         return Ok(buffer.clone());
     }
-    Err(UtaiError::Audio(
-        "Formant shift with WORLD vocoder is not yet implemented. Use NSF-HiFiGAN vocoder instead.".into()
-    ))
+    // Pure-Rust spectral-envelope warp (utai_dsp::formant_warp) per channel — a constant scalar ratio.
+    // This is the SAME DSP the ② vocal render feeds a per-frame envelope into (shared inference logic).
+    let channels = buffer.channels as usize;
+    let frames = buffer.samples.len() / channels;
+    let mut interleaved = vec![0.0f32; buffer.samples.len()];
+    for ch in 0..channels {
+        let mono: Vec<f32> = (0..frames).map(|i| buffer.samples[i * channels + ch]).collect();
+        let warped = utai_dsp::formant_warp(&mono, |_| ratio);
+        for i in 0..frames.min(warped.len()) {
+            interleaved[i * channels + ch] = warped[i];
+        }
+    }
+    Ok(AudioBuffer {
+        samples: interleaved,
+        sample_rate: buffer.sample_rate,
+        channels: buffer.channels,
+    })
 }
 
 fn formant_shift_nsf(
