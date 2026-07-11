@@ -292,7 +292,10 @@
   color: var(--text-tertiary, var(--text-secondary));
   flex-shrink: 0;
   min-width: 40px;
-  text-align: right;
+  /* Left-align so the number sits RIGHT AFTER the fader (not pushed to the box's right edge, where it
+     used to hug the O/M/S buttons); the min-width just reserves a stable column so O/M/S don't jump. */
+  text-align: left;
+  margin-left: 1px;
   line-height: 1;
   user-select: none;
   font-variant-numeric: tabular-nums;

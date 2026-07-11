@@ -1645,8 +1645,14 @@ function drawStaticContent(
           ctx.lineWidth = 0.5;
           ctx.strokeRect(sx, laneY, sw, laneH);
 
-          if (seg.content.type === "audioClip" && out.waveformPeaks && out.waveformPeaks.length > 0 && sw > 2) {
-            const lTotalMs = seg.content.totalDurationMs;
+          // Draw the baked waveform for a ROW: audio-track sub-lanes (audioClip) AND ② vocal bakes (a
+          // NOTES segment carrying a rendered stem in processedOutputs). S53 removed the audioClip gate
+          // from playback/contentEnd/lanesum but MISSED this display gate, so vocal renders played with
+          // no visible waveform. For a vocal bake the stem starts at the segment start (offset 0) and its
+          // length is the processedOutput's own duration (there is no content.offsetMs/totalDurationMs).
+          if (out.waveformPeaks && out.waveformPeaks.length > 0 && sw > 2) {
+            const lTotalMs = seg.content.type === "audioClip" ? seg.content.totalDurationMs : out.totalDurationMs;
+            const lOffMs = seg.content.type === "audioClip" ? seg.content.offsetMs : 0;
             // Light + thin lane-colour edge handles at a piece's two edges — mirrors the main-track segment's
             // edge bars, so EVERY cut reads as a left piece meeting a right piece (each hoverable) whether it
             // came from a laneOps slice OR a main-track SPLIT boundary between two segments' sub-lanes (each
@@ -1662,8 +1668,8 @@ function drawStaticContent(
               // stem spans the whole (trimmed) source, so draw the SAME [offset, offset+segment] window as
               // the original audio above (whole stem 0..1 would shift the lane vs the main track).
               const lSegMs = ticksToMs(seg.durationTicks, tempo);
-              const lStart = lTotalMs > 0 ? seg.content.offsetMs / lTotalMs : 0;
-              const lEnd = lTotalMs > 0 ? Math.min(1, (seg.content.offsetMs + lSegMs) / lTotalMs) : 1;
+              const lStart = lTotalMs > 0 ? lOffMs / lTotalMs : 0;
+              const lEnd = lTotalMs > 0 ? Math.min(1, (lOffMs + lSegMs) / lTotalMs) : 1;
               drawWaveform(ctx, out.audioPath, out.waveformPeaks, `rgba(${laneColor},0.6)`, sx, laneY, sw, laneH, lStart, lEnd, width);
               drawEdgeBars(sx, sw);
             } else {
