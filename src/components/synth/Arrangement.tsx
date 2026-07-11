@@ -115,6 +115,9 @@ export function Arrangement() {
   const updateSegmentLaneOps = useProjectStore((s) => s.updateSegmentLaneOps);
   const openWorkflow = useAppStore((s) => s.openWorkflow);
   const openVocalEditor = useAppStore((s) => s.openVocalEditor);
+  // ② S58 OOV verdicts — a draw dep (in the useCallback dep list + the staticKey) so the async verdict
+  // arriving AFTER the notes edit still re-bakes the static layer with the segment badge.
+  const vocalOov = useAppStore((s) => s.vocalOov);
   const selectedSegments = useAppStore((s) => s.selectedSegments);
   const selectedLane = useAppStore((s) => s.selectedLane);
   const selectSegment = useAppStore((s) => s.selectSegment);
@@ -1298,7 +1301,10 @@ export function Arrangement() {
         // laneId too: a DETACH rewrites laneId/outputNodeId in place with the same path/label/group,
         // but it splits one group RUN into several → new bars/row positions must repaint (P5).
         // o.loading: a lane turning ready flips the main row original-waveform → lane-sum switch.
-        return `${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${srcPeaks}.${notesSig}.${s.processedOutputs?.map(o => `${o.audioPath}:${o.laneId}:${o.laneLabel}:${o.group ?? ""}:${o.loading ? 1 : 0}:${o.offsetMs ?? 0}:${peaksSignature(o.waveformPeaks ?? [])}`).join(",") ?? ""}.${laneOpsSig(s.laneOps)}`;
+        // ② S58: the OOV badge is baked into the static layer, so its state must key the re-bake (the
+        // verdict lives in the app store — async, arrives AFTER the notes edit that keyed notesSig).
+        const oovCount = vocalOov[s.id]?.length ?? 0;
+        return `${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${srcPeaks}.${notesSig}.${oovCount}.${s.processedOutputs?.map(o => `${o.audioPath}:${o.laneId}:${o.laneLabel}:${o.group ?? ""}:${o.loading ? 1 : 0}:${o.offsetMs ?? 0}:${peaksSignature(o.waveformPeaks ?? [])}`).join(",") ?? ""}.${laneOpsSig(s.laneOps)}`;
       }).join(";");
       // playOriginal: flips the main-row waveform (sum ↔ original) + dims every lane row.
       return `${t.segments.length}:${t.expanded}:${t.muted}:${t.playOriginal ? 1 : 0}:${laneMutes}:${segs}`;
@@ -1435,7 +1441,7 @@ export function Arrangement() {
       const near = Math.abs(mouseXRef.current - phx) < 10;
       drawPlayhead(ctx, { x: phx, height, line: true, glow: near, cap: "top" });
     }
-  }, [tracks, audioFiles, loadingPaths, timeSignature, timeAxis, tempo, selectedSegments, selectedLane, dragOver, t]);
+  }, [tracks, audioFiles, loadingPaths, timeSignature, timeAxis, tempo, selectedSegments, selectedLane, dragOver, vocalOov, t]);
 
   drawRef.current = draw;
 
@@ -1623,6 +1629,25 @@ function drawStaticContent(
         ctx.beginPath();
         ctx.arc(sx + 8, sy + 8, 3, 0, Math.PI * 2);
         ctx.fill();
+      }
+
+      // ② S58 OOV badge — a red warning triangle at the segment's top-right when any of its notes
+      // can't be sung in its effective language (mirrors the green rendered-dot at top-left; the
+      // per-note red marks live in the vocal editor, this flags the segment from the arrangement).
+      // getState() is safe here: the COMPONENT subscribes vocalOov and keys the static re-bake on it
+      // (staticKey oovCount + the draw useCallback dep), so this read is always fresh at bake time.
+      if ((useAppStore.getState().vocalOov[seg.id]?.length ?? 0) > 0) {
+        const bx = sx + sw - 9;
+        ctx.fillStyle = "#f87171";
+        ctx.beginPath();
+        ctx.moveTo(bx, sy + 3);
+        ctx.lineTo(bx + 6, sy + 13);
+        ctx.lineTo(bx - 6, sy + 13);
+        ctx.closePath();
+        ctx.fill();
+        ctx.fillStyle = "#0a0f18";
+        ctx.fillRect(bx - 0.5, sy + 6.5, 1.5, 4);
+        ctx.fillRect(bx - 0.5, sy + 11.2, 1.5, 1.3);
       }
 
       if (track.muted) {

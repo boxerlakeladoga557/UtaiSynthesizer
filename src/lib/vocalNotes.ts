@@ -10,6 +10,7 @@
 // is Rust `validate_lyrics` (§9.5) — NOT here; the tie-mirror invariant lands in Phase 6 with render.
 import type { Note, PitchCurve, NoteTransition, VocalTrackParams } from "../types/project";
 import { RVC_DEFAULTS, SOVITS_DEFAULTS } from "./workflow/voiceDefaults";
+import { isVocalLangCode } from "./vocal/languages"; // S58: Note.lang whitelist (id↔code single source)
 
 // ── bounds (defensive; valid editor input never trips them, a corrupt file does) ──
 export const PITCH_MIN = 0;
@@ -104,7 +105,9 @@ export function normalizeNote(n: Note): Note {
   }
   if (n.pitchAuto === false) out.pitchAuto = false; // absent/true (default) → absent
   if (n.tie) out.tie = true; // false → absent (Phase-6 mirror enforces tie ≡ sustain-lyric)
-  if (n.lang) out.lang = sanitizeText(n.lang, 8);
+  // S58: lang is WHITELISTED to the 7 codes (anything else → absent = follow the track default) so a
+  // corrupt/hand-edited .usp can never smuggle an arbitrary string into the render's lang resolution.
+  if (n.lang && isVocalLangCode(n.lang)) out.lang = n.lang;
   if (n.phonemeInput) out.phonemeInput = sanitizeText(n.phonemeInput);
   return out;
 }

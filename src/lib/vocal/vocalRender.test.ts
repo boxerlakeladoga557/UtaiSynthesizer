@@ -138,6 +138,27 @@ describe("buildVocalScore", () => {
     expect(f0Cents.length).toBe(0);
   });
 
+  // ── S58 per-note language + phoneme override wire ──
+  it("triples carry the per-note EFFECTIVE lang (override ?? track default) + phoneme_input", () => {
+    const notes = [
+      mkNote("a", 480, 480, 60, "长"), // leading rest before it takes the DEFAULT lang
+      { ...mkNote("b", 960, 480, 62, "light"), lang: "en", phonemeInput: "L AY1 T" },
+    ];
+    const { triples } = buildVocalScore(notes, undefined, tempo, def, "AP", undefined, 0, 0 /* zh default */);
+    expect(triples[0]!.lyric).toBe("R");
+    expect(triples[0]!.lang).toBe(0); // rest → track default (Rust re-attaches it to the run)
+    const sung = triples.filter((t) => t.lyric !== "R");
+    expect(sung[0]).toMatchObject({ lyric: "长", lang: 0 }); // no override → track default (zh)
+    expect(sung[0]!.phoneme_input).toBeUndefined();
+    expect(sung[1]).toMatchObject({ lyric: "light", lang: 1, phoneme_input: "L AY1 T" }); // en override
+  });
+
+  it("an INVALID note lang code falls back to the track default (whitelist mirror)", () => {
+    const notes = [{ ...mkNote("a", 0, 480, 60), lang: "xx" }];
+    const { triples } = buildVocalScore(notes, undefined, tempo, def, "AP", undefined, 0, 5 /* es */);
+    expect(triples.find((t) => t.lyric !== "R")!.lang).toBe(5);
+  });
+
   // helper: the [start,end) frame span of each triple.
   const spans = (triples: { lyric: string; frames: number }[]) => {
     let c = 0;

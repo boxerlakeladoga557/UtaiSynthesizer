@@ -20,15 +20,12 @@ import { useAppStore } from "../../store/app";
 import { useVoiceModelStore, voiceHasDiffusion, type VoiceModelEntry } from "../../store/voice-models";
 import { effTransition } from "../../lib/f0eval";
 import { DEFAULT_TRANSITION } from "../../lib/vocalNotes";
+import { VOCAL_LANGUAGES, langById } from "../../lib/vocal/languages";
+import { backendOf, backendLabel, pickVoiceForTrack } from "../../lib/vocal/voicePick";
 import { DIFFUSION_METHODS, RVC_DEFAULTS, SOVITS_DEFAULTS, type RvcOptions, type SovitsOptions } from "../../lib/workflow/voiceDefaults";
 import { VocoderSelect } from "../workflow/nodes/VoiceModelPicker";
 import type { Note, NoteTransition, VibratoSpec, VocalTrackParams } from "../../types/project";
 import "./VocalSidebar.css";
-
-/** The backend a singer model runs on, from its serde `model_type` ("Rvc" | "SoVits") — the model's TYPE
- *  drives the backend, so there's no manual toggle (§user: unified SoVITS/RVC singer list). */
-const backendOf = (m: VoiceModelEntry): "sovits" | "rvc" => (m.model_type === "Rvc" ? "rvc" : "sovits");
-const backendLabel = (m: VoiceModelEntry): string => (backendOf(m) === "sovits" ? "SoVITS" : "RVC");
 
 /** Default vibrato seeded by "Add vibrato" (depthCents>0 so normalizeNote keeps it). ⚠ startMs/ease are SMALL
  *  on purpose so vibrato is VISIBLE the instant it's added, even on a shorter (tail) note — the old SynthV-ish
@@ -81,7 +78,6 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
   const [tab, setTab] = useState<"singer" | "pitch">("singer");
   const applyNoteEdits = useProjectStore((s) => s.applyNoteEdits);
   const setVocalParams = useProjectStore((s) => s.setVocalParams);
-  const updateTrack = useProjectStore((s) => s.updateTrack);
   const toggleModelManager = useAppStore((s) => s.toggleModelManager);
   const models = useVoiceModelStore((s) => s.models);
 
@@ -92,14 +88,9 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
     () => allVoices.find((m) => m.name === voiceModel && backendOf(m) === vocalParams.backend),
     [allVoices, voiceModel, vocalParams.backend],
   );
-  // Pick a singer → set voiceModel + auto-detect its backend, as ONE undo step.
-  const pickVoice = (m: VoiceModelEntry) => {
-    const hist = useHistoryStore.getState();
-    hist.beginTransaction();
-    updateTrack(trackId, { voiceModel: m.name, voiceModelAvatar: m.avatar_path ?? undefined });
-    setVocalParams(trackId, { backend: backendOf(m) });
-    hist.commitTransaction();
-  };
+  // Pick a singer → the SHARED single pick path (voiceModel + backend, one undo step) — the track-header
+  // singer popup uses the same function (S58, NO-dup).
+  const pickVoice = (m: VoiceModelEntry) => pickVoiceForTrack(trackId, m);
 
   // The selection = the notes to edit; the FIRST is the display anchor (its values fill the sliders; edits
   // apply to ALL selected). Recomputed only when the ids/notes change.
@@ -130,6 +121,12 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
     // KEEPS it (never clobber another selected note's data). REMOVE (spec===undefined) clears all selected.
     for (const n of selected) update[n.id] = { vibrato: spec ? (n.vibrato ?? { ...spec }) : undefined };
     applyNoteEdits(trackId, segmentId, { update }); // depthCents≤0 → normalizeNote strips → absent (= remove)
+  };
+  // S58 per-note language override for the whole selection (ONE undo step); undefined = follow the track.
+  const editNoteLang = (code: string | undefined) => {
+    const update: Record<string, Partial<Note>> = {};
+    for (const n of selected) update[n.id] = { lang: code };
+    applyNoteEdits(trackId, segmentId, { update });
   };
 
   const eff = anchor ? effTransition(anchor, trackTransition) : trackTransition;
@@ -218,6 +215,47 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             value={vocalParams.breathToken ?? "AP"}
             onChange={(e) => setVocalParams(trackId, { breathToken: e.target.value })}
           />
+        </div>
+      </div>
+
+      {/* ⓪.3 语言 (S58 §3.7) — lives on the SINGER tab (it configures WHAT is sung, not the pitch; §user).
+          Track default (VocalTrackParams.langId — the whole track's G2P language) + a per-note override
+          for the selection (Note.lang; absent = follow the track). Both feed the render per note. */}
+      <div className="vsb-section">
+        <div className="vsb-head"><span>{t("vocalEditor.sidebar.language")}</span></div>
+        <div className="vsb-inline">
+          <label className="vsb-label" title={t("vocalEditor.sidebar.trackLangTip")}>{t("vocalEditor.sidebar.trackLang")}</label>
+          <select
+            className="sep-model-select vsb-inline-select"
+            value={vocalParams.langId}
+            onChange={(e) => setVocalParams(trackId, { langId: Number(e.target.value) })}
+          >
+            {VOCAL_LANGUAGES.map((l) => (
+              <option key={l.code} value={l.id}>{t(`langs.${l.code}`)} ({l.short})</option>
+            ))}
+          </select>
+        </div>
+        <div className="vsb-inline">
+          <label className="vsb-label" title={t("vocalEditor.sidebar.noteLangTip")}>
+            {t("vocalEditor.sidebar.noteLang")}
+            {hasSel && selected.length > 1 ? ` ×${selected.length}` : ""}
+          </label>
+          {!hasSel ? (
+            <span className="vsb-hint-inline">{t("vocalEditor.sidebar.selectNoteHint")}</span>
+          ) : (
+            <select
+              className="sep-model-select vsb-inline-select"
+              value={anchor?.lang ?? ""}
+              onChange={(e) => editNoteLang(e.target.value || undefined)}
+            >
+              <option value="">
+                {t("vocalEditor.sidebar.langFollow")} ({langById(vocalParams.langId).short})
+              </option>
+              {VOCAL_LANGUAGES.map((l) => (
+                <option key={l.code} value={l.code}>{t(`langs.${l.code}`)} ({l.short})</option>
+              ))}
+            </select>
+          )}
         </div>
       </div>
 

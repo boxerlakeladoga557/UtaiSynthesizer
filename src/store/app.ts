@@ -98,6 +98,11 @@ interface AppState {
   /** ② The TRACK id whose vocal segment is CURRENTLY (re-)rendering — drives a spinner on that track's header
    *  so a re-render (which keeps the old bake, no loading placeholder) doesn't LOOK frozen (§user). null = idle. */
   renderingVocalTrackId: string | null;
+  /** ② S58 OOV verdicts (runtime-only, not undoable/persisted): segmentId → the note ids whose lyric can't
+   *  be sung in its effective language, from the debounced `validate_lyrics` watcher (oovWatch.ts — the
+   *  §9.5 single Rust classifier, so this ALWAYS equals what the render would reject). Drives the red
+   *  note marking (VocalEditor), the segment badge (Arrangement) and the track header warning (TrackList). */
+  vocalOov: Record<string, string[]>;
   toasts: ToastState[];
   /** Transient corner banner (undo/redo info, save/load confirmation, …). `seq` bumps each time so a
    *  rapid retrigger updates the same single banner in place (no stacking, no viewport jump). */
@@ -134,6 +139,9 @@ interface AppState {
   toggleSnapPlayhead: () => void;
   setVocalRenderActive: (v: boolean) => void;
   setRenderingVocalTrackId: (id: string | null) => void;
+  /** ② S58: publish one segment's OOV verdict (null = clear the entry). No-op-guarded (identical
+   *  verdicts don't re-render subscribers). Written ONLY by the oovWatch validation watcher. */
+  setVocalOov: (segmentId: string, noteIds: string[] | null) => void;
   showToast: (message: string, type?: "error" | "info" | "success") => void;
   dismissToast: (id: number) => void;
   showBanner: (message: string, kind: BannerKind) => void;
@@ -170,6 +178,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   snapPlayhead: loadSetting("utai.snapPlayhead", true),
   vocalRenderActive: false,
   renderingVocalTrackId: null,
+  vocalOov: {},
   toasts: [],
   banner: null,
   confirm: null,
@@ -246,6 +255,17 @@ export const useAppStore = create<AppState>((set, get) => ({
     }),
   setVocalRenderActive: (v) => set({ vocalRenderActive: v }),
   setRenderingVocalTrackId: (id) => set({ renderingVocalTrackId: id }),
+  setVocalOov: (segmentId, noteIds) =>
+    set((s) => {
+      const cur = s.vocalOov[segmentId];
+      // no-op guard: identical verdicts must not re-render every canvas subscriber on each revalidation
+      if (noteIds === null && cur === undefined) return {};
+      if (noteIds !== null && cur !== undefined && cur.length === noteIds.length && cur.every((v, i) => v === noteIds[i])) return {};
+      const next = { ...s.vocalOov };
+      if (noteIds === null) delete next[segmentId];
+      else next[segmentId] = noteIds;
+      return { vocalOov: next };
+    }),
   showToast: (message, type = "error") => {
     const id = Date.now();
     set((s) => ({ toasts: [...s.toasts, { message, type, id }] }));

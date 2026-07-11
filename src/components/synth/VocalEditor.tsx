@@ -149,6 +149,11 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // the next scoops, §10.5). Dynamic: editing the token re-connects the OLD token's notes.
   const breathTokenRef = useRef(part?.vocalParams?.breathToken ?? "AP");
   breathTokenRef.current = part?.vocalParams?.breathToken ?? "AP";
+  // ② S58 OOV verdicts for THIS segment (async, from the oovWatch watcher) — ref-synced for the draw
+  // closure; the dedicated redraw effect below re-invokes it when the verdict changes.
+  const oovIds = useAppStore((s) => s.vocalOov[segmentId]);
+  const oovRef = useRef<Set<string>>(new Set());
+  oovRef.current = new Set(oovIds ?? []);
   const startRef = useRef(part?.start ?? 0);
   startRef.current = part?.start ?? 0;
   const durRef = useRef(part?.dur ?? 0);
@@ -424,12 +429,23 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         if (x1 < noteAreaX || x0 > w) continue;
         const y = pitchToY(n.pitch, v);
         const selected = sel.has(n.id);
+        // ② S58 OOV: an unsingable lyric fills RED (LOUD — never silent, §3.7 ACE-style marking). A
+        // selected OOV note keeps the selection fill but takes the red stroke, so both states read.
+        const oov = oovRef.current.has(n.id);
         const cx0 = Math.max(noteAreaX, x0);
-        ctx.fillStyle = selected ? (col("--note-selected") || "#8b5cf6") : (col("--note-fill") || "#39c5bb");
+        ctx.fillStyle = selected
+          ? (col("--note-selected") || "#8b5cf6")
+          : oov
+            ? (col("--color-error") || "#f87171")
+            : (col("--note-fill") || "#39c5bb");
         ctx.globalAlpha = 0.9;
         ctx.fillRect(cx0, y + 1, Math.max(2, x1 - cx0), Math.max(2, v.rowH - 2));
         ctx.globalAlpha = 1;
-        ctx.strokeStyle = selected ? (col("--accent-secondary") || "#8b5cf6") : "rgba(0,0,0,0.4)";
+        ctx.strokeStyle = oov
+          ? (col("--color-error") || "#f87171")
+          : selected
+            ? (col("--accent-secondary") || "#8b5cf6")
+            : "rgba(0,0,0,0.4)";
         ctx.lineWidth = selected ? 1.5 : 1;
         ctx.strokeRect(Math.round(cx0) + 0.5, Math.round(y + 1) + 0.5, Math.max(2, x1 - cx0) - 1, Math.max(2, v.rowH - 2) - 1);
         // lyric
@@ -664,6 +680,10 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // scroll), which is the reported intermittent staleness. The draw closure reads start/dur/axis via refs,
   // so re-invoking it is enough (no rebuild).
   useEffect(() => { requestRedraw(); }, [part?.start, part?.dur, part?.pitchDev, part?.paramCurves, part?.transition, part?.vocalParams?.breathToken, timeSignature, tempo, requestRedraw]);
+
+  // ② S58 OOV marking: async verdicts from the oovWatch watcher (app store) → ref + redraw (the draw
+  // closure reads the ref — the standard三处同步: ref sync here + this dedicated redraw effect).
+  useEffect(() => { requestRedraw(); }, [oovIds, requestRedraw]);
 
   // Attach the live preview-notes closure to the drag state (draw reads it).
   const withPreview = (d: DragState): DragState & { previewNotes: () => Note[] } => {
@@ -1381,12 +1401,14 @@ function noteSig(n: Note): string {
 
 const SMALL_KANA = new Set([..."ぁぃぅぇぉゃゅょゎっゕゖァィゥェォャュョヮッ"]);
 /** Split a typed lyric phrase into per-note tokens (§9.2 auto-distribute). Whitespace-separated first;
- *  else an all-kana run splits per mora (a base kana + trailing small kana); otherwise one token (latin
- *  needs explicit spaces). Minimal + JS-side (a splitter, NOT a dictionary — the Rust classifier owns
- *  phoneme validation). */
+ *  else an all-kana run splits per mora (a base kana + trailing small kana); an all-Han run splits per
+ *  character (S58 — one hanzi per note; the Rust zh G2P reads phrase context from the NOTE SEQUENCE, so
+ *  polyphones still resolve after the split); otherwise one token (latin needs explicit spaces).
+ *  Minimal + JS-side (a splitter, NOT a dictionary — the Rust classifier owns phoneme validation). */
 function splitLyricTokens(s: string): string[] {
   if (!s) return [DEFAULT_LYRIC];
   if (/\s/.test(s)) return s.split(/\s+/).filter(Boolean);
+  if (/^[\p{Script=Han}]+$/u.test(s)) return [...s];
   const isKana = /^[぀-ヿ゠-ヿー]+$/.test(s);
   if (!isKana) return [s];
   const out: string[] = [];

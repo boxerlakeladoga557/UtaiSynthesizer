@@ -14,6 +14,9 @@ import { blankTrack } from "../../lib/trackFactory";
 import { VolumeFader, formatPan, formatDb } from "../common/VolumeFader";
 import { ContextMenu, type MenuItem } from "../common/ContextMenu";
 import * as playback from "../../lib/audio/playback";
+import { useVoiceModelStore } from "../../store/voice-models";
+import { backendLabel, pickVoiceForTrack } from "../../lib/vocal/voicePick";
+import { VOCAL_LANGUAGES, langById, DEFAULT_LANG_ID } from "../../lib/vocal/languages";
 import type { Track } from "../../types/project";
 import "./TrackList.css";
 
@@ -21,10 +24,13 @@ interface Props {
   width: number;
 }
 
-/** Context menu in the track-header column: per-track actions, or "add material" at a boundary. */
+/** Context menu in the track-header column: per-track actions, "add material" at a boundary, or the
+ *  ② vocal-track header pickers (S58): "voice" = singer list, "lang" = the track's default language. */
 type Menu = { x: number; y: number } & (
   | { kind: "track"; trackId: string }
   | { kind: "add"; index: number }
+  | { kind: "voice"; trackId: string }
+  | { kind: "lang"; trackId: string }
 );
 
 export function TrackList({ width }: Props) {
@@ -197,6 +203,10 @@ export function TrackList({ width }: Props) {
     [boundaryAt, offsets, totalH, scrollY, tracks],
   );
 
+  const voiceModels = useVoiceModelStore((s) => s.models);
+  const setVocalParams = useProjectStore((s) => s.setVocalParams);
+  const vocalOov = useAppStore((s) => s.vocalOov); // ② S58 track-level OOV warning
+
   const menuItems: MenuItem[] = (() => {
     if (!menu) return [];
     if (menu.kind === "track") {
@@ -204,6 +214,28 @@ export function TrackList({ width }: Props) {
         { label: t("tracks.rename"), onClick: () => setEditingTrackId(menu.trackId) },
         { label: t("tracks.delete"), danger: true, onClick: () => removeTrack(menu.trackId) },
       ];
+    }
+    // ② S58 header pickers — quick whole-track setup without opening the segment editor (and a visible
+    // cue that singer/language are TRACK-level, not per-segment). Details (quality/vocoder…) stay in
+    // the editor sidebar. The pick path is the SHARED pickVoiceForTrack (same as the sidebar — NO-dup).
+    if (menu.kind === "voice") {
+      const all = [...voiceModels.sovits, ...voiceModels.rvc];
+      const cur = tracks.find((tr) => tr.id === menu.trackId);
+      if (all.length === 0) return [{ label: t("tracks.noVoices"), disabled: true, onClick: () => {} }];
+      return all.map((m) => ({
+        label: `${m.name} · ${backendLabel(m)}`,
+        disabled: cur?.voiceModel === m.name && cur?.vocalParams?.backend === (m.model_type === "Rvc" ? "rvc" : "sovits"),
+        onClick: () => pickVoiceForTrack(menu.trackId, m),
+      }));
+    }
+    if (menu.kind === "lang") {
+      const cur = tracks.find((tr) => tr.id === menu.trackId);
+      const curId = cur?.vocalParams?.langId ?? DEFAULT_LANG_ID;
+      return VOCAL_LANGUAGES.map((l) => ({
+        label: `${l.short} · ${t(`langs.${l.code}`)}`,
+        disabled: l.id === curId,
+        onClick: () => setVocalParams(menu.trackId, { langId: l.id }),
+      }));
     }
     return [
       { label: t("toolbar.importAudio"), onClick: () => importAudioAt(menu.index) },
@@ -302,6 +334,13 @@ export function TrackList({ width }: Props) {
                 playback.updateLanePan(track.id, gid, v);
               }
             }}
+            onOpenVoiceMenu={(x, y) => {
+              // lazy model scan — the list may not have been fetched yet (Resource Manager not opened)
+              void useVoiceModelStore.getState().fetchModels();
+              setMenu({ kind: "voice", trackId: track.id, x, y });
+            }}
+            onOpenLangMenu={(x, y) => setMenu({ kind: "lang", trackId: track.id, x, y })}
+            hasOov={track.segments.some((sg) => (vocalOov[sg.id]?.length ?? 0) > 0)}
           />
           </Fragment>
         ))}
@@ -360,6 +399,11 @@ interface TrackItemProps {
   onLaneMute: (members: LaneMember[]) => void;
   onLaneVolumeChange: (run: LaneGroupRun, v: number) => void;
   onLanePanChange: (run: LaneGroupRun, v: number) => void;
+  /** ② S58 vocal-track header pickers (anchor = the trigger button's rect). */
+  onOpenVoiceMenu: (x: number, y: number) => void;
+  onOpenLangMenu: (x: number, y: number) => void;
+  /** ② S58: some segment on this track has OOV lyrics → header warning badge. */
+  hasOov: boolean;
 }
 
 function TrackItem({
@@ -383,6 +427,9 @@ function TrackItem({
   onLaneMute,
   onLaneVolumeChange,
   onLanePanChange,
+  onOpenVoiceMenu,
+  onOpenLangMenu,
+  hasOov,
 }: TrackItemProps) {
   const { t } = useTranslation();
   const colorVar = trackTypeCssVar(track.trackType);
@@ -421,10 +468,33 @@ function TrackItem({
                 {track.expanded ? "▼" : "▶"}
               </button>
             )}
-            {track.voiceModelAvatar && (
-              <div className="track-avatar">
-                <img src={convertFileSrc(track.voiceModelAvatar)} alt="" />
-              </div>
+            {/* ② S58 singer picker — on a VOCAL track the avatar slot is ALWAYS a button (placeholder
+                glyph when no singer yet): pick the whole track's singer right from the header, which
+                also signals that the singer is TRACK-level. Audio tracks keep the passive avatar. */}
+            {track.trackType === "vocal" ? (
+              <button
+                className="track-avatar-btn"
+                title={track.voiceModel ?? t("tracks.pickSinger")}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const r = e.currentTarget.getBoundingClientRect();
+                  onOpenVoiceMenu(r.left, r.bottom + 2);
+                }}
+              >
+                {track.voiceModelAvatar ? (
+                  <img src={convertFileSrc(track.voiceModelAvatar)} alt="" />
+                ) : (
+                  <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+                    <path fill="currentColor" d="M12 3a4 4 0 0 1 4 4v3a4 4 0 0 1-8 0V7a4 4 0 0 1 4-4zm-7 17v-2c0-2.8 4.7-4 7-4s7 1.2 7 4v2H5z" />
+                  </svg>
+                )}
+              </button>
+            ) : (
+              track.voiceModelAvatar && (
+                <div className="track-avatar">
+                  <img src={convertFileSrc(track.voiceModelAvatar)} alt="" />
+                </div>
+              )
             )}
             <div className="track-info">
               {editing ? (
@@ -443,6 +513,28 @@ function TrackItem({
               <span className="track-render-spinner" title={t("vocalEditor.render.rendering")}>
                 <svg viewBox="0 0 24 24" width="12" height="12"><path fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" d="M12 3a9 9 0 1 0 9 9" /></svg>
               </span>
+            )}
+            {/* ② S58 OOV warning — some note on this track can't be sung in its language (ACE-style
+                track-level flag; the segment badge + red notes point at the exact spot). */}
+            {hasOov && (
+              <span className="track-oov-badge" title={t("tracks.oovWarning")}>
+                <svg viewBox="0 0 24 24" width="12" height="12"><path fill="currentColor" d="M12 3 2 21h20L12 3zm-1 7h2v6h-2v-6zm0 7h2v2h-2v-2z" /></svg>
+              </span>
+            )}
+            {/* ② S58 language badge — the track's default G2P language as a two-letter code (vocal tracks
+                only; per-note overrides live in the editor sidebar). Sits where audio tracks keep O. */}
+            {track.trackType === "vocal" && (
+              <button
+                className="track-btn track-lang"
+                title={t("tracks.language")}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const r = e.currentTarget.getBoundingClientRect();
+                  onOpenLangMenu(r.left, r.bottom + 2);
+                }}
+              >
+                {langById(track.vocalParams?.langId ?? DEFAULT_LANG_ID).short}
+              </button>
             )}
             {/* SOURCE selector — AUDIO tracks only: a vocal track has no "original" audio to fall back to,
                 so the toggle would only mislead. lit = the original plays and the sub-lanes leave the output. */}

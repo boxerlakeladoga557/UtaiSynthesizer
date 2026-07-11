@@ -6,6 +6,7 @@ import i18n from "./i18n";
 import { installHistory, routeUndo, routeRedo } from "./store/history";
 import { newProjectFile, openProjectFile, saveProjectFile, saveProjectFileAs, restoreAutosave } from "./lib/project/projectFile";
 import { installAutosave, clearAutosave, readAutosave, setRecoveryPending, hasUnsavedWork, rearmAutosave } from "./lib/project/autosave";
+import { installOovWatch } from "./lib/vocal/oovWatch";
 import { Titlebar } from "./components/common/Titlebar";
 import { DawWorkflowSplit } from "./components/synth/DawWorkflowSplit";
 import { TrainingPage } from "./components/training/TrainingPage";
@@ -103,6 +104,10 @@ export function App() {
 
   // Autosave the document (debounced) for crash recovery — cleanup unsubscribes (HMR-safe).
   useEffect(() => installAutosave(), []);
+
+  // ② S58 OOV validation watcher (debounced Rust validate_lyrics → red notes / segment badge / track
+  // warning) — cleanup unsubscribes (HMR-safe).
+  useEffect(() => installOovWatch(), []);
 
   // Window close (X) → ask minimize-to-tray / quit / cancel. We ALWAYS preventDefault and decide
   // ourselves; Rust no longer guards close/exit, the frontend owns the whole flow. "Quit" runs the shared

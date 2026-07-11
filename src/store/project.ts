@@ -604,7 +604,19 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       let next = removeSet ? seg.content.notes.filter((n) => !removeSet.has(n.id)) : seg.content.notes;
       if (edits.update) {
         const u = edits.update;
-        next = next.map((n) => (u[n.id] ? { ...n, ...u[n.id] } : n));
+        next = next.map((n) => {
+          const patch = u[n.id];
+          if (!patch) return n;
+          const merged = { ...n, ...patch };
+          // S58 invariant: a phoneme override belongs to the LYRIC it was written for — changing the
+          // lyric without explicitly re-supplying the override drops it (else a stale pinyin/ARPABET
+          // silently keeps overriding the NEW lyric's pronunciation).
+          if (patch.lyric !== undefined && patch.lyric !== n.lyric) {
+            if (patch.phonemeInput === undefined) delete merged.phonemeInput;
+            if (patch.phoneme === undefined) delete merged.phoneme;
+          }
+          return merged;
+        });
       }
       if (edits.add && edits.add.length > 0) next = [...next, ...edits.add];
       const nextNotes = normalizeNotesArray(next);

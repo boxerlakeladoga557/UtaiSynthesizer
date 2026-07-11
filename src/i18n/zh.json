@@ -115,7 +115,20 @@
     "delete": "删除轨道",
     "rename": "重命名",
     "loading": "加载中",
-    "playOriginal": "播放原始音频（子轨道不进输出）"
+    "playOriginal": "播放原始音频（子轨道不进输出）",
+    "pickSinger": "选择歌手（整条轨道）",
+    "language": "轨道默认语言",
+    "noVoices": "没有可用的歌手模型——请先在资源管理器导入",
+    "oovWarning": "有无法识别的歌词（OOV）——请检查歌词或音符/轨道的语言设置"
+  },
+  "langs": {
+    "zh": "中文",
+    "en": "英语",
+    "ja": "日语",
+    "de": "德语",
+    "fr": "法语",
+    "es": "西班牙语",
+    "it": "意大利语"
   },
   "training": {
     "title": "模型训练",
@@ -363,6 +376,12 @@
       "q_protect": "清辅音保护",
       "breathToken": "呼吸标记",
       "breathTokenTip": "该词的音符渲染为呼吸；可改成喜欢的词。AP/ap 始终视为呼吸。",
+      "language": "语言",
+      "trackLang": "轨道默认",
+      "trackLangTip": "整条轨道的歌词按此语言转音素；单个音符可在下方单独覆盖。",
+      "noteLang": "选中音符",
+      "noteLangTip": "只对选中的音符生效；「跟随轨道」即使用上面的轨道默认语言。",
+      "langFollow": "跟随轨道",
       "noteTransition": "音符间过渡",
       "selectNoteHint": "选择音符以编辑",
       "vibrato": "颤音",

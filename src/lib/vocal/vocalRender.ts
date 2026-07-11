@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { RVC_DEFAULTS, SOVITS_DEFAULTS, type RvcOptions, type SovitsOptions } from "../workflow/voiceDefaults";
 import { evalF0CentsFrames, evalCurveAt } from "../f0eval";
 import { isBreathLyric } from "../vocalNotes";
+import { DEFAULT_LANG_ID, effLangId } from "./languages";
 import { msToTicks } from "../audio/laneOps";
 import { useProjectStore, DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useAppStore } from "../../store/app";
@@ -58,6 +59,11 @@ export interface ScoreTriple {
   lyric: string;
   note_num: number;
   frames: number;
+  /** S58: the note's EFFECTIVE lang id (note.lang override ?? track default) — snake-free wire name
+   *  matching Rust `ScoreNote.lang`. Rests/sustains carry it too (Rust run-assignment refines them). */
+  lang: number;
+  /** §3.7 traditional-phoneme override (pinyin/kana/ARPABET/MFA — never raw IPA). */
+  phoneme_input?: string;
 }
 
 /** Wire options mirroring Rust `VocalRenderOptions` (snake_case — Tauri passes them through verbatim).
@@ -88,31 +94,9 @@ export function buildVocalScore(
   breathToken: string,
   paramCurves?: Record<string, PitchCurve>,
   formantScalar = 0,
+  defaultLangId: number = DEFAULT_LANG_ID,
 ): { triples: ScoreTriple[]; f0Cents: number[]; f0Voiced: number[]; loudnessEnv: number[]; formantEnv: number[] } {
-  const ticksPerFrame = msToTicks(1000 / RENDER_FPS, tempo); // 20 ms per 50fps frame
-  const frameOf = (relTick: number) => Math.round(relTick / ticksPerFrame);
-  const sorted = [...notes].sort((a, b) => a.tick - b.tick || (a.id < b.id ? -1 : 1));
-  // M3 breath: a breath lyric (canonical AP/ap or the track's trigger) maps to the `AP` phone Rust
-  // recognizes. It is also UNVOICED — dropped from the pitch chain below so it breaks the line and the
-  // neighbours get the §10.5 release/scoop (段中尾音) instead of gliding into/out of the breath.
-  const mapLyric = (l: string) => (isBreathLyric(l, breathToken) ? "AP" : l);
-
-  const triples: ScoreTriple[] = [];
-  let cursor = 0; // segment-relative tick covered so far
-  for (const n of sorted) {
-    const start = Math.max(cursor, n.tick);
-    const end = n.tick + n.duration;
-    if (end <= cursor) continue; // fully swallowed by a previous note (defensive — notes don't overlap)
-    if (start > cursor) {
-      const restFrames = frameOf(start) - frameOf(cursor);
-      if (restFrames > 0) triples.push({ lyric: "R", note_num: 0, frames: restFrames });
-    }
-    const noteFrames = frameOf(end) - frameOf(start);
-    if (noteFrames > 0) triples.push({ lyric: mapLyric(n.lyric), note_num: n.pitch, frames: noteFrames });
-    cursor = end;
-  }
-
-  const frameCount = frameOf(cursor); // cursor == last note end == Σ(triple frames)
+  const { triples, sorted, ticksPerFrame, frameCount } = buildScoreTriples(notes, tempo, breathToken, defaultLangId);
   // f0 sees the notes WITHOUT breaths (they're unvoiced): a breath's frames fall in a rest gap → voiced 0,
   // and its neighbours become phrase edges (release-drift before, onset-scoop after). frameCount is unchanged
   // (it's the triple cursor incl. breath frames), so the array length still equals Σ(triple frames).
@@ -135,6 +119,55 @@ export function buildVocalScore(
       ? sampleParamFrames(formantCurve, ticksPerFrame, frameCount, (semi) => formantScalar + semi)
       : [];
   return { triples, f0Cents: Array.from(cents), f0Voiced: Array.from(voiced), loudnessEnv, formantEnv };
+}
+
+/** The score-triple construction shared by the RENDER (buildVocalScore) and the OOV VALIDATION watcher
+ *  (oovWatch) — the validation payload must be STRUCTURALLY IDENTICAL to what renders (same breath
+ *  mapping, same inserted gap rests — a rest breaks a zh phrase window, so its presence changes the
+ *  polyphone verdict) or the editor's marking could drift from the render's judgment. `tripleNoteIds`
+ *  is parallel to `triples` (null = an inserted gap rest) so verdicts map back to notes. Pure. */
+export function buildScoreTriples(
+  notes: readonly Note[],
+  tempo: number,
+  breathToken: string,
+  defaultLangId: number,
+): { triples: ScoreTriple[]; tripleNoteIds: (string | null)[]; sorted: Note[]; ticksPerFrame: number; frameCount: number } {
+  const ticksPerFrame = msToTicks(1000 / RENDER_FPS, tempo); // 20 ms per 50fps frame
+  const frameOf = (relTick: number) => Math.round(relTick / ticksPerFrame);
+  const sorted = [...notes].sort((a, b) => a.tick - b.tick || (a.id < b.id ? -1 : 1));
+  // M3 breath: a breath lyric (canonical AP/ap or the track's trigger) maps to the `AP` phone Rust
+  // recognizes. It is also UNVOICED — dropped from the pitch chain by the caller so it breaks the line
+  // and the neighbours get the §10.5 release/scoop (段中尾音) instead of gliding into/out of the breath.
+  const mapLyric = (l: string) => (isBreathLyric(l, breathToken) ? "AP" : l);
+
+  const triples: ScoreTriple[] = [];
+  const tripleNoteIds: (string | null)[] = [];
+  let cursor = 0; // segment-relative tick covered so far
+  for (const n of sorted) {
+    const start = Math.max(cursor, n.tick);
+    const end = n.tick + n.duration;
+    if (end <= cursor) continue; // fully swallowed by a previous note (defensive — notes don't overlap)
+    // S58: per-note effective language (note override ?? track default). Gap rests take the default —
+    // Rust's run assignment attaches them to the surrounding run anyway (a rest's lang is only read
+    // when the whole score has no sung note).
+    const lang = effLangId(n.lang, defaultLangId);
+    if (start > cursor) {
+      const restFrames = frameOf(start) - frameOf(cursor);
+      if (restFrames > 0) {
+        triples.push({ lyric: "R", note_num: 0, frames: restFrames, lang: defaultLangId });
+        tripleNoteIds.push(null);
+      }
+    }
+    const noteFrames = frameOf(end) - frameOf(start);
+    if (noteFrames > 0) {
+      const t: ScoreTriple = { lyric: mapLyric(n.lyric), note_num: n.pitch, frames: noteFrames, lang };
+      if (n.phonemeInput) t.phoneme_input = n.phonemeInput;
+      triples.push(t);
+      tripleNoteIds.push(n.id);
+    }
+    cursor = end;
+  }
+  return { triples, tripleNoteIds, sorted, ticksPerFrame, frameCount: frameOf(cursor) };
 }
 
 /** Sample a segment-relative param curve at each of `frameCount` 50fps frames (`f·ticksPerFrame`), applying
@@ -295,7 +328,7 @@ export async function renderVocalPart(track: Track, seg: Segment, tempo: number,
   if (!entry) throw new Error(VOCAL_NO_VOICE);
   const { triples, f0Cents, f0Voiced, loudnessEnv, formantEnv } = buildVocalScore(
     seg.content.notes, seg.content.pitchDev, tempo, vp.transition, vp.breathToken ?? "AP",
-    seg.content.paramCurves, vp.formant ?? 0,
+    seg.content.paramCurves, vp.formant ?? 0, vp.langId,
   );
   if (triples.length === 0) throw new Error(VOCAL_EMPTY);
   await renderVocalSegment({

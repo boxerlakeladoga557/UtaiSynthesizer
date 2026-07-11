@@ -115,7 +115,20 @@
     "delete": "Delete Track",
     "rename": "Rename",
     "loading": "Loading",
-    "playOriginal": "Play the original audio (sub-lanes leave the output)"
+    "playOriginal": "Play the original audio (sub-lanes leave the output)",
+    "pickSinger": "Pick a singer (whole track)",
+    "language": "Track default language",
+    "noVoices": "No singer models available — import one in the Resource Manager first",
+    "oovWarning": "Unrecognized lyrics (OOV) — check the lyric or the note/track language"
+  },
+  "langs": {
+    "zh": "Chinese",
+    "en": "English",
+    "ja": "Japanese",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "it": "Italian"
   },
   "training": {
     "title": "Model Training",
@@ -363,6 +376,12 @@
       "q_protect": "Consonant protect",
       "breathToken": "Breath token",
       "breathTokenTip": "Notes with this lyric render as a breath; set it to any word you like. AP/ap are always breath.",
+      "language": "Language",
+      "trackLang": "Track default",
+      "trackLangTip": "Lyrics on this track convert to phonemes in this language; individual notes can override it below.",
+      "noteLang": "Selected notes",
+      "noteLangTip": "Applies only to the selected notes; \"Follow track\" uses the track default above.",
+      "langFollow": "Follow track",
       "noteTransition": "Note transition",
       "selectNoteHint": "Select a note to edit",
       "vibrato": "Vibrato",

@@ -1,0 +1,43 @@
+// ② Multi-language (S58 §3.7): THE single source for the 7 ScoreToCV languages. Everything language-
+// related on the TS side goes through this module — track-header badge, sidebar selects, per-note
+// overrides, buildVocalScore's per-note lang resolution — so the id↔code mapping can never drift from
+// the Rust `Lang` enum (inference/g2p.rs) it mirrors. Labels are i18n keys (`langs.<code>`).
+
+export interface VocalLanguage {
+  /** ScoreToCV lang_id (the wire value — zh0 en1 ja2 de3 fr4 es5 it6). */
+  id: number;
+  /** The Note.lang override code (persisted on notes). */
+  code: string;
+  /** Two-letter badge for the crowded track header. */
+  short: string;
+}
+
+export const VOCAL_LANGUAGES: readonly VocalLanguage[] = [
+  { id: 0, code: "zh", short: "ZH" },
+  { id: 1, code: "en", short: "EN" },
+  { id: 2, code: "ja", short: "JA" },
+  { id: 3, code: "de", short: "DE" },
+  { id: 4, code: "fr", short: "FR" },
+  { id: 5, code: "es", short: "ES" },
+  { id: 6, code: "it", short: "IT" },
+];
+
+export const DEFAULT_LANG_ID = 2; // ja — the historical default (DEFAULT_VOCAL_PARAMS.langId)
+
+const BY_CODE = new Map(VOCAL_LANGUAGES.map((l) => [l.code, l]));
+const BY_ID = new Map(VOCAL_LANGUAGES.map((l) => [l.id, l]));
+
+/** True iff `code` is one of the 7 language codes (the Note.lang sanitize whitelist). */
+export function isVocalLangCode(code: string): boolean {
+  return BY_CODE.has(code);
+}
+
+/** Per-note effective lang id: the note's override code (when valid) else the track default id. */
+export function effLangId(noteLang: string | undefined, defaultLangId: number): number {
+  return (noteLang ? BY_CODE.get(noteLang)?.id : undefined) ?? defaultLangId;
+}
+
+/** Language for a lang_id (out-of-range falls back to ja — mirrors the Rust-side clamp). */
+export function langById(id: number): VocalLanguage {
+  return BY_ID.get(id) ?? BY_ID.get(DEFAULT_LANG_ID)!;
+}

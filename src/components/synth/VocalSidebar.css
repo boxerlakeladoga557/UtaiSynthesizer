@@ -93,6 +93,13 @@
   color: var(--text-muted);
 }
 
+/* ② S58: the same muted hint, inline in a .vsb-inline row (per-note language with no selection). */
+.vsb-hint-inline {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-muted);
+}
+
 .vsb-row {
   display: flex;
   flex-direction: column;

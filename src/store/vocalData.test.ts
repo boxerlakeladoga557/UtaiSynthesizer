@@ -242,6 +242,29 @@ describe("Phase 4a — store additions", () => {
     expect(useHistoryStore.getState().canUndo).toBe(false); // no phantom undo step
   });
 
+  // ── S58 language fields ──
+  it("Note.lang is WHITELISTED to the 7 codes (junk strips to follow-track); valid codes persist", () => {
+    P().applyNoteEdits(T, S, { update: { n1: { lang: "en" } } });
+    expect(notes()[0]!.lang).toBe("en");
+    P().applyNoteEdits(T, S, { update: { n1: { lang: "klingon" } } });
+    expect(notes()[0]!.lang).toBeUndefined(); // invalid → absent = follow the track default
+  });
+
+  it("changing the LYRIC drops a stale phonemeInput/phoneme override (S58 invariant)", () => {
+    P().applyNoteEdits(T, S, { update: { n1: { phonemeInput: "L AY1 T", phoneme: "x" } } });
+    expect(notes()[0]!.phonemeInput).toBe("L AY1 T");
+    P().applyNoteEdits(T, S, { update: { n1: { lyric: "night" } } }); // lyric changed, no new override
+    expect(notes()[0]!.lyric).toBe("night");
+    expect(notes()[0]!.phonemeInput).toBeUndefined(); // the old pinyin/ARPABET no longer applies
+    expect(notes()[0]!.phoneme).toBeUndefined();
+    // …but supplying BOTH in one edit keeps the new override (an explicit pair is intentional)
+    P().applyNoteEdits(T, S, { update: { n1: { lyric: "light", phonemeInput: "L AY1 T" } } });
+    expect(notes()[0]!.phonemeInput).toBe("L AY1 T");
+    // …and a NON-lyric edit never touches it
+    P().applyNoteEdits(T, S, { update: { n1: { pitch: 65 } } });
+    expect(notes()[0]!.phonemeInput).toBe("L AY1 T");
+  });
+
   it("splitSegment on a notes part: partitions notes + rebases + slices curves + one undo step (§user)", () => {
     // fixture: n1@[0,240]. Add n2@[480,960] + a pitchDev/loudness curve spanning the part.
     P().addVocalNote(T, S, { ...plainNote(), id: "n2", tick: 480, duration: 480, pitch: 64 });
