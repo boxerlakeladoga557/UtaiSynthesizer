@@ -70,14 +70,43 @@
 
 .track-item {
   display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  height: 48px;
+  cursor: default; /* the .track-light strip on the right is the drag handle, not the whole header */
+  transition: background var(--transition-fast), box-shadow var(--transition-fast);
+  box-sizing: border-box;
+}
+
+/* The two-row content (name row over fader row); the drag handle (.track-light) sits to its right. */
+.track-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
   flex-direction: column;
   justify-content: center;
   gap: 2px;
-  height: 48px;
   padding: 3px var(--space-sm);
-  cursor: grab; /* grab the header's empty space to reorder; name/buttons/faders keep their own cursors */
-  transition: background var(--transition-fast), box-shadow var(--transition-fast);
-  box-sizing: border-box;
+}
+
+/* Track LIGHT = the drag-reorder HANDLE: a full-height strip on the far right, coloured by track type +
+   lit when audible. Grab it to reorder the track (the header is too packed for an empty drag zone). */
+.track-light {
+  width: 5px;
+  flex-shrink: 0;
+  align-self: stretch;
+  cursor: grab;
+}
+.track-light:active {
+  cursor: grabbing;
+}
+
+/* Plain divider where the coloured bar used to sit (left of the name) — a subtle separator now. */
+.track-divider {
+  width: 1px;
+  height: 16px;
+  background: var(--border-subtle);
+  flex-shrink: 0;
 }
 
 /* Two rows in the fixed 48px header — Row 1: NAME (owns the width) + M/S/O; Row 2: V/P faders + readouts
@@ -259,12 +288,17 @@
   flex: 1;
   min-width: 0;
   padding-left: 2px;
+  /* MUST be flex so the rename <input> (flex:1) fills exactly this box — without it the input took its
+     ~150px default width and overflowed onto the M/S/O buttons (user-reported). */
+  display: flex;
+  align-items: center;
 }
 
 .track-name {
   /* Smaller than before — on its own row it needn't be big (user), and must fit the ~18px top row. */
   font-size: 10px;
-  display: block;
+  flex: 1;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;

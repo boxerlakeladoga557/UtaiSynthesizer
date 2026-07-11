@@ -405,100 +405,101 @@ function TrackItem({
       <div
         className="track-item"
         onClick={onSelect}
-        onMouseDown={onHeaderMouseDown}
         style={{ height: TRACK_HEADER_HEIGHT * vZoom }}
       >
-        {/* Two rows inside the fixed 48px header: the NAME owns the TOP row (it was squeezed to nothing
-            between the expand button and the faders on expandable tracks), the V/P faders + readouts sit
-            side-by-side on the BOTTOM row. Total height unchanged, so canvas/lane geometry is untouched. */}
-        <div className="track-row-top">
-          {hasLanes && (
-            <button
-              className="track-expand-btn"
-              onClick={(e) => { e.stopPropagation(); onToggleExpand(); }}
-            >
-              {track.expanded ? "▼" : "▶"}
-            </button>
-          )}
-          <div
-            className="track-color-bar"
-            style={{
-              background: colorVar,
-              opacity: lit ? 1 : 0.28,
-              boxShadow: lit ? `0 0 6px ${colorVar}` : "none",
-            }}
-          />
-          {track.voiceModelAvatar && (
-            <div className="track-avatar">
-              <img src={convertFileSrc(track.voiceModelAvatar)} alt="" />
-            </div>
-          )}
-          <div className="track-info">
-            {editing ? (
-              <RenameInput initial={track.name} onCommit={onCommitRename} onCancel={onCancelRename} />
-            ) : (
-              <span
-                className="track-name"
-                title={track.name}
-                onDoubleClick={(e) => { e.stopPropagation(); onStartRename(); }}
+        {/* Two rows inside the fixed 48px header (NAME owns the top row, V/P faders the bottom); the
+            track-light strip on the far RIGHT is the drag-reorder handle — the header is too packed with
+            controls to leave an empty drag zone. Total height unchanged → canvas/lane geometry untouched. */}
+        <div className="track-main">
+          <div className="track-row-top">
+            {hasLanes && (
+              <button
+                className="track-expand-btn"
+                onClick={(e) => { e.stopPropagation(); onToggleExpand(); }}
               >
-                {track.name}
-              </span>
+                {track.expanded ? "▼" : "▶"}
+              </button>
             )}
-          </div>
-          {/* SOURCE selector (only meaningful once lanes exist): lit = the ORIGINAL audio plays and the
-              sub-lanes leave the output entirely — a Mute/Solo-class state, not just monitoring. */}
-          {hasLanes && (
+            <div className="track-divider" />
+            {track.voiceModelAvatar && (
+              <div className="track-avatar">
+                <img src={convertFileSrc(track.voiceModelAvatar)} alt="" />
+              </div>
+            )}
+            <div className="track-info">
+              {editing ? (
+                <RenameInput initial={track.name} onCommit={onCommitRename} onCancel={onCancelRename} />
+              ) : (
+                <span
+                  className="track-name"
+                  title={track.name}
+                  onDoubleClick={(e) => { e.stopPropagation(); onStartRename(); }}
+                >
+                  {track.name}
+                </span>
+              )}
+            </div>
+            {/* SOURCE selector — AUDIO tracks only: a vocal track has no "original" audio to fall back to,
+                so the toggle would only mislead. lit = the original plays and the sub-lanes leave the output. */}
+            {hasLanes && track.trackType !== "vocal" && (
+              <button
+                className={`track-btn ${track.playOriginal ? "active-orig" : ""}`}
+                title={t("tracks.playOriginal")}
+                onClick={(e) => { e.stopPropagation(); onTogglePlayOriginal(); }}
+              >
+                O
+              </button>
+            )}
             <button
-              className={`track-btn ${track.playOriginal ? "active-orig" : ""}`}
-              title={t("tracks.playOriginal")}
-              onClick={(e) => { e.stopPropagation(); onTogglePlayOriginal(); }}
+              className={`track-btn ${track.muted ? "active-mute" : ""}`}
+              onClick={(e) => { e.stopPropagation(); onMute(); }}
             >
-              O
+              M
             </button>
-          )}
-          <button
-            className={`track-btn ${track.muted ? "active-mute" : ""}`}
-            onClick={(e) => { e.stopPropagation(); onMute(); }}
-          >
-            M
-          </button>
-          <button
-            className={`track-btn ${track.solo ? "active-solo" : ""}`}
-            onClick={(e) => { e.stopPropagation(); onSolo(); }}
-          >
-            S
-          </button>
-        </div>
-        <div className="track-row-bot">
-          <div className="fader-row">
-            <span className="fader-tag">V</span>
-            <VolumeFader
-              value={track.volumeDb}
-              min={FADER_MIN_DB}
-              max={FADER_MAX_DB}
-              onChange={onVolumeChange}
-              onGestureStart={() => useHistoryStore.getState().beginTransaction()}
-              onGestureEnd={() => useHistoryStore.getState().commitTransaction()}
-            />
-            <span className="fader-val">{formatDb(track.volumeDb, FADER_MIN_DB)}</span>
+            <button
+              className={`track-btn ${track.solo ? "active-solo" : ""}`}
+              onClick={(e) => { e.stopPropagation(); onSolo(); }}
+            >
+              S
+            </button>
           </div>
-          <div className="fader-row">
-            <span className="fader-tag">P</span>
-            <VolumeFader
-              value={track.pan}
-              min={-1}
-              max={1}
-              step={0.1}
-              fillFrom="center"
-              format={formatPan}
-              onChange={onPanChange}
-              onGestureStart={() => useHistoryStore.getState().beginTransaction()}
-              onGestureEnd={() => useHistoryStore.getState().commitTransaction()}
-            />
-            <span className="fader-val">{formatPan(track.pan)}</span>
+          <div className="track-row-bot">
+            <div className="fader-row">
+              <span className="fader-tag">V</span>
+              <VolumeFader
+                value={track.volumeDb}
+                min={FADER_MIN_DB}
+                max={FADER_MAX_DB}
+                onChange={onVolumeChange}
+                onGestureStart={() => useHistoryStore.getState().beginTransaction()}
+                onGestureEnd={() => useHistoryStore.getState().commitTransaction()}
+              />
+              <span className="fader-val">{formatDb(track.volumeDb, FADER_MIN_DB)}</span>
+            </div>
+            <div className="fader-row">
+              <span className="fader-tag">P</span>
+              <VolumeFader
+                value={track.pan}
+                min={-1}
+                max={1}
+                step={0.1}
+                fillFrom="center"
+                format={formatPan}
+                onChange={onPanChange}
+                onGestureStart={() => useHistoryStore.getState().beginTransaction()}
+                onGestureEnd={() => useHistoryStore.getState().commitTransaction()}
+              />
+              <span className="fader-val">{formatPan(track.pan)}</span>
+            </div>
           </div>
         </div>
+        {/* Track light = drag-reorder HANDLE: a full-height strip at the far right, coloured by track type +
+            lit when audible. Grabbing an always-visible strip beats hunting for scarce empty header space. */}
+        <div
+          className="track-light"
+          onMouseDown={onHeaderMouseDown}
+          style={{ background: colorVar, opacity: lit ? 1 : 0.3, boxShadow: lit ? `0 0 5px ${colorVar}` : "none" }}
+        />
       </div>
       {track.expanded && laneLayout.runs.map((run) => {
         // One GROUP BLOCK per 组+名 run (getLaneLayout — same geometry the canvas rows use): a slim
