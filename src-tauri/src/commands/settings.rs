@@ -344,6 +344,12 @@ pub async fn migrate_data_dir(state: State<'_, Arc<AppState>>, new_dir: String) 
         }
         copy_dir_all(&data_root.join("models"), &target.join("models")).map_err(|e| format!("Copy models: {e}"))?;
         copy_dir_all(&data_root.join("cache"), &target.join("cache")).map_err(|e| format!("Copy cache: {e}"))?;
+        // ② S58: the stage1 G2P dictionaries live under <data_root>/dictionaries — leaving them behind
+        // would fake-OOV every zh/en/de/fr/es/it lyric after a migration (audit MAJOR).
+        let dicts_src = data_root.join("dictionaries");
+        if dicts_src.exists() {
+            copy_dir_all(&dicts_src, &target.join("dictionaries")).map_err(|e| format!("Copy dictionaries: {e}"))?;
+        }
         // Runtime packs (S42) live under <data_root>/runtimes and must MOVE WITH the
         // data dir — lib.rs roots pyenv on the resolved data dir, so leaving them
         // behind would make every installed pack "vanish" after migration (and strand

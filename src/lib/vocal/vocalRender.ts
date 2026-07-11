@@ -39,14 +39,18 @@ export const VOCAL_PHONE_MISSING = "VOCAL_PHONE_MISSING";
  *  carrying a detail payload (`CODE: detail`) interpolate it into the i18n string. */
 export function vocalRenderErrorMessage(e: unknown): string {
   const msg = String(e);
-  if (msg.includes(VOCAL_NO_VOICE)) return i18n.t("vocalEditor.render.noVoice");
-  if (msg.includes(VOCAL_EMPTY)) return i18n.t("vocalEditor.render.empty");
-  if (msg.includes(VOCAL_RENDER_BUSY)) return i18n.t("vocalEditor.render.busy");
-  if (msg.includes(VOCAL_SPK_MIX_DIFFUSION)) return i18n.t("vocalEditor.render.spkMixDiffusion");
+  // Payload-carrying codes FIRST: their detail is user content (a lyric), and a lyric that happens to
+  // CONTAIN another code string ("VOCAL_EMPTY" as a lyric…) must not hijack the match (audit).
+  const dict = msg.match(/VOCAL_DICT_MISSING:\s*(.*)$/);
+  if (dict) return i18n.t("vocalEditor.render.dictMissing", { file: dict[1] });
   const oov = msg.match(/VOCAL_OOV:\s*(.*)$/);
   if (oov) return i18n.t("vocalEditor.render.oov", { lyric: oov[1] });
   const ph = msg.match(/VOCAL_PHONE_MISSING:\s*(.*)$/);
   if (ph) return i18n.t("vocalEditor.render.phoneMissing", { phone: ph[1] });
+  if (msg.includes(VOCAL_NO_VOICE)) return i18n.t("vocalEditor.render.noVoice");
+  if (msg.includes(VOCAL_EMPTY)) return i18n.t("vocalEditor.render.empty");
+  if (msg.includes(VOCAL_RENDER_BUSY)) return i18n.t("vocalEditor.render.busy");
+  if (msg.includes(VOCAL_SPK_MIX_DIFFUSION)) return i18n.t("vocalEditor.render.spkMixDiffusion");
   return `${i18n.t("vocalEditor.render.failed")}: ${msg}`;
 }
 
@@ -415,6 +419,7 @@ export async function renderDirtyVocals(
   await waitVocalIdle();
   let rendered = 0;
   let failed = 0;
+  const MAX_FAILURE_TOASTS = 3; // loud but bounded — a many-track failure aggregates past this
   for (const { trackId, segmentId } of list) {
     if (opts?.shouldCancel?.()) return { rendered, failed, cancelled: true };
     const tr = useProjectStore.getState().tracks.find((t) => t.id === trackId);
@@ -431,10 +436,19 @@ export async function renderDirtyVocals(
       rendered++;
     } catch (e) {
       if (opts?.shouldCancel?.()) return { rendered, failed, cancelled: true };
+      // VOCAL_EMPTY = a degenerate no-renderable-content segment (every note rounds to 0 frames):
+      // nothing to bake AND it can never converge — treat like the emptied-segment case above (the
+      // manual Render button still reports it loudly), instead of re-toasting on every Play (audit).
+      if (String(e).includes(VOCAL_EMPTY)) continue;
       failed++;
       // LOUD failure (§user: Play's auto-render must report exactly like the manual Render button — never
-      // swallow). Same shared mapping, prefixed with the track name so the user knows WHICH track failed.
-      useAppStore.getState().showToast(`${tr.name}: ${vocalRenderErrorMessage(e)}`, "error");
+      // swallow). Same shared mapping, prefixed with the track name so the user knows WHICH track failed;
+      // capped so a project-wide failure (e.g. missing dictionary) doesn't storm one toast per segment.
+      if (failed <= MAX_FAILURE_TOASTS) {
+        useAppStore.getState().showToast(`${tr.name}: ${vocalRenderErrorMessage(e)}`, "error");
+      } else if (failed === MAX_FAILURE_TOASTS + 1) {
+        useAppStore.getState().showToast(i18n.t("vocalEditor.render.moreFailures"), "error");
+      }
     }
   }
   return { rendered, failed, cancelled: false };

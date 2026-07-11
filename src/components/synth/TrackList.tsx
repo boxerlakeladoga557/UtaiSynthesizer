@@ -15,7 +15,7 @@ import { VolumeFader, formatPan, formatDb } from "../common/VolumeFader";
 import { ContextMenu, type MenuItem } from "../common/ContextMenu";
 import * as playback from "../../lib/audio/playback";
 import { useVoiceModelStore } from "../../store/voice-models";
-import { backendLabel, pickVoiceForTrack } from "../../lib/vocal/voicePick";
+import { backendOf, backendLabel, pickVoiceForTrack } from "../../lib/vocal/voicePick";
 import { VOCAL_LANGUAGES, langById, DEFAULT_LANG_ID } from "../../lib/vocal/languages";
 import type { Track } from "../../types/project";
 import "./TrackList.css";
@@ -224,7 +224,7 @@ export function TrackList({ width }: Props) {
       if (all.length === 0) return [{ label: t("tracks.noVoices"), disabled: true, onClick: () => {} }];
       return all.map((m) => ({
         label: `${m.name} · ${backendLabel(m)}`,
-        disabled: cur?.voiceModel === m.name && cur?.vocalParams?.backend === (m.model_type === "Rvc" ? "rvc" : "sovits"),
+        disabled: cur?.voiceModel === m.name && cur?.vocalParams?.backend === backendOf(m),
         onClick: () => pickVoiceForTrack(menu.trackId, m),
       }));
     }

@@ -1105,12 +1105,15 @@ pub struct LyricNote {
 /// dictionary copy. Double-side capped (DoS): note count + per-token char length (an over-long lyric
 /// classifies Unknown without ever being looked up).
 #[tauri::command]
-pub fn validate_lyrics(
+pub async fn validate_lyrics(
     state: State<'_, Arc<AppState>>,
     notes: Vec<LyricNote>,
     default_lang: i64,
 ) -> Result<Vec<score2cv::LyricClass>, String> {
-    const MAX_TOKENS: usize = 100_000;
+    // ≥ 2×MAX_SCORE_NOTES: the validation payload mirrors the render triples (notes + gap rests can
+    // reach twice the note count), so the cap must never reject a segment the render itself accepts
+    // (audit: a legal huge segment would otherwise silently lose its OOV marking forever).
+    const MAX_TOKENS: usize = 2 * MAX_SCORE_NOTES + 1;
     const MAX_LEN: usize = 256;
     if notes.len() > MAX_TOKENS {
         return Err(format!("VOCAL_TOO_MANY_NOTES: {} > {}", notes.len(), MAX_TOKENS));
@@ -1119,23 +1122,30 @@ pub fn validate_lyrics(
         g2p::set_dict_dir(data_dir.join("dictionaries"));
     }
     let fallback = g2p::Lang::from_id(default_lang).unwrap_or(g2p::Lang::Ja);
-    // over-long lyrics are replaced by a token that is OOV in EVERY language (never truncate — a
-    // truncation could accidentally form a valid word). U+FFFD is not hanzi/kana/ascii/dict material.
-    const TOO_LONG: &str = "\u{FFFD}";
-    let evts: Vec<g2p::ScoreEvt> = notes
-        .iter()
-        .map(|n| g2p::ScoreEvt {
-            lyric: if n.lyric.chars().count() > MAX_LEN { TOO_LONG } else { n.lyric.as_str() },
-            note_num: 60,
-            frames: 1,
-            lang: n.lang.and_then(g2p::Lang::from_id).unwrap_or(fallback),
-            phoneme_input: n
-                .phoneme_input
-                .as_deref()
-                .filter(|p| p.chars().count() <= MAX_LEN),
-        })
-        .collect();
-    Ok(g2p::classify_score(&evts, &g2p::GlobalDicts))
+    // spawn_blocking: the FIRST validation of a language lazily parses its dictionary (the en TSV is
+    // ~3.7MB / 135k lines) — that one-time load must never block the IPC/main thread.
+    tauri::async_runtime::spawn_blocking(move || {
+        // over-long lyrics are replaced by a token that is OOV in EVERY language (never truncate — a
+        // truncation could accidentally form a valid word). U+FFFD is not hanzi/kana/ascii/dict material.
+        const TOO_LONG: &str = "\u{FFFD}";
+        let evts: Vec<g2p::ScoreEvt> = notes
+            .iter()
+            .map(|n| g2p::ScoreEvt {
+                lyric: if n.lyric.chars().count() > MAX_LEN { TOO_LONG } else { n.lyric.as_str() },
+                note_num: 60,
+                frames: 1,
+                lang: n.lang.and_then(g2p::Lang::from_id).unwrap_or(fallback),
+                phoneme_input: n
+                    .phoneme_input
+                    .as_deref()
+                    .filter(|p| p.chars().count() <= MAX_LEN),
+            })
+            .collect();
+        // Err = infrastructure (VOCAL_DICT_MISSING) — the watcher must NOT paint OOV marks for it.
+        g2p::classify_score(&evts, &g2p::GlobalDicts).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("validate_lyrics task failed: {e}"))?
 }
 
 /// One note of the score from the frontend. `lyric` = the note's lyric (JA kana / rest `R` / sustain

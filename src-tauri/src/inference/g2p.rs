@@ -323,7 +323,12 @@ impl ZhDict {
         };
         for line in syllables.lines() {
             if let Some((s, ph)) = line.split_once('\t') {
-                d.syllables.insert(s.to_string(), ph.trim().to_string());
+                // empty-phones guard (mirrors WordDict): a "syl\t" row would resolve to ZERO phones and
+                // silently desync the cv↔DAW group alignment (audit) — skipping it makes the syllable a
+                // LOUD OOV instead.
+                if !s.is_empty() && !ph.trim().is_empty() {
+                    d.syllables.insert(s.to_string(), ph.trim().to_string());
+                }
             }
         }
         for line in chars.lines() {
@@ -337,8 +342,13 @@ impl ZhDict {
         for line in phrases.lines() {
             if let Some((p, syls)) = line.split_once('\t') {
                 let n = p.chars().count();
-                d.max_phrase = d.max_phrase.max(n);
-                d.phrases.insert(p.to_string(), syls.trim().split_whitespace().map(str::to_string).collect());
+                let parsed: Vec<String> = syls.trim().split_whitespace().map(str::to_string).collect();
+                // a phrase row must carry exactly one syllable per char, else the greedy assign would
+                // mislabel neighbouring notes — drop malformed rows (chars fall back to defaults).
+                if n >= 2 && parsed.len() == n {
+                    d.max_phrase = d.max_phrase.max(n);
+                    d.phrases.insert(p.to_string(), parsed);
+                }
             }
         }
         d
@@ -382,49 +392,52 @@ fn read_dict_file(name: &str) -> Result<String> {
         .map_err(|_| UtaiError::Inference(format!("VOCAL_DICT_MISSING: {}", name)))
 }
 
-/// The process-wide lazy dictionary store (each language loads once; a load失败 is cached as the error).
+/// The process-wide lazy dictionary store. A SUCCESSFUL load is cached for the process lifetime
+/// (Box::leak — bounded: ≤6 dictionaries); a FAILED load is NOT cached, so restoring a missing TSV
+/// recovers on the next render/validation without an app restart (audit: the old OnceLock cached the
+/// failure forever).
 pub struct GlobalDicts;
 
-static ZH_DICT: OnceLock<std::result::Result<ZhDict, String>> = OnceLock::new();
-static EN_DICT: OnceLock<std::result::Result<WordDict, String>> = OnceLock::new();
-static DE_DICT: OnceLock<std::result::Result<WordDict, String>> = OnceLock::new();
-static FR_DICT: OnceLock<std::result::Result<WordDict, String>> = OnceLock::new();
-static ES_DICT: OnceLock<std::result::Result<WordDict, String>> = OnceLock::new();
-static IT_DICT: OnceLock<std::result::Result<WordDict, String>> = OnceLock::new();
+static ZH_DICT: parking_lot::Mutex<Option<&'static ZhDict>> = parking_lot::Mutex::new(None);
+static WORD_DICTS: parking_lot::Mutex<[Option<&'static WordDict>; 5]> = parking_lot::Mutex::new([None; 5]);
 
-fn word_cell(lang: Lang) -> &'static OnceLock<std::result::Result<WordDict, String>> {
+fn word_slot(lang: Lang) -> usize {
     match lang {
-        Lang::En => &EN_DICT,
-        Lang::De => &DE_DICT,
-        Lang::Fr => &FR_DICT,
-        Lang::Es => &ES_DICT,
-        Lang::It => &IT_DICT,
-        _ => unreachable!("word_cell: {lang:?} is not a word-dictionary language"),
+        Lang::En => 0,
+        Lang::De => 1,
+        Lang::Fr => 2,
+        Lang::Es => 3,
+        Lang::It => 4,
+        _ => unreachable!("word_slot: {lang:?} is not a word-dictionary language"),
     }
 }
 
 impl DictSource for GlobalDicts {
     fn zh(&self) -> Result<&ZhDict> {
-        let cell = ZH_DICT.get_or_init(|| {
-            let load = || -> Result<ZhDict> {
-                Ok(ZhDict::from_tsv(
-                    &read_dict_file("zh_syllables.tsv")?,
-                    &read_dict_file("zh_chars.tsv")?,
-                    &read_dict_file("zh_phrases.tsv")?,
-                ))
-            };
-            load().map_err(|e| e.to_string())
-        });
-        cell.as_ref().map_err(|e| UtaiError::Inference(e.clone()))
+        let mut cell = ZH_DICT.lock();
+        if let Some(d) = *cell {
+            return Ok(d);
+        }
+        let d = ZhDict::from_tsv(
+            &read_dict_file("zh_syllables.tsv")?,
+            &read_dict_file("zh_chars.tsv")?,
+            &read_dict_file("zh_phrases.tsv")?,
+        );
+        let leaked: &'static ZhDict = Box::leak(Box::new(d));
+        *cell = Some(leaked);
+        Ok(leaked)
     }
 
     fn words(&self, lang: Lang) -> Result<&WordDict> {
-        let cell = word_cell(lang).get_or_init(|| {
-            read_dict_file(&format!("{}.tsv", lang.code()))
-                .map(|tsv| WordDict::from_tsv(lang, &tsv))
-                .map_err(|e| e.to_string())
-        });
-        cell.as_ref().map_err(|e| UtaiError::Inference(e.clone()))
+        let slot = word_slot(lang);
+        let mut cells = WORD_DICTS.lock();
+        if let Some(d) = cells[slot] {
+            return Ok(d);
+        }
+        let tsv = read_dict_file(&format!("{}.tsv", lang.code()))?;
+        let leaked: &'static WordDict = Box::leak(Box::new(WordDict::from_tsv(lang, &tsv)));
+        cells[slot] = Some(leaked);
+        Ok(leaked)
     }
 }
 
@@ -546,49 +559,68 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
     let run_langs = note_run_langs(score);
     let toks: Vec<Tok> = score.iter().map(|e| token_class(e.lyric)).collect();
 
-    // zh phrase pass: maximal windows of consecutive PLAIN single-hanzi word notes (no override, no
-    // pinyin) → greedy longest phrase match; each note gets its resolved pinyin syllable.
+    // zh phrase pass: phrase context flows over a window of PLAIN single-hanzi word notes (no override,
+    // no pinyin) where sustains/rests/breaths are TRANSPARENT — a hold belongs to the previous char and
+    // a breath doesn't end a word (audit: [了][-][解] must still read 了解=liǎo, not the 了 default).
+    // Any other note (pinyin, override, another language's word) breaks the window. Greedy longest
+    // phrase match assigns each participating note its resolved pinyin syllable.
+    // Dictionary availability is checked ONCE per zh word note (dicts.zh()? propagates a missing
+    // dictionary as VOCAL_DICT_MISSING — never masked as per-word OOV; audit MAJOR).
     let mut zh_syl: Vec<Option<String>> = vec![None; n];
-    let mut i = 0;
-    while i < n {
+    let has_zh_word = (0..n).any(|k| toks[k] == Tok::Word && score[k].lang == Lang::Zh);
+    if has_zh_word {
+        let zh = dicts.zh()?;
         let is_plain_hanzi = |k: usize| -> bool {
             toks[k] == Tok::Word
                 && score[k].lang == Lang::Zh
                 && score[k].phoneme_input.is_none()
                 && {
                     let mut cs = score[k].lyric.trim().chars();
-                    matches!((cs.next(), cs.next()), (Some(c), None) if dicts.zh().map(|d| d.is_hanzi(c)).unwrap_or(false))
+                    matches!((cs.next(), cs.next()), (Some(c), None) if zh.is_hanzi(c))
                 }
         };
-        if !is_plain_hanzi(i) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < n && is_plain_hanzi(i) {
-            i += 1;
-        }
-        let zh = dicts.zh()?; // is_plain_hanzi succeeded ⇒ loaded
-        let chars: Vec<char> = (start..i).map(|k| score[k].lyric.trim().chars().next().unwrap()).collect();
-        let mut pos = 0usize;
-        while pos < chars.len() {
-            let maxw = zh.max_phrase.min(chars.len() - pos);
-            let mut matched = 0usize;
-            for w in (2..=maxw).rev() {
-                let phrase: String = chars[pos..pos + w].iter().collect();
-                if let Some(syls) = zh.phrases.get(&phrase) {
-                    for (j, s) in syls.iter().enumerate() {
-                        zh_syl[start + pos + j] = Some(s.clone());
-                    }
-                    matched = w;
+        let transparent = |k: usize| matches!(toks[k], Tok::Hold | Tok::Next | Tok::Rest | Tok::Breath);
+        let mut i = 0;
+        while i < n {
+            if !is_plain_hanzi(i) {
+                i += 1;
+                continue;
+            }
+            // collect the hanzi-note indices of this window (transparent notes skipped, not breaking)
+            let mut idx: Vec<usize> = Vec::new();
+            let mut j = i;
+            while j < n {
+                if is_plain_hanzi(j) {
+                    idx.push(j);
+                    j += 1;
+                } else if transparent(j) {
+                    j += 1;
+                } else {
                     break;
                 }
             }
-            if matched == 0 {
-                zh_syl[start + pos] = zh.char_default(chars[pos]).map(str::to_string);
-                matched = 1;
+            let chars: Vec<char> = idx.iter().map(|&k| score[k].lyric.trim().chars().next().unwrap()).collect();
+            let mut pos = 0usize;
+            while pos < chars.len() {
+                let maxw = zh.max_phrase.min(chars.len() - pos);
+                let mut matched = 0usize;
+                for w in (2..=maxw).rev() {
+                    let phrase: String = chars[pos..pos + w].iter().collect();
+                    if let Some(syls) = zh.phrases.get(&phrase) {
+                        for (k, s) in syls.iter().enumerate() {
+                            zh_syl[idx[pos + k]] = Some(s.clone());
+                        }
+                        matched = w;
+                        break;
+                    }
+                }
+                if matched == 0 {
+                    zh_syl[idx[pos]] = zh.char_default(chars[pos]).map(str::to_string);
+                    matched = 1;
+                }
+                pos += matched;
             }
-            pos += matched;
+            i = j;
         }
     }
 
@@ -623,7 +655,7 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
             Tok::Word => {
                 match evt.lang {
                     Lang::Ja | Lang::Zh => {
-                        match resolve_east_word(evt, zh_syl[i].as_deref(), dicts) {
+                        match resolve_east_word(evt, zh_syl[i].as_deref(), dicts)? {
                             Some(ph) => {
                                 // carrier update: ja = last phone if in VOWEL_SET (legacy prev_vowel
                                 // rule — persists across a non-vowel-final note like ん); zh = the
@@ -657,8 +689,8 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                         while span_end < n && matches!(toks[span_end], Tok::Hold | Tok::Next) {
                             span_end += 1;
                         }
-                        match resolve_west_span(evt, &score[i..span_end], &toks[i..span_end], dicts) {
-                            Ok(assignments) => {
+                        match resolve_west_span(evt, &score[i..span_end], &toks[i..span_end], dicts)? {
+                            Some(assignments) => {
                                 for (j, ph) in assignments.into_iter().enumerate() {
                                     carrier = ph.last().copied().or(carrier);
                                     out[i + j] = Some(ResolvedNote {
@@ -668,7 +700,7 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                                     });
                                 }
                             }
-                            Err(_) => {
+                            None => {
                                 if strict {
                                     return Err(oov(evt.lyric));
                                 }
@@ -694,39 +726,41 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
     Ok(out.into_iter().map(|o| o.expect("every note resolved")).collect())
 }
 
-/// Resolve a JA/ZH sung word note to IPA phones (None = OOV). §3.7 override precedence:
-/// whitespace phoneme_input = raw traditional phones; no-space = a mora (ja) / pinyin syllable (zh);
-/// otherwise ja = legacy mora path, zh = phrase-resolved reading (or the lyric as bare pinyin).
+/// Resolve a JA/ZH sung word note to IPA phones. `Ok(None)` = real OOV (unknown word/mora/pinyin);
+/// `Err` = INFRASTRUCTURE failure (missing dictionary — propagated as VOCAL_DICT_MISSING, never
+/// masked as OOV; audit MAJOR). §3.7 override precedence: whitespace phoneme_input = raw traditional
+/// phones; no-space = a mora (ja) / pinyin syllable (zh); otherwise ja = legacy mora path, zh =
+/// phrase-resolved reading (or the lyric as bare pinyin).
 fn resolve_east_word(
     evt: &ScoreEvt,
     zh_phrase_syl: Option<&str>,
     dicts: &dyn DictSource,
-) -> Option<Vec<&'static str>> {
+) -> Result<Option<Vec<&'static str>>> {
     if let Some(pi) = evt.phoneme_input {
         let pi = pi.trim();
         if pi.contains(char::is_whitespace) {
             let phones: Vec<String> = pi.split_whitespace().map(str::to_string).collect();
-            return match evt.lang {
+            return Ok(match evt.lang {
                 Lang::Ja => ja_phones_from_tokens(&phones),
                 _ => stage2(evt.lang, &phones).ok(),
-            };
+            });
         }
     }
     match evt.lang {
         Lang::Ja => {
             let token = evt.phoneme_input.map(str::trim).unwrap_or(evt.lyric);
-            ja_word_phones(token)
+            Ok(ja_word_phones(token))
         }
         _ => {
-            let zh = dicts.zh().ok()?;
+            let zh = dicts.zh()?;
             let syl: String = match (evt.phoneme_input, zh_phrase_syl) {
                 (Some(pi), _) => pi.trim().to_lowercase(),
                 (None, Some(s)) => s.to_string(),
                 // not a plain hanzi: try the lyric itself as a bare pinyin syllable
                 (None, None) => evt.lyric.trim().to_lowercase(),
             };
-            let trad = zh.syllable_phones(&syl)?;
-            stage2(Lang::Zh, &trad).ok()
+            let Some(trad) = zh.syllable_phones(&syl) else { return Ok(None) };
+            Ok(stage2(Lang::Zh, &trad).ok())
         }
     }
 }
@@ -763,23 +797,27 @@ pub fn fold_katakana(s: &str) -> String {
 
 /// Resolve one western-word span: syllabify the word, distribute syllables over the carrier + `+`
 /// notes (last consumer takes the remainder), holds re-emit the current nucleus, and DEFER the
-/// word-final coda to the span's last note (归韵). Returns per-span-note IPA phone lists.
+/// word-final coda to the span's last note (归韵). Returns per-span-note IPA phone lists;
+/// `Ok(None)` = real OOV, `Err` = missing dictionary (VOCAL_DICT_MISSING — never masked as OOV).
 fn resolve_west_span(
     evt: &ScoreEvt,
     span: &[ScoreEvt],
     toks: &[Tok],
     dicts: &dyn DictSource,
-) -> std::result::Result<Vec<Vec<&'static str>>, ()> {
-    let dict = dicts.words(evt.lang).map_err(|_| ())?;
+) -> Result<Option<Vec<Vec<&'static str>>>> {
+    let dict = dicts.words(evt.lang)?;
     // stage1: the word's traditional phones (override with spaces already handled by the caller — a
     // no-space override here is a single traditional phone).
     let trad: Vec<String> = if let Some(pi) = evt.phoneme_input {
         pi.split_whitespace().map(str::to_string).collect()
     } else {
-        dict.lookup(evt.lyric.trim()).ok_or(())?
+        match dict.lookup(evt.lyric.trim()) {
+            Some(t) => t,
+            None => return Ok(None),
+        }
     };
     if trad.is_empty() {
-        return Err(());
+        return Ok(None);
     }
     let sylls = syllabify(dict, &trad);
 
@@ -824,11 +862,15 @@ fn resolve_west_span(
         assign_trad[last_note].extend(coda);
     }
 
-    // stage2 each note's traditional phones → interned IPA
-    assign_trad
-        .into_iter()
-        .map(|tr| stage2(evt.lang, &tr).map_err(|_| ()))
-        .collect()
+    // stage2 each note's traditional phones → interned IPA (a bad phone = real OOV, not an error)
+    let mut out: Vec<Vec<&'static str>> = Vec::with_capacity(assign_trad.len());
+    for tr in assign_trad {
+        match stage2(evt.lang, &tr) {
+            Ok(ph) => out.push(ph),
+            Err(_) => return Ok(None),
+        }
+    }
+    Ok(Some(out))
 }
 
 /// STRICT resolve for the render: every note must resolve (LOUD `VOCAL_OOV` otherwise).
@@ -837,26 +879,25 @@ pub fn resolve_score(score: &[ScoreEvt], dicts: &dyn DictSource) -> Result<Vec<R
 }
 
 /// LENIENT resolve for the editor (§9.5 single classifier): per-note verdicts, OOV as `Unknown` —
-/// same code path as the render, so the marking can never drift from what actually renders.
-pub fn classify_score(score: &[ScoreEvt], dicts: &dyn DictSource) -> Vec<LyricClass> {
-    match resolve_core(score, dicts, false) {
-        Ok(notes) => notes
-            .into_iter()
-            .map(|nt| match nt.kind {
-                ResolvedKind::Rest => LyricClass::Rest,
-                ResolvedKind::Breath => LyricClass::Breath,
-                ResolvedKind::Phones(ph) => {
-                    if nt.is_sustain {
-                        LyricClass::Sustain
-                    } else {
-                        LyricClass::Phones { phones: ph }
-                    }
+/// same code path as the render, so the marking can never drift from what actually renders. `Err` =
+/// infrastructure failure (missing dictionary): the caller must NOT mark notes (red marks would point
+/// the user at their lyrics when the problem is a missing file — the render reports it precisely).
+pub fn classify_score(score: &[ScoreEvt], dicts: &dyn DictSource) -> Result<Vec<LyricClass>> {
+    Ok(resolve_core(score, dicts, false)?
+        .into_iter()
+        .map(|nt| match nt.kind {
+            ResolvedKind::Rest => LyricClass::Rest,
+            ResolvedKind::Breath => LyricClass::Breath,
+            ResolvedKind::Phones(ph) => {
+                if nt.is_sustain {
+                    LyricClass::Sustain
+                } else {
+                    LyricClass::Phones { phones: ph }
                 }
-                ResolvedKind::Unknown => LyricClass::Unknown,
-            })
-            .collect(),
-        Err(_) => score.iter().map(|_| LyricClass::Unknown).collect(), // unreachable (lenient never errs)
-    }
+            }
+            ResolvedKind::Unknown => LyricClass::Unknown,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -914,24 +955,30 @@ mod tests {
             "长大\tzhang da\n了解\tliao jie\n",
         )
     }
+    fn de_fixture() -> WordDict {
+        // haben's n̩ is a SYLLABIC consonant (nucleus) — baum makes bare B a legal onset. NB the de
+        // TRADITIONAL layer spells the diphthong "aw" (MFA notation; stage2 normalizes it to aʊ).
+        WordDict::from_tsv(Lang::De, "haben\th aː b n̩\nbaum\tb aw m\n")
+    }
     struct Fixtures {
         zh: ZhDict,
         en: WordDict,
+        de: WordDict,
     }
     impl DictSource for Fixtures {
         fn zh(&self) -> Result<&ZhDict> {
             Ok(&self.zh)
         }
         fn words(&self, lang: Lang) -> Result<&WordDict> {
-            if lang == Lang::En {
-                Ok(&self.en)
-            } else {
-                Err(UtaiError::Inference("VOCAL_DICT_MISSING: fixture".into()))
+            match lang {
+                Lang::En => Ok(&self.en),
+                Lang::De => Ok(&self.de),
+                _ => Err(UtaiError::Inference("VOCAL_DICT_MISSING: fixture".into())),
             }
         }
     }
     fn fixtures() -> Fixtures {
-        Fixtures { zh: zh_fixture(), en: en_fixture() }
+        Fixtures { zh: zh_fixture(), en: en_fixture(), de: de_fixture() }
     }
     fn evt(lyric: &str, lang: Lang) -> ScoreEvt<'_> {
         ScoreEvt { lyric, note_num: 60, frames: 20, lang, phoneme_input: None }
@@ -1134,9 +1181,63 @@ mod tests {
         let score = [evt("light", Lang::En), evt("zzzzq", Lang::En), evt("か", Lang::Ja)];
         let err = resolve_score(&score, &f).unwrap_err().to_string();
         assert!(err.contains("VOCAL_OOV: zzzzq"), "strict render error carries the CODE + lyric: {err}");
-        let classes = classify_score(&score, &f);
+        let classes = classify_score(&score, &f).unwrap();
         assert!(matches!(classes[0], LyricClass::Phones { .. }));
         assert!(matches!(classes[1], LyricClass::Unknown));
         assert!(matches!(classes[2], LyricClass::Phones { .. }), "notes after the OOV still classify");
+    }
+
+    // ── audit MAJOR: a MISSING DICTIONARY must surface as VOCAL_DICT_MISSING — never masked as
+    //    per-word VOCAL_OOV (which points the user at their lyrics instead of the broken install) ──
+    #[test]
+    fn dict_missing_is_not_oov() {
+        use super::super::score2cv::NoDicts;
+        for score in [vec![evt("长", Lang::Zh)], vec![evt("light", Lang::En)]] {
+            let err = resolve_score(&score, &NoDicts).unwrap_err().to_string();
+            assert!(err.contains("VOCAL_DICT_MISSING"), "infrastructure error surfaces its own CODE: {err}");
+            assert!(!err.contains("VOCAL_OOV"), "never masked as OOV: {err}");
+            assert!(classify_score(&score, &NoDicts).is_err(), "lenient classify propagates too (no wrong red marks)");
+        }
+        // pure-JA scores never touch the dictionaries → still fine with none present
+        assert!(resolve_score(&[evt("か", Lang::Ja)], &NoDicts).is_ok());
+    }
+
+    // ── audit MAJOR: sustains/rests are TRANSPARENT to the zh phrase window — [了][-][解] (melisma on
+    //    了) must still read 了解 = liǎo, and a breath gap must not break 长大 ──
+    #[test]
+    fn zh_phrase_window_transparent_over_sustains_and_rests() {
+        let f = fixtures();
+        let score = [evt("了", Lang::Zh), evt("-", Lang::Zh), evt("解", Lang::Zh)];
+        let r = resolve_score(&score, &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["l", "iaʊ"], "了解 across a sustain → liao (not the 了 default le)");
+        assert_eq!(phones_of(&r[1]), vec!["iaʊ"], "the hold re-emits the resolved final");
+        let score2 = [evt("长", Lang::Zh), evt("R", Lang::Zh), evt("大", Lang::Zh)];
+        let r2 = resolve_score(&score2, &f).unwrap();
+        assert_eq!(phones_of(&r2[0]), vec!["ʈʂ", "ɑŋ"], "长大 across a rest → zhang");
+    }
+
+    // ── audit MINOR: de syllabic consonants (l̩/m̩/n̩) count as nuclei — haben = ha|bn̩ (2 syllables),
+    //    so a + note takes the second syllable instead of a bare vowel hold ──
+    #[test]
+    fn de_syllabic_consonant_is_nucleus() {
+        let f = fixtures();
+        let d = de_fixture();
+        let sylls = syllabify(&d, &d.lookup("haben").unwrap());
+        assert_eq!(sylls, vec![vec!["h", "aː"], vec!["b", "n̩"]], "n̩ carries the 2nd syllable");
+        let score = [evt("haben", Lang::De), evt("+", Lang::De)];
+        let r = resolve_score(&score, &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["h", "aː"]);
+        assert_eq!(phones_of(&r[1]), vec!["b", "n̩"], "+ advances to the syllabic-consonant syllable");
+    }
+
+    // ── audit MINOR: malformed zh TSV rows are dropped at load (empty phones / phrase-length mismatch)
+    //    so a hand-edited dictionary degrades to LOUD OOV instead of silent frame desync ──
+    #[test]
+    fn zh_dict_drops_malformed_rows() {
+        let d = ZhDict::from_tsv("ok\to k\nbad\t\n", "长\tzhang\n", "长大\tzhang\n好了\thao le\n");
+        assert!(d.syllable_phones("ok").is_some());
+        assert!(d.syllable_phones("bad").is_none(), "empty-phones row dropped → OOV, not zero phones");
+        assert!(!d.phrases.contains_key("长大"), "syllable-count mismatch row dropped");
+        assert!(d.phrases.contains_key("好了"));
     }
 }

@@ -18,17 +18,29 @@ import type { Segment, Track } from "../../types/project";
 
 const DEBOUNCE_MS = 300;
 
-/** Everything a segment's verdict depends on (NOT pitch/curves — they can't change a lyric's class). */
+/** Everything a segment's verdict depends on (NOT pitch/curves — they can't change a lyric's class).
+ *  JSON-encoded: lyrics may contain any delimiter character, so a hand-rolled join could collide two
+ *  different note lists into one sig (audit — a collision silently skips revalidation). */
 function oovSig(track: Track, seg: Segment, tempo: number): string {
   if (seg.content.type !== "notes") return "";
   const vp = track.vocalParams ?? DEFAULT_VOCAL_PARAMS;
-  const notes = seg.content.notes
-    .map((n) => `${n.tick},${n.duration},${n.lyric},${n.lang ?? ""},${n.phonemeInput ?? ""}`)
-    .join(";");
-  return `${notes}|${vp.langId}|${vp.breathToken ?? "AP"}|${tempo}`;
+  return JSON.stringify([
+    seg.content.notes.map((n) => [n.tick, n.duration, n.lyric, n.lang ?? "", n.phonemeInput ?? ""]),
+    vp.langId,
+    vp.breathToken ?? "AP",
+    tempo,
+  ]);
 }
 
-const validated = new Map<string, string>(); // segmentId → last VALIDATED input sig
+interface Validated {
+  /** ref-identity short-circuit (a drag re-runs the pass every DEBOUNCE_MS — never rebuild the sig
+   *  string for segments whose notes/params/tempo refs did not change). */
+  notes: unknown;
+  vp: unknown;
+  tempo: number;
+  sig: string;
+}
+const validated = new Map<string, Validated>(); // segmentId → last VALIDATED inputs
 let timer: number | null = null;
 let running = false;
 let lastTracks: unknown = null;
@@ -49,10 +61,16 @@ async function validatePass(): Promise<void> {
       for (const seg of tr.segments) {
         if (seg.content.type !== "notes") continue;
         live.add(seg.id);
+        const prev = validated.get(seg.id);
+        if (prev && prev.notes === seg.content.notes && prev.vp === tr.vocalParams && prev.tempo === st.tempo) continue;
         const sig = oovSig(tr, seg, st.tempo);
-        if (validated.get(seg.id) === sig) continue;
+        const stamp: Validated = { notes: seg.content.notes, vp: tr.vocalParams, tempo: st.tempo, sig };
+        if (prev?.sig === sig) {
+          validated.set(seg.id, stamp); // same content through different refs (e.g. undo) — refresh refs
+          continue;
+        }
         if (seg.content.notes.length === 0) {
-          validated.set(seg.id, sig);
+          validated.set(seg.id, stamp);
           app.setVocalOov(seg.id, null);
           continue;
         }
@@ -73,11 +91,11 @@ async function validatePass(): Promise<void> {
             const id = tripleNoteIds[i];
             if (id && c.kind === "unknown") oov.push(id);
           });
-          validated.set(seg.id, sig);
+          validated.set(seg.id, stamp);
           app.setVocalOov(seg.id, oov.length ? oov : null);
         } catch (e) {
           console.warn("[oovWatch] validate_lyrics failed:", e);
-          validated.set(seg.id, sig); // don't hot-loop on a persistent backend error
+          validated.set(seg.id, stamp); // don't hot-loop on a persistent backend error
         }
       }
     }

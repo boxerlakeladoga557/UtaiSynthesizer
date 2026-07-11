@@ -31,7 +31,9 @@ export function ContextMenu({ x, y, items, onClose }: Props) {
     if (left < 0) left = 4;
     if (top < 0) top = 4;
     setPos({ left, top });
-  }, [x, y]);
+    // items.length: a menu whose items arrive ASYNC (the vocal-track singer picker fetches the model
+    // list after opening) grows after the first clamp ran — re-clamp so it never extends off-screen.
+  }, [x, y, items.length]);
 
   useEffect(() => {
     const handle = (e: MouseEvent) => {

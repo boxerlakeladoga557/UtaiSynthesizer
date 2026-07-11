@@ -26,6 +26,7 @@ import {
   paramToY, yToParam,
 } from "../../lib/vocalGeometry";
 import type { Note } from "../../types/project";
+import { langById, DEFAULT_LANG_ID } from "../../lib/vocal/languages";
 import { VocalSidebar } from "./VocalSidebar";
 import "./VocalEditor.css";
 
@@ -50,7 +51,9 @@ const LANE_PARAMS: { id: LaneParam; min: number; max: number; unit: string; labe
   { id: "formant", min: -12, max: 12, unit: "st", labelKey: "vocalEditor.lane.formant" },
 ];
 const laneCfg = (p: LaneParam) => LANE_PARAMS.find((x) => x.id === p)!;
-const DEFAULT_LYRIC = "あ"; // JA vowel — always in PHONE_TO_ID, never OOV/empty (§9.2)
+// S58: the default lyric for a newly drawn note follows the TRACK's language (a ja "あ" on a zh/en
+// track would be instant OOV — audit MAJOR). langById falls back to ja for an out-of-range id.
+const defaultLyricFor = (langId: number | undefined) => langById(langId ?? DEFAULT_LANG_ID).defaultLyric;
 const MIN_LEN_TICKS = TICKS_PER_BEAT / 12; // shortest note the UI allows = 1/12 (40t), the finest grid — so you
 // can always drag down to it WITHOUT switching grid; the 60ms singability floor is a Phase-6 render concern (§user)
 
@@ -149,6 +152,9 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // the next scoops, §10.5). Dynamic: editing the token re-connects the OLD token's notes.
   const breathTokenRef = useRef(part?.vocalParams?.breathToken ?? "AP");
   breathTokenRef.current = part?.vocalParams?.breathToken ?? "AP";
+  // S58: the track's default lang drives the default lyric of newly drawn notes (must be singable).
+  const defaultLyricRef = useRef(defaultLyricFor(part?.vocalParams?.langId));
+  defaultLyricRef.current = defaultLyricFor(part?.vocalParams?.langId);
   // ② S58 OOV verdicts for THIS segment (async, from the oovWatch watcher) — ref-synced for the draw
   // closure; the dedicated redraw effect below re-invokes it when the verdict changes.
   const oovIds = useAppStore((s) => s.vocalOov[segmentId]);
@@ -936,7 +942,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       const p = clampPitch(pitchAt(e.clientY));
       // Created note honors the 60ms floor like resize/truncation do (§9.2) — a fine grid can't make an
       // inaudible sub-floor note.
-      const newNote: Note = { id: crypto.randomUUID(), tick: relStart, duration: Math.max(1, snap), pitch: p, lyric: DEFAULT_LYRIC, velocity: 100 };
+      const newNote: Note = { id: crypto.randomUUID(), tick: relStart, duration: Math.max(1, snap), pitch: p, lyric: defaultLyricRef.current, velocity: 100 };
       playback.playPreviewTone(pitchToHz(p), 0); // sustained while drawing; stops on pointerup
       dragRef.current = withPreview({
         kind: "create", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
@@ -1132,11 +1138,11 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
 
   const commitLyric = (id: string, value: string) => {
     if (!part) { setLyricEdit(null); return; }
-    const tokens = splitLyricTokens(value.trim());
+    const tokens = splitLyricTokens(value.trim(), defaultLyricRef.current);
     const ordered = orderedNotes();
     const startIdx = ordered.findIndex((n) => n.id === id);
     if (tokens.length <= 1 || startIdx < 0) {
-      applyNoteEdits(part.trackId, segmentId, { update: { [id]: { lyric: tokens[0] ?? DEFAULT_LYRIC } } });
+      applyNoteEdits(part.trackId, segmentId, { update: { [id]: { lyric: tokens[0] ?? defaultLyricRef.current } } });
     } else {
       const update: Record<string, Partial<Note>> = {};
       for (let i = 0; i < tokens.length && startIdx + i < ordered.length; i++) {
@@ -1405,8 +1411,8 @@ const SMALL_KANA = new Set([..."ぁぃぅぇぉゃゅょゎっゕゖァィゥェ
  *  character (S58 — one hanzi per note; the Rust zh G2P reads phrase context from the NOTE SEQUENCE, so
  *  polyphones still resolve after the split); otherwise one token (latin needs explicit spaces).
  *  Minimal + JS-side (a splitter, NOT a dictionary — the Rust classifier owns phoneme validation). */
-function splitLyricTokens(s: string): string[] {
-  if (!s) return [DEFAULT_LYRIC];
+function splitLyricTokens(s: string, emptyFallback: string): string[] {
+  if (!s) return [emptyFallback];
   if (/\s/.test(s)) return s.split(/\s+/).filter(Boolean);
   if (/^[\p{Script=Han}]+$/u.test(s)) return [...s];
   const isKana = /^[぀-ヿ゠-ヿー]+$/.test(s);

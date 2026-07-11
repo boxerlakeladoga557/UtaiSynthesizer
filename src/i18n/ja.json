@@ -415,7 +415,9 @@
       "autoRendering": "変更した人声トラックを合成中…",
       "autoRenderingCancel": "もう一度で中止",
       "oov": "歌詞「{{lyric}}」を音素に変換できません（OOV）——歌詞またはノート/トラックの言語設定を確認してください",
-      "phoneMissing": "内部エラー：音素「{{phone}}」は ScoreToCV の語彙にありません"
+      "phoneMissing": "内部エラー：音素「{{phone}}」は ScoreToCV の語彙にありません",
+      "dictMissing": "発音辞書がありません（{{file}}）——data/dictionaries フォルダを確認してください",
+      "moreFailures": "他の人声トラックも合成に失敗しました（重複通知は省略）"
     }
   }
 }

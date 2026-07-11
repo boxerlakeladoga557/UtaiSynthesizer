@@ -148,7 +148,7 @@ pub const FIX_C3_GLOBAL: &[(&str, &str)] = &[
 
 /// Per-language MFA vowel phones (traditional layer) — nucleus detection for
 /// syllabification / sustain / coda-deferral. Derived from each shipped dictionary's inventory.
-pub const MFA_VOWELS_DE: &[&str] = &["a", "aj", "aw", "aː", "eː", "iː", "oː", "uː", "yː", "øː", "œ", "ɐ", "ɔ", "ɔʏ", "ə", "ɛ", "ɪ", "ʊ", "ʏ"];
+pub const MFA_VOWELS_DE: &[&str] = &["a", "aj", "aw", "aː", "eː", "iː", "l̩", "m̩", "n̩", "oː", "uː", "yː", "øː", "œ", "ɐ", "ɔ", "ɔʏ", "ə", "ɛ", "ɪ", "ʊ", "ʏ"];
 pub const MFA_VOWELS_FR: &[&str] = &["a", "e", "i", "o", "u", "y", "ø", "œ", "ɑ", "ɑ̃", "ɔ", "ɔ̃", "ə", "ɛ", "ɛ̃"];
 pub const MFA_VOWELS_ES: &[&str] = &["a", "e", "i", "o", "u"];
 pub const MFA_VOWELS_IT: &[&str] = &["a", "aː", "e", "eː", "i", "o", "oː", "u", "y", "æ", "ø", "œ", "ɔ", "ə", "ɛ"];

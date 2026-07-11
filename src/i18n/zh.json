@@ -415,7 +415,9 @@
       "autoRendering": "渲染改动的人声轨…",
       "autoRenderingCancel": "再次点击取消渲染",
       "oov": "歌词「{{lyric}}」无法转换为音素（OOV）——请检查歌词或音符/轨道的语言设置",
-      "phoneMissing": "内部错误：音素「{{phone}}」不在 ScoreToCV 词表中"
+      "phoneMissing": "内部错误：音素「{{phone}}」不在 ScoreToCV 词表中",
+      "dictMissing": "缺少发音词典（{{file}}）——请检查 data/dictionaries 目录是否完整",
+      "moreFailures": "还有更多人声轨渲染失败（已省略重复提示）"
     }
   }
 }

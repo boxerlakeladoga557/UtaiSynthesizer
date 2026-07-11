@@ -10,16 +10,19 @@ export interface VocalLanguage {
   code: string;
   /** Two-letter badge for the crowded track header. */
   short: string;
+  /** Default lyric for a NEWLY DRAWN note — must be singable in THIS language (a ja "あ" on a zh/en
+   *  track would be instant OOV; audit MAJOR). Every value is verified against its dictionary. */
+  defaultLyric: string;
 }
 
 export const VOCAL_LANGUAGES: readonly VocalLanguage[] = [
-  { id: 0, code: "zh", short: "ZH" },
-  { id: 1, code: "en", short: "EN" },
-  { id: 2, code: "ja", short: "JA" },
-  { id: 3, code: "de", short: "DE" },
-  { id: 4, code: "fr", short: "FR" },
-  { id: 5, code: "es", short: "ES" },
-  { id: 6, code: "it", short: "IT" },
+  { id: 0, code: "zh", short: "ZH", defaultLyric: "啊" },
+  { id: 1, code: "en", short: "EN", defaultLyric: "a" },
+  { id: 2, code: "ja", short: "JA", defaultLyric: "あ" },
+  { id: 3, code: "de", short: "DE", defaultLyric: "a" },
+  { id: 4, code: "fr", short: "FR", defaultLyric: "a" },
+  { id: 5, code: "es", short: "ES", defaultLyric: "a" },
+  { id: 6, code: "it", short: "IT", defaultLyric: "a" },
 ];
 
 export const DEFAULT_LANG_ID = 2; // ja — the historical default (DEFAULT_VOCAL_PARAMS.langId)

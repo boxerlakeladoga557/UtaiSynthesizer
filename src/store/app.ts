@@ -152,6 +152,9 @@ interface AppState {
 
 export type BannerKind = "undo" | "redo" | "save" | "load" | "info";
 
+/** Monotonic toast id (Date.now() collides within one millisecond — see showToast). */
+let toastSeq = 0;
+
 export const useAppStore = create<AppState>((set, get) => ({
   trainingPageOpen: false,
   modelManagerOpen: false,
@@ -267,7 +270,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       return { vocalOov: next };
     }),
   showToast: (message, type = "error") => {
-    const id = Date.now();
+    // monotonic id — Date.now() collides when two toasts fire in the same millisecond (e.g. the
+    // auto-render batch reporting several failures back-to-back), making the first timeout dismiss both.
+    const id = ++toastSeq;
     set((s) => ({ toasts: [...s.toasts, { message, type, id }] }));
     setTimeout(() => {
       set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
