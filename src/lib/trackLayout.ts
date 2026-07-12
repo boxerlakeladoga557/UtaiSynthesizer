@@ -316,6 +316,13 @@ export function laneControlFor(track: Track, groupId: string, laneId: string): L
   return track.laneControls[groupId] ?? track.laneControls[laneId];
 }
 
+/** Would a clip spanning [startTick, startTick+durTicks) overlap any existing (non-loading) segment on
+ *  `track`? THE shared collision test for placing new content (drag-import placement + S61 paste). */
+export function clipCollides(track: Track, startTick: number, durTicks: number): boolean {
+  const end = startTick + durTicks;
+  return track.segments.some((s) => !s.loading && startTick < s.startTick + s.durationTicks && s.startTick < end);
+}
+
 /** One visual sub-lane GROUP (a contiguous run of same-组-same-名 rows) + its slim GROUP BAR above the
  *  rows. The bar hosts the group name + the group-level volume/pan controls (drawn ONCE per 组 — P5). */
 export interface LaneGroupRun {

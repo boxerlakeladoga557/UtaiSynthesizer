@@ -13,6 +13,7 @@ import { clearNodeHistories } from "../workflow/nodeHistory";
 // module. Neither side calls the other during module EVALUATION (both are plain function
 // references used at runtime), which ESM resolves safely.
 import { cancelExtractionsForTeardown } from "../vocal/midiExtract";
+import { clearClipboard } from "../clipboard";
 import { buildSaveBundle, parseLoadedBundle, type LoadedProject } from "./bundle";
 import { hasUnsavedWork, isRecoveryPending, markAutosaveBaseline } from "./autosave";
 
@@ -113,6 +114,9 @@ function teardownForLoad() {
   useProjectStore.getState().selectNotes([]);
   // Per-segment node-graph undo stacks reference the OLD document's segments — no undo across a load.
   clearNodeHistories();
+  // S61: the arrangement clipboard holds the OLD document's render paths / mixer entries / sigs —
+  // pasting them into a different project would resurrect half-broken caches. Cleared like node undo.
+  clearClipboard();
 }
 
 export async function newProjectFile(): Promise<void> {

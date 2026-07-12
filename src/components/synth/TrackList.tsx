@@ -11,6 +11,7 @@ import { laneLabelParts } from "../../lib/audio/laneOps";
 import { trackTypeCssVar, LANE_COLORS } from "../../lib/trackColors";
 import { importAudioToNewTrack } from "../../lib/audio/import";
 import { blankTrack } from "../../lib/trackFactory";
+import { copyTrackToClipboard, pasteWithFeedback, clipboardKind } from "../../lib/clipboard";
 import { VolumeFader, formatPan, formatDb } from "../common/VolumeFader";
 import { ContextMenu, type MenuItem } from "../common/ContextMenu";
 import * as playback from "../../lib/audio/playback";
@@ -212,6 +213,13 @@ export function TrackList({ width }: Props) {
     if (menu.kind === "track") {
       return [
         { label: t("tracks.rename"), onClick: () => setEditingTrackId(menu.trackId) },
+        // S61 whole-track clipboard: 复制轨道 snapshots a full duplicate (segments + renders + config);
+        // 粘贴轨道 inserts the copy right below THIS track (enabled only with a track on the clipboard).
+        { label: t("tracks.copyTrack"), onClick: () => { copyTrackToClipboard(menu.trackId); } },
+        {
+          label: t("tracks.pasteTrack"), disabled: clipboardKind() !== "track",
+          onClick: () => pasteWithFeedback(menu.trackId),
+        },
         { label: t("tracks.delete"), danger: true, onClick: () => removeTrack(menu.trackId) },
       ];
     }

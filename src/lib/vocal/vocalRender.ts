@@ -280,7 +280,24 @@ export async function renderVocalSegment(req: {
  *  derives its 50fps grid + f0 from the tempo, so a BPM change alters the bake even with identical notes.
  *  Reuses the history helpers (single source — never fork a sig). */
 export function vocalRenderSig(track: Track, seg: Segment, tempo: number): string {
-  return `${contentSig(seg.content)}|vp:${vocalParamsSig(track.vocalParams)}|vm:${track.voiceModel ?? ""}|bpm:${tempo}|rr:${rangeRecordSig(track)}`;
+  return `${contentSig(seg.content)}|${vocalTrackSig(track, tempo)}`;
+}
+
+/** The TRACK-level + tempo terms of vocalRenderSig, alone (no segment content). S61 copy/paste uses it
+ *  to decide whether a carried bake is still valid on the DESTINATION track: the pasted copy's notes get
+ *  fresh ids (contentSig can never match the source's), so validity = "source bake was clean AND the
+ *  track/tempo terms are byte-equal between copy-source and paste-destination". Kept HERE so it can never
+ *  drift from vocalRenderSig (same string, single construction). */
+export function vocalTrackSig(track: Track, tempo: number): string {
+  return `vp:${vocalParamsSig(track.vocalParams)}|vm:${track.voiceModel ?? ""}|bpm:${tempo}|rr:${rangeRecordSig(track)}`;
+}
+
+/** Resolve a track's configured singer to its installed model entry (undefined = no vocalParams, no
+ *  voiceModel, or the model is gone). THE one "is this track renderable" probe (isVocalDirty + paste). */
+export function resolveTrackVoice(track: Track): { name: string; path: string } | undefined {
+  const vp = track.vocalParams;
+  if (!vp) return undefined;
+  return useVoiceModelStore.getState().models[vp.backend]?.find((m) => m.name === track.voiceModel);
 }
 
 /** S60-2 audit: the model's vocal_range record IS a render input (it decides the tier shift),
@@ -325,7 +342,9 @@ export function splitSegmentVocalAware(trackId: string, segId: string, tick: num
  *  never read clean — the carried window does NOT match this half's content). The bake's `renderedSig` (the
  *  PARENT whole-stem content) is LEFT UNCHANGED either way so an undo-of-split still matches the restored full
  *  content. Both sigs ride the OVERLAY (never undoable → can never desync from the bake — unlike an undoable
- *  flag). No-op for a non-notes / un-baked half. Exposed only for splitSegmentVocalAware. */
+ *  flag). No-op for a non-notes / un-baked half. Callers: splitSegmentVocalAware, and S61 paste (a pasted
+ *  copy's fresh note ids make the carried renderedSig permanently stale — the SAME stamp/clear discipline
+ *  marks the carried stem valid-for-destination or leaves it dirty; see lib/clipboard.ts). */
 export function stampSplitWindowSigs(trackId: string, segIds: string[], tempo: number, parentWasDirty: boolean): void {
   for (const segId of segIds) {
     const track = useProjectStore.getState().tracks.find((t) => t.id === trackId);
@@ -389,10 +408,8 @@ export function isVocalDirty(track: Track, seg: Segment, tempo: number): boolean
   // singing keeps playing for a segment that has no notes (segmentPlaysLanes still schedules the stem).
   // There's nothing to bake, so renderDirtyVocals clears the overlay instead of rendering.
   if (seg.content.notes.length === 0) return !!bake;
-  const vp = track.vocalParams;
-  if (!vp) return false;
-  const entry = useVoiceModelStore.getState().models[vp.backend]?.find((m) => m.name === track.voiceModel);
-  if (!entry) return false;
+  if (!track.vocalParams) return false;
+  if (!resolveTrackVoice(track)) return false;
   if (!bake) return true;
   // ② DUAL-SIG acceptance (§user: split is not a re-render). A carried SPLIT-WINDOW bake keeps the PARENT's
   // whole-stem `renderedSig` but is windowed to this half; `windowSig` is THIS half's own content sig (stamped

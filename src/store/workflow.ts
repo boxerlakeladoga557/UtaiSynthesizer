@@ -10,6 +10,18 @@ export interface ExecutionState {
   cancelled?: boolean;
 }
 
+/** A segment's portable render state (S61 copy/paste): the output CACHE always, node badges +
+ *  execution only when the run was SETTLED (the cloneSegmentState gate — a running execution must
+ *  never be duplicated onto another id, it would be a phantom nothing drives). Self-contained, so a
+ *  clipboard can hold it long after the source segment is deleted. */
+export interface SegmentRenderSnapshot {
+  nodeOutputs?: Record<string, string[]>;
+  nodeStatuses?: Record<string, NodeStatus>;
+  nodeProgress?: Record<string, number>;
+  nodeErrors?: Record<string, string>;
+  execution?: ExecutionState;
+}
+
 interface WorkflowStore {
   executions: Record<string, ExecutionState>;
   nodeStatuses: Record<string, Record<string, NodeStatus>>;
@@ -37,6 +49,13 @@ interface WorkflowStore {
    *  source is NOT cloned wholesale: cloning a 'running' execution would create a phantom that nothing
    *  drives (stuck spinner + blocks the quit/busy warning), so only its partial cache rides along. */
   cloneSegmentState: (fromId: string, toId: string) => void;
+  /** Capture a segment's render state as a portable snapshot (see SegmentRenderSnapshot). null when
+   *  there is nothing to carry. Same settled gate as cloneSegmentState (single source: clone = snapshot
+   *  + install). */
+  snapshotSegmentState: (segmentId: string) => SegmentRenderSnapshot | null;
+  /** Install a previously captured snapshot under a (new) segment id — the paste half of copy/paste.
+   *  Overwrites nothing when the snapshot is empty. */
+  installSegmentState: (segmentId: string, snap: SegmentRenderSnapshot) => void;
   /** Warm the runtime render CACHE + mark nodes "completed" for a segment IN ONE update, reconstructed
    *  from its PERSISTED processedOutputs after a project load/autoload (see engine.rehydrateRenderState).
    *  No-op if the cache is already warm (a live / just-run session), so it never clobbers real run state. */
@@ -116,27 +135,42 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
       return { executions: rest };
     }),
 
-  cloneSegmentState: (fromId, toId) =>
-    set((s) => {
-      const outs = s.nodeOutputs[fromId];
-      const exec = s.executions[fromId];
-      const statuses = s.nodeStatuses[fromId];
-      const progress = s.nodeProgress[fromId];
-      const errors = s.nodeErrors[fromId];
-      // SETTLED = there is an execution and it is not still running. Only then are the node badges +
-      // execution status meaningful to clone (a running source would leave the new id with stuck
-      // waiting/running badges + a phantom execution nothing drives). The output CACHE always rides along
-      // (harmless, and what the reconciler reads to re-deposit). New inner Records so later per-node writes
-      // to either id don't alias; the path arrays inside are read-only and may stay shared.
-      const settled = exec !== undefined && exec.status !== "running";
-      return {
-        nodeOutputs: outs ? { ...s.nodeOutputs, [toId]: { ...outs } } : s.nodeOutputs,
-        nodeStatuses: settled && statuses ? { ...s.nodeStatuses, [toId]: { ...statuses } } : s.nodeStatuses,
-        nodeProgress: settled && progress ? { ...s.nodeProgress, [toId]: { ...progress } } : s.nodeProgress,
-        nodeErrors: settled && errors ? { ...s.nodeErrors, [toId]: { ...errors } } : s.nodeErrors,
-        executions: settled ? { ...s.executions, [toId]: { ...exec } } : s.executions,
-      };
-    }),
+  cloneSegmentState: (fromId, toId) => {
+    const snap = get().snapshotSegmentState(fromId);
+    if (snap) get().installSegmentState(toId, snap);
+  },
+
+  snapshotSegmentState: (segmentId) => {
+    const s = get();
+    const outs = s.nodeOutputs[segmentId];
+    const exec = s.executions[segmentId];
+    const statuses = s.nodeStatuses[segmentId];
+    const progress = s.nodeProgress[segmentId];
+    const errors = s.nodeErrors[segmentId];
+    // SETTLED = there is an execution and it is not still running. Only then are the node badges +
+    // execution status meaningful to carry (a running source would leave the new id with stuck
+    // waiting/running badges + a phantom execution nothing drives). The output CACHE always rides along
+    // (harmless, and what the reconciler reads to re-deposit). New inner Records so later per-node writes
+    // to either id don't alias; the path arrays inside are read-only and may stay shared.
+    const settled = exec !== undefined && exec.status !== "running";
+    const snap: SegmentRenderSnapshot = {
+      ...(outs ? { nodeOutputs: { ...outs } } : {}),
+      ...(settled && statuses ? { nodeStatuses: { ...statuses } } : {}),
+      ...(settled && progress ? { nodeProgress: { ...progress } } : {}),
+      ...(settled && errors ? { nodeErrors: { ...errors } } : {}),
+      ...(settled ? { execution: { ...exec } } : {}),
+    };
+    return Object.keys(snap).length > 0 ? snap : null;
+  },
+
+  installSegmentState: (segmentId, snap) =>
+    set((s) => ({
+      nodeOutputs: snap.nodeOutputs ? { ...s.nodeOutputs, [segmentId]: { ...snap.nodeOutputs } } : s.nodeOutputs,
+      nodeStatuses: snap.nodeStatuses ? { ...s.nodeStatuses, [segmentId]: { ...snap.nodeStatuses } } : s.nodeStatuses,
+      nodeProgress: snap.nodeProgress ? { ...s.nodeProgress, [segmentId]: { ...snap.nodeProgress } } : s.nodeProgress,
+      nodeErrors: snap.nodeErrors ? { ...s.nodeErrors, [segmentId]: { ...snap.nodeErrors } } : s.nodeErrors,
+      executions: snap.execution ? { ...s.executions, [segmentId]: { ...snap.execution } } : s.executions,
+    })),
 
   hydrateRenderState: (segmentId, nodeOutputs, completedNodeIds) =>
     set((s) => {

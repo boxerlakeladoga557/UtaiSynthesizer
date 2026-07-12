@@ -7,6 +7,7 @@ import { useTranslation } from "react-i18next";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { newProjectFile, openProjectFile, saveProjectFile, saveProjectFileAs } from "../../lib/project/projectFile";
 import { importScoreFile } from "../../lib/vocal/import";
+import { copySelectedSegments, cutSelectedSegments, pasteWithFeedback, clipboardKind } from "../../lib/clipboard";
 import "./Titlebar.css";
 
 export function Titlebar() {
@@ -31,6 +32,11 @@ export function Titlebar() {
     { label: t("menu.import"), onClick: () => void importScoreFile() },
   ];
 
+  // Clipboard entries act on the ARRANGEMENT selection (the vocal editor owns note copy/paste via its
+  // own Ctrl+C/V while focused) — so they enable only while the timeline pane is active. Read lazily on
+  // menu open, same as undo/redo enablement above.
+  const timelineActive = useAppStore.getState().activePane === "timeline";
+  const hasSelection = useAppStore.getState().selectedSegments.length > 0 || useAppStore.getState().selectedSegment !== null;
   const editItems: MenuItem[] = [
     {
       label: t("menu.undo"),
@@ -43,6 +49,24 @@ export function Titlebar() {
       shortcut: "Ctrl+Y",
       disabled: !routeCanRedo(),
       onClick: () => routeRedo(),
+    },
+    {
+      label: t("menu.copy"),
+      shortcut: "Ctrl+C",
+      disabled: !timelineActive || !hasSelection,
+      onClick: () => { copySelectedSegments(); },
+    },
+    {
+      label: t("menu.cut"),
+      shortcut: "Ctrl+X",
+      disabled: !timelineActive || !hasSelection,
+      onClick: () => { cutSelectedSegments(); },
+    },
+    {
+      label: t("menu.paste"),
+      shortcut: "Ctrl+V",
+      disabled: !timelineActive || clipboardKind() === null,
+      onClick: () => pasteWithFeedback(),
     },
   ];
 
@@ -70,7 +94,6 @@ export function Titlebar() {
             {t("menu.edit")}
           </button>
           <button className={`menu-item ${modelManagerOpen ? "active" : ""}`} onClick={toggleModelManager}>{t("titlebar.models")}</button>
-          <button className="menu-item">{t("menu.tools")}</button>
           <button className={`menu-item ${settingsOpen ? "active" : ""}`} onClick={toggleSettings}>{t("menu.settings")}</button>
           <button className={`menu-item ${logViewerOpen ? "active" : ""}`} onClick={toggleLogViewer}>{t("titlebar.log")}</button>
         </nav>

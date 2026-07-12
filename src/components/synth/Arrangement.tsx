@@ -8,7 +8,7 @@ import { useHistoryStore } from "../../store/history";
 import { useTranslation } from "react-i18next";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { TICKS_PER_BEAT, PIXELS_PER_TICK, TRACK_HEADER_HEIGHT, LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, TRACK_ADD_FOOTER, AUDIO_EXT_RE } from "../../lib/constants";
-import { computeTrackYOffsets, computeTrackHeight, computeTotalTracksHeight, findTrackAtY, getLanes, getLaneLayout, laneRowAtY, isLaneRowMuted, laneControlFor, loudnessBandH, segmentPlaysLanes, segmentLaneSumPeaks, laneSumSig } from "../../lib/trackLayout";
+import { computeTrackYOffsets, computeTrackHeight, computeTotalTracksHeight, findTrackAtY, getLanes, getLaneLayout, laneRowAtY, isLaneRowMuted, laneControlFor, loudnessBandH, segmentPlaysLanes, segmentLaneSumPeaks, laneSumSig, clipCollides } from "../../lib/trackLayout";
 import { importAudioToNewTrack, importAudioToExistingTrack, probeAudioDuration, DEFAULT_DURATION_MS } from "../../lib/audio/import";
 import { durationMsToTicks } from "../../lib/audio/playback";
 import {
@@ -18,6 +18,7 @@ import {
 } from "../../lib/audio/laneOps";
 import { drawWaveform, beginWaveformFrame, peaksSignature } from "../../lib/waveformCache";
 import { splitSegmentVocalAware } from "../../lib/vocal/vocalRender";
+import { copySelectedSegments, cutSelectedSegments, pasteWithFeedback, clipboardKind } from "../../lib/clipboard";
 import { paramToY, yToParam, LOUDNESS_DB_RANGE } from "../../lib/vocalGeometry";
 import { evalCurveAt } from "../../lib/f0eval";
 import { collectSnapTicks, snapTick, snapMovedStart, SNAP_PX } from "../../lib/snapping";
@@ -473,9 +474,7 @@ export function Arrangement() {
         // Insert onto this audio track unless the clip would collide with existing content there —
         // then drop a new track just above/below (by cursor half) so clips never overlap on import.
         // (An empty audio track has no content → never collides → the clip lands in it.)
-        const end = tick + durTicks;
-        const collides = track.segments.some((s) => !s.loading && tick < s.startTick + s.durationTicks && s.startTick < end);
-        if (!collides) return { target: "insert", index: idx, tick };
+        if (!clipCollides(track, tick, durTicks)) return { target: "insert", index: idx, tick };
         return { target: "new", index: contentY < half ? idx : idx + 1, tick };
       }
       // Non-audio track body → new track above/below by cursor half.
@@ -610,7 +609,13 @@ export function Arrangement() {
       const yOffsets = computeTrackYOffsets(trks, vZoomRef.current);
       const targetIdx = Math.max(0, Math.min(trks.length - 1, findTrackAtY(yOffsets, mouseY)));
       const targetTrack = trks[targetIdx];
-      if (targetTrack && targetIdx !== drag.trackIdx && srcTrack.trackType === "audio" && targetTrack.trackType === "audio") {
+      // S61: cross-track hop for SAME-type tracks — audio↔audio (original) AND vocal↔vocal (a notes
+      // part was inexplicably locked to its own track). Track-level state (singer/vocalParams) stays
+      // with the TRACK by construction — the segment carries only its own content; the vocal bake's
+      // renderedSig/windowSig embed the host track's config (vm:/vp:/rr: terms), so landing under a
+      // different singer auto-fails both sigs → dirty → Play re-renders under the new track's config
+      // (an identically-configured track keeps the bake clean — zero extra bookkeeping).
+      if (targetTrack && targetIdx !== drag.trackIdx && srcTrack.trackType === targetTrack.trackType) {
         const seg = srcTrack.segments.find((s) => s.id === drag.segId);
         if (seg) {
           const movedSeg = { ...seg, startTick: Math.max(0, drag.origStartTick + moveDelta) };
@@ -1168,7 +1173,10 @@ export function Arrangement() {
           if (track) selectLane(track.id, hit.segId, hit.lane.group, hit.lane.clipIndex);
           setCtxMenu({ x: e.clientX, y: e.clientY, trackIdx: hit.trackIdx, segId: hit.segId, lane: { outputNodeId: hit.lane.group, clipIndex: hit.lane.clipIndex } });
         } else {
-          if (track) selectSegment(track.id, hit.segId);
+          // S61: right-clicking a segment that is ALREADY part of a multi-selection keeps the set
+          // (so 复制/剪切 act on the whole selection, the DAW convention) — any other target replaces it.
+          const inMulti = useAppStore.getState().selectedSegments.some((x) => x.segmentId === hit.segId);
+          if (track && !(inMulti && useAppStore.getState().selectedSegments.length > 1)) selectSegment(track.id, hit.segId);
           setCtxMenu({ x: e.clientX, y: e.clientY, trackIdx: hit.trackIdx, segId: hit.segId });
         }
       } else if (trackIdx >= 0 && trackIdx < tracks.length) {
@@ -1244,6 +1252,14 @@ export function Arrangement() {
           if (useAudioStore.getState().isPlaying) useAudioStore.getState().bumpSchedule();
         },
       });
+      // S61 clipboard — 复制/剪切 act on the SELECTION (the right-click keeps a multi-set that
+      // includes this segment); 粘贴 targets THIS track at the playhead.
+      items.push({ label: t("menu.copy"), shortcut: "Ctrl+C", onClick: () => { copySelectedSegments(); } });
+      items.push({ label: t("menu.cut"), shortcut: "Ctrl+X", onClick: () => { cutSelectedSegments(); } });
+      items.push({
+        label: t("menu.paste"), shortcut: "Ctrl+V", disabled: clipboardKind() === null,
+        onClick: () => pasteWithFeedback(track.id),
+      });
       // Clear a render → reveal the original audio again (non-destructive: content + node graph are
       // preserved, so it can be re-rendered any time). processedOutputs is a non-undoable overlay, so
       // this — like rendering — isn't an undo step; to get the render back, re-run the workflow.
@@ -1292,6 +1308,13 @@ export function Arrangement() {
           });
         }
       }
+    }
+    // Empty-row right-click still offers 粘贴 (this row's track at the playhead) — S61.
+    if (!ctxMenu.segId) {
+      items.push({
+        label: t("menu.paste"), shortcut: "Ctrl+V", disabled: clipboardKind() === null,
+        onClick: () => pasteWithFeedback(track.id),
+      });
     }
     items.push({
       label: t("tracks.delete"), danger: true,

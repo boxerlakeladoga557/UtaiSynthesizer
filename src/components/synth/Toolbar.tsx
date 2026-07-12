@@ -8,6 +8,7 @@ import { useWorkflowStore } from "../../store/workflow";
 import { useTranslation } from "react-i18next";
 import * as playback from "../../lib/audio/playback";
 import { collectDirtyVocals, renderDirtyVocals, splitSegmentVocalAware } from "../../lib/vocal/vocalRender";
+import { copySelectedSegments, cutSelectedSegments, pasteWithFeedback } from "../../lib/clipboard";
 import { formatBarBeat, type TimeAxis } from "../../lib/timeAxis";
 import { contentEndTick } from "../../lib/trackLayout";
 import { sliceLaneGroupAtPlayhead, deleteLanePiece, liveSelectedLane } from "../../lib/laneEdit";
@@ -357,6 +358,15 @@ export function Toolbar() {
         }
         e.preventDefault();
         splitRef.current();
+      } else if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === "c" || e.key === "x" || e.key === "v")) {
+        // S61 arrangement clipboard. Timeline-pane ONLY: the vocal editor owns note copy/paste under
+        // activePane === "vocal" (VocalEditor keydown), and the workflow pane deliberately has no
+        // clipboard — same `!== "timeline"` posture as Delete above (never fire under another pane).
+        if (useAppStore.getState().activePane !== "timeline") return;
+        e.preventDefault();
+        if (e.key === "c") copySelectedSegments();
+        else if (e.key === "x") cutSelectedSegments();
+        else pasteWithFeedback();
       }
     };
     document.addEventListener("keydown", onKey);

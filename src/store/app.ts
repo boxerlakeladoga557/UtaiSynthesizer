@@ -119,6 +119,8 @@ interface AppState {
   toggleLogViewer: () => void;
   setActiveTrack: (id: string | null) => void;
   selectSegment: (trackId: string, segmentId: string) => void;
+  /** Replace the whole selection with `items` (first = primary/anchor) — S61 paste selects its output. */
+  selectSegments: (items: SegmentSelection[]) => void;
   toggleSegment: (trackId: string, segmentId: string) => void;
   /** Select a sub-lane group (all lanes of `outputNodeId`) in a segment, with the clicked piece index. */
   selectLane: (trackId: string, segmentId: string, outputNodeId: string, clipIndex: number) => void;
@@ -208,6 +210,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       selectedSegments: [{ trackId, segmentId }],
       selectedLane: null,
       activeTrackId: trackId,
+    }),
+  selectSegments: (items) =>
+    set({
+      selectedSegment: items[0] ?? null,
+      selectedSegments: items,
+      selectedLane: null,
+      activeTrackId: items[0]?.trackId ?? null,
     }),
   toggleSegment: (trackId, segmentId) =>
     set((s) => {

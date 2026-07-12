@@ -41,10 +41,12 @@
     "done": "Range test done, comfort zone",
     "failed": "Range test failed"
   },
+  "clipboard": {
+    "typeMismatch": "Clipboard content doesn't match the target track type"
+  },
   "menu": {
     "file": "File",
     "edit": "Edit",
-    "tools": "Tools",
     "settings": "Settings",
     "undo": "Undo",
     "redo": "Redo",
@@ -52,7 +54,10 @@
     "open": "Open",
     "save": "Save",
     "saveAs": "Save As",
-    "import": "Import Score"
+    "import": "Import Score",
+    "copy": "Copy",
+    "cut": "Cut",
+    "paste": "Paste"
   },
   "import": {
     "done": "Imported",
@@ -158,6 +163,9 @@
     "empty": "Drop audio files or add a new track",
     "delete": "Delete Track",
     "rename": "Rename",
+    "copyTrack": "Copy Track",
+    "pasteTrack": "Paste Track",
+    "copySuffix": "copy",
     "loading": "Loading",
     "playOriginal": "Play the original audio (sub-lanes leave the output)",
     "pickSinger": "Pick a singer (whole track)",

@@ -41,10 +41,12 @@
     "done": "音域测试完成，舒适区",
     "failed": "音域测试失败"
   },
+  "clipboard": {
+    "typeMismatch": "剪贴板内容与目标轨道类型不符"
+  },
   "menu": {
     "file": "文件",
     "edit": "编辑",
-    "tools": "工具",
     "settings": "设置",
     "undo": "撤销",
     "redo": "重做",
@@ -52,7 +54,10 @@
     "open": "打开",
     "save": "保存",
     "saveAs": "另存为",
-    "import": "导入乐谱"
+    "import": "导入乐谱",
+    "copy": "复制",
+    "cut": "剪切",
+    "paste": "粘贴"
   },
   "import": {
     "done": "已导入",
@@ -158,6 +163,9 @@
     "empty": "拖放音频文件或添加新轨道",
     "delete": "删除轨道",
     "rename": "重命名",
+    "copyTrack": "复制轨道",
+    "pasteTrack": "粘贴轨道",
+    "copySuffix": "副本",
     "loading": "加载中",
     "playOriginal": "播放原始音频（子轨道不进输出）",
     "pickSinger": "选择歌手（整条轨道）",
