@@ -694,6 +694,11 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* model-quirk chips live on their OWN line under the range row (§user: inline crowded
+   the row); the info column's 2px gap provides the rhythm, no extra top margin */
+.rm-range-caution-row {
+  margin-top: 0;
+}
 .rm-range-testing {
   color: var(--accent-primary);
 }

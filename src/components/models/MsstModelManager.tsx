@@ -1081,6 +1081,7 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
     );
   }
   return (
+    <>
     <span className="rm-range-row">
       <span
         className="rm-range-text"
@@ -1094,33 +1095,6 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
         {" · "}
         {t18({ zh: "舒适", en: "comfort", ja: "快適" }, lang)} {midiName(shown![0])}–{midiName(shown![1])}
       </span>
-      {caution!.artifact.length > 0 && (
-        <span
-          className="rm-range-caution"
-          title={`${caution!.artifact.map(([a, b]) => `${midiName(a)}–${midiName(b)}`).join(", ")} — ${t18({
-            zh: "模型在这些音高会发声但明显走音（中位误差≥200¢）——模型自身的伪影区，不是程序或算法问题；此区间谨慎使用",
-            en: "the model voices these pitches but lands ≥200¢ off — model-side artifact zones, not a program/algorithm issue; use with caution",
-            ja: "モデルはこの音高で発声しますが大きく音を外します（中央誤差≥200¢）——モデル自体のアーティファクト域です。プログラムの問題ではありません",
-          }, lang)}`}
-        >
-          {t18({ zh: "伪影", en: "artifacts", ja: "偽影" }, lang)}{" "}
-          {caution!.artifact.map(([a, b]) => `${midiName(a)}–${midiName(b)}`).join(", ")}
-        </span>
-      )}
-      {caution!.weak.length > 0 && (
-        <span
-          className="rm-range-caution"
-          title={`${caution!.weak.map((n) => midiName(n)).join(", ")} — ${t18({
-            zh: "可用区内部的孤立弱音（测试未达标、推导范围时被桥接跳过）——这些音上出怪声属模型自身问题，谨慎使用",
-            en: "isolated weak notes inside the usable range (failed the probe, bridged over when deriving) — oddities at these pitches are the model's own; use with caution",
-            ja: "使用可能域内の孤立した弱点（測定不合格・範囲導出時にブリッジ）——この音高での異音はモデル由来です",
-          }, lang)}`}
-        >
-          {t18({ zh: "弱点", en: "weak", ja: "弱点" }, lang)}{" "}
-          {caution!.weak.slice(0, 3).map((n) => midiName(n)).join(", ")}
-          {caution!.weak.length > 3 ? ` +${caution!.weak.length - 3}` : ""}
-        </span>
-      )}
       {editing ? (
         <span className="rm-range-edit">
           <ParamSlider
@@ -1159,6 +1133,38 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
         </>
       )}
     </span>
+    {(caution!.artifact.length > 0 || caution!.weak.length > 0) && (
+      <span className="rm-range-row rm-range-caution-row">
+        {caution!.artifact.length > 0 && (
+          <span
+            className="rm-range-caution"
+            title={`${caution!.artifact.map(([a, b]) => `${midiName(a)}–${midiName(b)}`).join(", ")} — ${t18({
+              zh: "模型在这些音高会发声但明显走音（中位误差≥200¢）——模型自身的伪影区，不是程序或算法问题；此区间谨慎使用",
+              en: "the model voices these pitches but lands ≥200¢ off — model-side artifact zones, not a program/algorithm issue; use with caution",
+              ja: "モデルはこの音高で発声しますが大きく音を外します（中央誤差≥200¢）——モデル自体のアーティファクト域です。プログラムの問題ではありません",
+            }, lang)}`}
+          >
+            {t18({ zh: "伪影", en: "artifacts", ja: "偽影" }, lang)}{" "}
+            {caution!.artifact.map(([a, b]) => `${midiName(a)}–${midiName(b)}`).join(", ")}
+          </span>
+        )}
+        {caution!.weak.length > 0 && (
+          <span
+            className="rm-range-caution"
+            title={`${caution!.weak.map((n) => midiName(n)).join(", ")} — ${t18({
+              zh: "可用区内部的孤立弱音（测试未达标、推导范围时被桥接跳过）——这些音上出怪声属模型自身问题，谨慎使用",
+              en: "isolated weak notes inside the usable range (failed the probe, bridged over when deriving) — oddities at these pitches are the model's own; use with caution",
+              ja: "使用可能域内の孤立した弱点（測定不合格・範囲導出時にブリッジ）——この音高での異音はモデル由来です",
+            }, lang)}`}
+          >
+            {t18({ zh: "弱点", en: "weak", ja: "弱点" }, lang)}{" "}
+            {caution!.weak.slice(0, 3).map((n) => midiName(n)).join(", ")}
+            {caution!.weak.length > 3 ? ` +${caution!.weak.length - 3}` : ""}
+          </span>
+        )}
+      </span>
+    )}
+    </>
   );
 }
 
