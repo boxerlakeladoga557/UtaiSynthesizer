@@ -182,8 +182,8 @@ export function SpeakerSelect({ model, value, onChange, lang }: {
  * ①c speaker-blend stack — the multi-speaker replacement for SpeakerSelect on a GENUINE spk_mix
  * export (gate: voiceHasSpkMix). A list of {id, weight} rows (Rust normalizes to sum 1 and builds
  * the dense spk_mix vector); each row shows the speaker name + a weight slider reading its
- * effective blend %. SHARED by RvcNode + SoVitsNode. Modeled on EffectsNode's params.effects[]
- * stack — derived from GRAPH params (never a useState mirror; the modal-local undo restores
+ * effective blend %. SHARED by RvcNode + SoVitsNode. Modeled on the old Effects node's stack
+ * pattern — derived from GRAPH params (never a useState mirror; the modal-local undo restores
  * params via setNodes WITHOUT remounting, so a mirror would re-commit undone rows) and every
  * mutation is a single onChange for clean single-step JSON-diff undo. An EMPTY stack degrades to
  * the default speaker 0 (byte-identical to picking that one speaker). Reuses the `.fx-*` CSS.

@@ -347,7 +347,7 @@
     "clearRender": "レンダリングをクリア",
     "nodes": "ノード",
     "catVoice": "ボイス変換",
-    "catEffects": "エフェクト",
+    "catEffects": "処理",
     "catSeparation": "音声分離",
     "catIO": "入出力",
     "nodeOutput": "トラックへ出力",

@@ -18,16 +18,22 @@ extern "C" {
 
 // Returns 0 on success, non-zero on failure. `output` must hold out_samples * channels floats,
 // where out_samples = (int)llround(in_samples * time_factor) as computed by the Rust caller.
+// `transpose_semitones` = 0 keeps the original pitch (pure time-stretch); non-zero pitch-shifts
+// in the spectral domain (formant/tonality-aware — the upstream-recommended ~8 kHz tonality
+// limit keeps highs/air natural on full mixes).
 int utai_stretch_exact(const float* input, int in_samples, int channels, float sample_rate,
-                       double time_factor, float* output, int out_samples) {
+                       double time_factor, double transpose_semitones, float* output,
+                       int out_samples) {
     if (!input || !output || in_samples <= 0 || out_samples <= 0 || channels <= 0 ||
-        sample_rate <= 0.0f || !(time_factor > 0.0)) {
+        sample_rate <= 0.0f || !(time_factor > 0.0) || !std::isfinite(transpose_semitones)) {
         return 1;
     }
     try {
         signalsmith::stretch::SignalsmithStretch<float> stretch;
         stretch.presetDefault(channels, sample_rate);
-        // tempo-only change: transpose stays 1.0 (the default) — pitch is preserved
+        if (transpose_semitones != 0.0) {
+            stretch.setTransposeSemitones((float)transpose_semitones, 8000.0f / sample_rate);
+        }
 
         const int in_lat = stretch.inputLatency();
         const int out_lat = stretch.outputLatency();

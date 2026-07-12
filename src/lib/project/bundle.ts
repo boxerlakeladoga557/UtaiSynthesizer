@@ -178,6 +178,27 @@ export function parseLoadedBundle(projectJson: string, dir: string): LoadedProje
     const segments = (t.segments ?? []).map((s): Segment => {
       const rest: Segment = { ...s };
       delete rest.loading;
+      // S61 MIGRATION: the dead Effects node family (persisted as pitchShift / formantShift /
+      // audioEnhance) → the Transpose node, HERE at the single load choke point so neither the
+      // editor nor the engine ever sees the legacy types. Node id/position/edges are kept (lane
+      // identity embeds node ids — re-keying would orphan deposited lanes); the only meaningful
+      // legacy param (a pitchShift entry's semitones) is carried, everything else was dead
+      // (formant/enhance were unreachable Err stubs in the old Rust path).
+      if (rest.workflow?.nodes.some((n) => ["pitchShift", "formantShift", "audioEnhance"].includes(n.nodeType as string))) {
+        rest.workflow = {
+          ...rest.workflow,
+          nodes: rest.workflow.nodes.map((n) => {
+            if (!["pitchShift", "formantShift", "audioEnhance"].includes(n.nodeType as string)) return n;
+            const fx = Array.isArray(n.params?.effects)
+              ? (n.params.effects as Array<{ type?: string; params?: Record<string, unknown> }>)
+              : [];
+            const pitch = fx.find((e) => e?.type === "pitchShift");
+            const rawSemis = Number(pitch?.params?.semitones ?? n.params?.semitones ?? 0);
+            const semitones = Number.isFinite(rawSemis) ? Math.max(-24, Math.min(24, Math.round(rawSemis))) : 0;
+            return { ...n, nodeType: "transpose" as const, params: { semitones } };
+          }),
+        };
+      }
       let content = rest.content;
       if (content.type === "audioClip") {
         content = { ...content, sourcePath: resolve(content.sourcePath) };

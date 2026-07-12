@@ -85,7 +85,7 @@ pub fn export(buffer: &AudioBuffer, path: &Path, config: &ExportConfig) -> Resul
     }
 
     if config.normalize {
-        output = super::effects::normalize(&output, config.normalize_target_db);
+        output = normalize(&output, config.normalize_target_db);
     }
 
     match config.format {
@@ -96,6 +96,30 @@ pub fn export(buffer: &AudioBuffer, path: &Path, config: &ExportConfig) -> Resul
             // For now, fall back to WAV
             super::save_wav(path, &output)
         }
+    }
+}
+
+/// Peak-normalize to `target_db` dBFS (moved from the deleted audio/effects.rs — export is its
+/// only consumer; the S60-batch removed the dead Effects node that owned the rest of that file).
+fn normalize(buffer: &AudioBuffer, target_db: f32) -> AudioBuffer {
+    let peak = buffer
+        .samples
+        .iter()
+        .map(|s| s.abs())
+        .fold(0.0f32, f32::max);
+
+    if peak < 1e-10 {
+        return buffer.clone();
+    }
+
+    let target_linear = 10.0f32.powf(target_db / 20.0);
+    let gain = target_linear / peak;
+    let samples: Vec<f32> = buffer.samples.iter().map(|&s| s * gain).collect();
+
+    AudioBuffer {
+        samples,
+        sample_rate: buffer.sample_rate,
+        channels: buffer.channels,
     }
 }
 

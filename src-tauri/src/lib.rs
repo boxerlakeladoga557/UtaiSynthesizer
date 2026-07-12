@@ -715,7 +715,7 @@ pub fn run() {
             commands::models::attach_diffusion,
             commands::audio::load_audio_file,
             commands::audio::probe_audio_duration,
-            commands::audio::process_effects,
+            commands::audio::transpose_audio,
             commands::audio::save_temp_audio,
             commands::audio::ensure_cache_dir,
             commands::audio::save_binary_file,

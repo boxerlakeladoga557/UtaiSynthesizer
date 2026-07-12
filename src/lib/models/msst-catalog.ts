@@ -19,7 +19,7 @@ export interface MsstCatalogEntry {
 }
 
 /** Pick the active-language string from an I18nText. ONE source of truth for the zh/ja/en dispatch
- *  (previously copy-pasted as t18/l in SeparationNode, NodePalette, MsstModelManager, EffectsNode). */
+ *  (previously copy-pasted as t18/l in SeparationNode, NodePalette, MsstModelManager). */
 export function t18(text: I18nText, lang: string): string {
   if (lang === "zh") return text.zh;
   if (lang === "ja") return text.ja;

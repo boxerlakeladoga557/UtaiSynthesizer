@@ -311,9 +311,10 @@ export type WorkflowNodeType =
   | "output"
   | "rvc"
   | "sovits"
-  | "pitchShift"
-  | "formantShift"
-  | "audioEnhance"
+  // S61: fidelity pitch-shift (Signalsmith spectral transpose) — replaced the dead Effects node.
+  // Legacy graphs' "pitchShift"/"formantShift"/"audioEnhance" nodes migrate to it at LOAD
+  // (parseLoadedBundle), so they never reach the editor/engine.
+  | "transpose"
   | "msstSeparation"
   | "split";
 

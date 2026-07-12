@@ -5,18 +5,25 @@
 //! Slider's range. The Tempo Slider feeds it whole sources/stems; output length is exactly
 //! round(input_len × factor) per channel (the upstream exact-length recipe).
 
-/// `time_factor` = output duration / input duration (>1 = slower/longer). Pitch is unchanged.
+/// `time_factor` = output duration / input duration (>1 = slower/longer).
+/// `transpose_semitones` = spectral-domain pitch shift (0 = pitch unchanged); tonality-aware
+/// (~8 kHz limit inside the shim) so full mixes keep natural highs — the S60-batch Transpose
+/// node's engine (instrumental transposition; the vocal path has its own model-side transpose).
 pub fn stretch_interleaved(
     input: &[f32],
     channels: usize,
     sample_rate: u32,
     time_factor: f64,
+    transpose_semitones: f64,
 ) -> Result<Vec<f32>, String> {
     if channels == 0 || input.len() % channels != 0 {
         return Err("STRETCH_BAD_INPUT".into());
     }
     if !(time_factor.is_finite() && time_factor > 0.0) {
         return Err("STRETCH_RATIO_RANGE".into());
+    }
+    if !transpose_semitones.is_finite() {
+        return Err("TRANSPOSE_RANGE".into());
     }
     let in_samples = input.len() / channels;
     if in_samples == 0 {
@@ -31,6 +38,7 @@ pub fn stretch_interleaved(
             channels as i32,
             sample_rate as f32,
             time_factor,
+            transpose_semitones,
             output.as_mut_ptr(),
             out_samples as i32,
         )
@@ -48,6 +56,7 @@ extern "C" {
         channels: i32,
         sample_rate: f32,
         time_factor: f64,
+        transpose_semitones: f64,
         output: *mut f32,
         out_samples: i32,
     ) -> i32;
@@ -95,7 +104,7 @@ mod tests {
     fn exact_output_length() {
         let x = sine_stereo(440.0, 2 * SR as usize);
         for factor in [0.75f64, 1.0, 1.25, 1.5] {
-            let y = stretch_interleaved(&x, 2, SR, factor).expect("stretch");
+            let y = stretch_interleaved(&x, 2, SR, factor, 0.0).expect("stretch");
             let expected = ((2 * SR as usize) as f64 * factor).round() as usize * 2;
             assert_eq!(y.len(), expected, "factor={factor}");
             assert!(y.iter().all(|v| v.is_finite()));
@@ -108,7 +117,7 @@ mod tests {
         let x = sine_stereo(f0, 3 * SR as usize);
         let expected = (SR as f32 / f0).round() as usize; // ~200 samples
         for factor in [0.8f64, 1.3] {
-            let y = stretch_interleaved(&x, 2, SR, factor).expect("stretch");
+            let y = stretch_interleaved(&x, 2, SR, factor, 0.0).expect("stretch");
             let mono = mono_left(&y);
             // measure well inside the output (skip edges)
             let mid = &mono[mono.len() / 4..mono.len() * 3 / 4];
@@ -121,9 +130,31 @@ mod tests {
     }
 
     #[test]
+    fn transpose_shifts_pitch_and_keeps_length() {
+        let f0 = 220.0f32;
+        let x = sine_stereo(f0, 3 * SR as usize);
+        for semis in [-5.0f64, 4.0, 12.0] {
+            let y = stretch_interleaved(&x, 2, SR, 1.0, semis).expect("transpose");
+            // pure transpose: sample-exact same length
+            assert_eq!(y.len(), x.len(), "semis={semis}");
+            let shifted = f0 * (2.0f32).powf(semis as f32 / 12.0);
+            let expected = (SR as f32 / shifted).round() as usize;
+            let mono = mono_left(&y);
+            let mid = &mono[mono.len() / 4..mono.len() * 3 / 4];
+            let p = est_period(mid, expected.saturating_sub(20).max(8), expected + 20);
+            // spectral shift tolerance: within ~1.5% of the target period
+            let tol = (expected as f32 * 0.015).ceil() as i32 + 1;
+            assert!(
+                (p as i32 - expected as i32).abs() <= tol,
+                "semis={semis} period {p} vs {expected} (tol {tol})"
+            );
+        }
+    }
+
+    #[test]
     fn energy_is_sane() {
         let x = sine_stereo(330.0, 2 * SR as usize);
-        let y = stretch_interleaved(&x, 2, SR, 1.2).expect("stretch");
+        let y = stretch_interleaved(&x, 2, SR, 1.2, 0.0).expect("stretch");
         let ex = x.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / x.len() as f64;
         let ey = y.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / y.len() as f64;
         assert!(ey > ex * 0.25 && ey < ex * 4.0, "mean energy in={ex} out={ey}");
@@ -136,7 +167,7 @@ mod tests {
         for n in [64usize, 441, 2205] {
             let x = sine_stereo(440.0, n);
             for factor in [0.75f64, 1.0, 1.4] {
-                let y = stretch_interleaved(&x, 2, SR, factor).expect("short stretch");
+                let y = stretch_interleaved(&x, 2, SR, factor, 0.0).expect("short stretch");
                 assert_eq!(y.len(), ((n as f64) * factor).round().max(1.0) as usize * 2);
                 assert!(y.iter().all(|v| v.is_finite()));
             }
@@ -145,8 +176,9 @@ mod tests {
 
     #[test]
     fn rejects_bad_args() {
-        assert!(stretch_interleaved(&[0.0; 10], 3, SR, 1.2).is_err()); // not divisible
-        assert!(stretch_interleaved(&[0.0; 8], 2, SR, f64::NAN).is_err());
-        assert!(stretch_interleaved(&[0.0; 8], 2, SR, 0.0).is_err());
+        assert!(stretch_interleaved(&[0.0; 10], 3, SR, 1.2, 0.0).is_err()); // not divisible
+        assert!(stretch_interleaved(&[0.0; 8], 2, SR, f64::NAN, 0.0).is_err());
+        assert!(stretch_interleaved(&[0.0; 8], 2, SR, 0.0, 0.0).is_err());
+        assert!(stretch_interleaved(&[0.0; 8], 2, SR, 1.0, f64::NAN).is_err());
     }
 }

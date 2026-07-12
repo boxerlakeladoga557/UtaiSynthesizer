@@ -423,19 +423,6 @@
   color: var(--color-error, #ff4466);
 }
 
-.fx-params {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-top: var(--space-xs);
-}
-
-.fx-desc {
-  font-size: 9px;
-  color: var(--text-muted);
-  margin-top: 2px;
-}
-
 .fx-add-row select {
   font-size: 10px;
   font-family: var(--font-mono);

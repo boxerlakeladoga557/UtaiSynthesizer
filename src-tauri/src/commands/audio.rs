@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::State;
 
-use crate::audio::effects::Effect;
 use crate::AppState;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -19,19 +18,6 @@ pub struct AudioFileInfo {
     /// no consumer — reserved for a future frontend-side dedup UI).
     #[serde(default)]
     pub content_hash: String,
-}
-
-#[derive(serde::Deserialize)]
-pub struct EffectRequest {
-    pub audio_path: String,
-    pub effects: Vec<Effect>,
-    pub output_path: Option<String>,
-}
-
-#[derive(serde::Serialize)]
-pub struct EffectResult {
-    pub output_path: String,
-    pub duration_secs: f64,
 }
 
 /// Per-call unique suffix for the content-addressed WAV temp file (see load_audio_file).
@@ -225,42 +211,50 @@ fn trim_codec_silence(mut buf: crate::audio::AudioBuffer) -> crate::audio::Audio
     buf
 }
 
+/// Fidelity pitch-shift (transpose) of a whole file — the workflow Transpose node's engine.
+/// Spectral-domain via Signalsmith Stretch (time_factor = 1.0 → sample-exact same length),
+/// formant/tonality-aware, polyphonic-safe (built for instrumentals; the vocal path transposes
+/// model-side instead). Writes a 32-bit float WAV to `output_path` (a run-unique workflow cache
+/// path — path change IS the re-render signal, so no content-addressing here). Errors are stable
+/// CODEs per the i18n rule: TRANSPOSE_RANGE / TRANSPOSE_INPUT_MISSING / STRETCH_ENGINE_FAILED.
 #[tauri::command]
-pub async fn process_effects(
-    state: State<'_, Arc<AppState>>,
-    request: EffectRequest,
-) -> Result<EffectResult, String> {
-    let mut buffer = crate::audio::load_audio(&PathBuf::from(&request.audio_path))
-        .map_err(|e| e.to_string())?;
-
-    let nsf_session: Option<&str> = None;
-
-    for effect in &request.effects {
-        buffer = crate::audio::effects::apply_effect(
-            &buffer,
-            effect,
-            &state.inference.engine,
-            nsf_session,
-        )
-        .map_err(|e| e.to_string())?;
+pub async fn transpose_audio(
+    path: String,
+    semitones: f64,
+    output_path: String,
+) -> Result<StretchResult, String> {
+    if !(semitones.is_finite() && (-24.0..=24.0).contains(&semitones)) {
+        return Err("TRANSPOSE_RANGE".to_string());
     }
-
-    let output_path = request.output_path.unwrap_or_else(|| {
-        let input = PathBuf::from(&request.audio_path);
-        let stem = input.file_stem().unwrap_or_default().to_string_lossy();
-        input
-            .with_file_name(format!("{}_processed.wav", stem))
-            .to_string_lossy()
-            .to_string()
-    });
-
-    crate::audio::save_wav(&PathBuf::from(&output_path), &buffer)
-        .map_err(|e| e.to_string())?;
-
-    Ok(EffectResult {
-        output_path,
-        duration_secs: buffer.duration_secs(),
+    tauri::async_runtime::spawn_blocking(move || {
+        let input = PathBuf::from(&path);
+        let buf = crate::audio::load_audio(&input).map_err(|e| format!("TRANSPOSE_INPUT_MISSING: {e}"))?;
+        let shifted = utai_stretch::stretch_interleaved(
+            &buf.samples,
+            buf.channels.max(1) as usize,
+            buf.sample_rate,
+            1.0,
+            semitones,
+        )?;
+        let out_buf = crate::audio::AudioBuffer {
+            samples: shifted,
+            sample_rate: buf.sample_rate,
+            channels: buf.channels.max(1),
+        };
+        let out = PathBuf::from(&output_path);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        crate::audio::save_wav_f32(&out, &out_buf).map_err(|e| format!("STRETCH_ENGINE_FAILED: {e}"))?;
+        Ok(StretchResult {
+            output_path,
+            duration_ms: out_buf.duration_secs() * 1000.0,
+            sample_rate: out_buf.sample_rate,
+            channels: out_buf.channels,
+        })
     })
+    .await
+    .map_err(|e| format!("STRETCH_JOIN: {e}"))?
 }
 
 #[tauri::command]
@@ -418,6 +412,7 @@ pub async fn stretch_segment_audio(
             buf.channels.max(1) as usize,
             buf.sample_rate,
             time_factor,
+            0.0,
         )?;
         let out_buf = crate::audio::AudioBuffer {
             samples: stretched,

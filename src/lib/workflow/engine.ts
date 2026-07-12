@@ -431,27 +431,20 @@ async function executeNode(
       break;
     }
 
-    case "pitchShift":
-    case "formantShift":
-    case "audioEnhance": {
-      const effectsList = Array.isArray(params.effects)
-        ? (params.effects as Array<{ type: string; params: Record<string, unknown> }>).map(
-            (fx) => buildEffect(fx.type === "enhance" ? "audioEnhance" : fx.type, fx.params),
-          )
-        : [buildEffect(nodeType, params)];
-
-      if (effectsList.length === 0) {
+    case "transpose": {
+      // Fidelity transpose (spectral, Signalsmith) — built for instrumentals. 0 = exact
+      // passthrough: forward the input path untouched so an inert node costs nothing and
+      // downstream lanes keep byte-identical audio.
+      const semitones = typeof params.semitones === "number" ? params.semitones : 0;
+      if (semitones === 0) {
         outputData.set(0, primaryInput);
         break;
       }
-
-      const outputPath = `${cacheDir}/${nodeId}_fx.wav`;
-      await invoke("process_effects", {
-        request: {
-          audio_path: primaryInput,
-          effects: effectsList,
-          output_path: outputPath,
-        },
+      const outputPath = `${cacheDir}/${nodeId}_transpose.wav`;
+      await invoke("transpose_audio", {
+        path: primaryInput,
+        semitones,
+        outputPath,
       });
       outputData.set(0, outputPath);
       break;
@@ -785,26 +778,10 @@ export function rehydrateRenderState(
   if (Object.keys(nodeOutputs).length === 0) return;
   // Mark "completed" ONLY the nodes whose output we ACTUALLY warmed (the deposited lanes' DIRECT feeders)
   // plus the Output nodes — so a green badge always means "cache-backed / reusable". A deeper ancestor in a
-  // chain (separation → effects → output) is NOT warmable (only the deposited lane's direct-feeder audio is
+  // chain (separation → transpose → output) is NOT warmable (only the deposited lane's direct-feeder audio is
   // persisted), so greening it would be a badge no cache backs — and single-running a downstream node would
   // still re-run it. This also matches the user's rationale ("we kept the separation RESULT" = the deposited
   // lane = the direct feeder). The common input→separation→output graph still greens the separation node,
   // since it IS the direct feeder. (Excludes the input node too — a real run never sets its status.)
   store.hydrateRenderState(segmentId, nodeOutputs, [...Object.keys(nodeOutputs), ...outputIds]);
-}
-
-function buildEffect(
-  nodeType: string,
-  params: Record<string, unknown>,
-): Record<string, unknown> {
-  switch (nodeType) {
-    case "pitchShift":
-      return { PitchShift: { semitones: params.semitones ?? 0, vocoder: params.vocoder ?? "World" } };
-    case "formantShift":
-      return { FormantShift: { ratio: params.ratio ?? 1.0, vocoder: params.vocoder ?? "World" } };
-    case "audioEnhance":
-      return { AudioEnhance: {} };
-    default:
-      return {};
-  }
 }

@@ -347,7 +347,7 @@
     "clearRender": "清除渲染",
     "nodes": "节点",
     "catVoice": "声音转换",
-    "catEffects": "效果器",
+    "catEffects": "处理",
     "catSeparation": "音频分离",
     "catIO": "输入/输出",
     "nodeOutput": "输出到轨道",

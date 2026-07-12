@@ -25,7 +25,7 @@ import { AudioOutputNode } from "./nodes/AudioOutputNode";
 import { RvcNode } from "./nodes/RvcNode";
 import { SoVitsNode } from "./nodes/SoVitsNode";
 import { SeparationNode } from "./nodes/SeparationNode";
-import { EffectsNode } from "./nodes/EffectsNode";
+import { TransposeNode } from "./nodes/TransposeNode";
 import { NodePalette } from "./NodePalette";
 import { useProjectStore } from "../../store/project";
 import { useAudioStore } from "../../store/audio";
@@ -50,10 +50,10 @@ const nodeTypes: NodeTypes = {
   rvc: RvcNode,
   sovits: SoVitsNode,
   separation: SeparationNode,
-  effects: EffectsNode,
-  // Legacy — kept for loading old workflows. Only "msst" can actually reach ReactFlow: the palette has
-  // never emitted the raw effect names, and wfTypeToRfType maps every legacy wf nodeType to "effects"
-  // before they get here.
+  transpose: TransposeNode,
+  // Legacy — kept for loading old workflows ("msst" was the pre-catalog separation type).
+  // The dead Effects node types (pitchShift/formantShift/audioEnhance) are migrated to
+  // "transpose" at LOAD (parseLoadedBundle), so they never reach ReactFlow.
   msst: SeparationNode,
 };
 
@@ -63,7 +63,7 @@ const rfTypeToWfType: Record<string, WorkflowNodeType> = {
   rvc: "rvc",
   sovits: "sovits",
   separation: "msstSeparation",
-  effects: "pitchShift",
+  transpose: "transpose",
   msst: "msstSeparation",
 };
 
@@ -73,9 +73,7 @@ const wfTypeToRfType: Record<string, string> = {
   rvc: "rvc",
   sovits: "sovits",
   msstSeparation: "separation",
-  pitchShift: "effects",
-  formantShift: "effects",
-  audioEnhance: "effects",
+  transpose: "transpose",
 };
 
 interface Props {

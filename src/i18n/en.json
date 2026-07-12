@@ -347,7 +347,7 @@
     "clearRender": "Clear Render",
     "nodes": "Nodes",
     "catVoice": "Voice Conversion",
-    "catEffects": "Effects",
+    "catEffects": "Processing",
     "catSeparation": "Separation",
     "catIO": "Input / Output",
     "nodeOutput": "Output to track",

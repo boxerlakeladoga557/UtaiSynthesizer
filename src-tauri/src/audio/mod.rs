@@ -1,4 +1,3 @@
-pub mod effects;
 pub mod export;
 pub mod resample;
 
