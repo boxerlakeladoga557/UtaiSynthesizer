@@ -126,8 +126,9 @@
   background: var(--accent-primary-glow);
 }
 
-/* S64 help "?" — square icon variant of .titlebar-btn (the SVG glyph replaces text). */
+/* S64 help "?" — icon variant of .menu-item, tail of the app menus (S64b: next to the training
+   button it read as training-specific help). Flex centers the SVG on the text baseline row. */
 .titlebar-help {
-  width: 24px;
-  padding: 0;
+  display: flex;
+  align-items: center;
 }

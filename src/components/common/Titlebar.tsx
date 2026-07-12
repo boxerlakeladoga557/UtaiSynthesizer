@@ -134,6 +134,28 @@ export function Titlebar() {
           <button className={`menu-item ${modelManagerOpen ? "active" : ""}`} onClick={toggleModelManager}>{t("titlebar.models")}</button>
           <button className={`menu-item ${settingsOpen ? "active" : ""}`} onClick={toggleSettings}>{t("menu.settings")}</button>
           <button className={`menu-item ${logViewerOpen ? "active" : ""}`} onClick={toggleLogViewer}>{t("titlebar.log")}</button>
+          {/* Help/community sits at the END of the app menus — next to the training button it read
+              as training-specific guidance (user, S64b). */}
+          <button
+            className={`menu-item titlebar-help ${helpMenu ? "active" : ""}`}
+            title={t("help.title")}
+            onClick={(e) => {
+              const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+              setHelpMenu({ x: r.left, y: r.bottom });
+            }}
+          >
+            {/* Angular question mark — square caps/joins, themed stroke (house SVG style, no raw emoji). */}
+            <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+              <path
+                d="M8 9 V8 a4 4 0 0 1 4-4 a4 4 0 0 1 4 4 v0.5 c0 1.8-1.4 2.6-2.6 3.4 c-1 0.65-1.4 1.3-1.4 2.6 v0.5"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.2"
+                strokeLinecap="square"
+              />
+              <rect x="10.9" y="18" width="2.4" height="2.4" fill="currentColor" />
+            </svg>
+          </button>
         </nav>
       </div>
 
@@ -156,26 +178,6 @@ export function Titlebar() {
           onClick={toggleTrainingPage}
         >
           {t("titlebar.training")}
-        </button>
-        <button
-          className={`titlebar-btn titlebar-help ${helpMenu ? "active" : ""}`}
-          title={t("help.title")}
-          onClick={(e) => {
-            const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-            setHelpMenu({ x: r.left, y: r.bottom });
-          }}
-        >
-          {/* Angular question mark — square caps/joins, themed stroke (house SVG style, no raw emoji). */}
-          <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
-            <path
-              d="M8 9 V8 a4 4 0 0 1 4-4 a4 4 0 0 1 4 4 v0.5 c0 1.8-1.4 2.6-2.6 3.4 c-1 0.65-1.4 1.3-1.4 2.6 v0.5"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.2"
-              strokeLinecap="square"
-            />
-            <rect x="10.9" y="18" width="2.4" height="2.4" fill="currentColor" />
-          </svg>
         </button>
       </div>
 
