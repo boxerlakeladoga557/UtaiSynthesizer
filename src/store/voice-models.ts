@@ -164,6 +164,13 @@ export function voiceFeatureDim(m: VoiceModelEntry): number | null {
  * embedding row → silent garbage). RVC sidecars carry no map → single-speaker → no dropdown.
  * Options are sorted by id and labelled with the real speaker name.
  */
+/** S60c: the model carries at least one tested speaker range — gates the range-extend UI
+ * (an untested model's toggle would be a confusing no-op; test it in the resource manager). */
+export function voiceHasRangeRecord(m: VoiceModelEntry | undefined | null): boolean {
+  const rec = (m?.config as { vocal_range?: { speakers?: Record<string, unknown> } } | undefined)?.vocal_range;
+  return !!rec?.speakers && Object.keys(rec.speakers).length > 0;
+}
+
 export function voiceSpeakerOptions(m: VoiceModelEntry): { id: number; label: string }[] {
   const map = m.config?.speakers;
   if (!map || typeof map !== "object" || Array.isArray(map)) return [];

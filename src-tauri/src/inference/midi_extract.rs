@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::inference::engine::{DeviceConfig, InputTensor, OnnxEngine, OutputTensor};
+use crate::inference::engine::{InputTensor, OnnxEngine, OutputTensor};
 
 pub const GAME_FILES: [&str; 5] = [
     "config.json",
@@ -256,18 +256,26 @@ struct GameSessions {
     samplerate: u32,
 }
 
-fn load_sessions(engine: &OnnxEngine, models_dir: &Path) -> Result<GameSessions, String> {
+fn load_sessions(engine: &OnnxEngine, models_dir: &Path, force_cpu: bool) -> Result<GameSessions, String> {
     if !game_installed(models_dir) {
         return Err("MIDI_EXTRACT_NOT_INSTALLED".to_string());
     }
     let config = load_game_config(models_dir)?;
     let dir = game_dir(models_dir);
-    // CPU like the aux extractors (dynamic shapes → mem_pattern off); fast enough and
-    // never competes with voice synthesis for VRAM.
+    // S60c (§user): follow the GLOBAL device preference (Auto probes CUDA→DirectML→CPU with
+    // CPU fallback) — forced CPU was noticeably slow on long stems. Dynamic shapes → mem
+    // pattern off. Sessions are unloaded when the last extraction finishes (refcount), so
+    // the GPU-class session cache pressure is transient. `force_cpu` = the run-time fallback
+    // path (a GPU stack can pass session BUILD yet fail at the first conv — e.g. a cudnn
+    // frontend engine DLL that won't resolve); extract_notes retries once on CPU.
     let mut load = |name: &str| {
-        engine
-            .load_model_on(&dir.join(name), false, DeviceConfig::Cpu)
-            .map_err(|e| format!("MIDI_EXTRACT_LOAD_FAILED: {name}: {e}"))
+        let path = dir.join(name);
+        if force_cpu {
+            engine.load_model_on(&path, false, super::engine::DeviceConfig::Cpu)
+        } else {
+            engine.load_model_with(&path, false)
+        }
+        .map_err(|e| format!("MIDI_EXTRACT_LOAD_FAILED: {name}: {e}"))
     };
     Ok(GameSessions {
         encoder: load("encoder.onnx")?,
@@ -432,6 +440,10 @@ fn assemble_notes(
 /// Extract notes from a mono waveform at the model's samplerate (44100). `language_id`
 /// follows config.json's map (0 = universal — our only caller; the field exists for parity
 /// with the official CLI). Progress is 0..1 over input samples.
+///
+/// Device policy (S60c): try the GLOBAL device first; on a RUN-TIME inference failure
+/// (session build can succeed while the first conv still fails — brittle GPU stacks) the
+/// whole extraction retries ONCE on forced CPU. Cancellation is never retried.
 pub fn extract_notes(
     engine: &OnnxEngine,
     models_dir: &Path,
@@ -440,7 +452,29 @@ pub fn extract_notes(
     cancelled: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(f32),
 ) -> Result<Vec<GameNote>, String> {
-    let s = load_sessions(engine, models_dir)?;
+    match extract_notes_on(engine, models_dir, samples, language_id, cancelled, progress, false) {
+        Err(e)
+            if !e.contains("MIDI_EXTRACT_CANCELLED")
+                && !e.contains("MIDI_EXTRACT_NOT_INSTALLED") =>
+        {
+            tracing::warn!("GAME on the global device failed ({e}) — retrying once on CPU");
+            unload_sessions(engine, models_dir);
+            extract_notes_on(engine, models_dir, samples, language_id, cancelled, progress, true)
+        }
+        r => r,
+    }
+}
+
+fn extract_notes_on(
+    engine: &OnnxEngine,
+    models_dir: &Path,
+    samples: &[f32],
+    language_id: i64,
+    cancelled: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(f32),
+    force_cpu: bool,
+) -> Result<Vec<GameNote>, String> {
+    let s = load_sessions(engine, models_dir, force_cpu)?;
     let sr = s.samplerate;
     let chunks = slice_silence(samples, sr);
     tracing::info!("GAME: {} chunk(s) from {:.1}s audio", chunks.len(), samples.len() as f64 / sr as f64);

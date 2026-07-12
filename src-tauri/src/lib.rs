@@ -323,8 +323,25 @@ pub fn setup_cuda_dll_paths(app_dir: &std::path::Path) {
                 .collect();
             let new_path = format!("{};{}", additions.join(";"), current_path);
             std::env::set_var("PATH", &new_path);
+            // S60c: ALSO register via AddDllDirectory — cudnn 9's FRONTEND path lazily loads
+            // its engine DLLs (cudnn_engines_tensor_ir64_9.dll etc.) with LOAD_LIBRARY_SEARCH_*
+            // semantics that IGNORE PATH once the process is in default-dirs mode; the PATH
+            // prepend alone left GAME's convs failing CUDNN_FE on CUDA while the classic-API
+            // convs (voice models) kept working.
+            extern "system" {
+                fn AddDllDirectory(new_directory: *const u16) -> *mut std::ffi::c_void;
+            }
             for dir in &dirs_to_add {
-                tracing::info!("Added to PATH for CUDA: {}", dir.display());
+                let wide: Vec<u16> = dir
+                    .as_os_str()
+                    .to_string_lossy()
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                unsafe {
+                    AddDllDirectory(wide.as_ptr());
+                }
+                tracing::info!("Added to PATH+DllDirectory for CUDA: {}", dir.display());
             }
         }
     }
@@ -683,6 +700,8 @@ pub fn run() {
             commands::training::check_training_workspace,
             commands::training::get_training_workspace_info,
             commands::audition::render_model_audition,
+            commands::audition::render_candidate_scale,
+            commands::audition::set_candidate_vocal_range,
             commands::audition::render_audition_voice,
             commands::audition::render_audition_vocoder,
             commands::audition::render_audition_diffusion,

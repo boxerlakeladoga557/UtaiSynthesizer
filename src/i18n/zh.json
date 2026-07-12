@@ -339,7 +339,8 @@
     "needName": "请先填写模型名称",
     "dropHint": "拖放到此处以添加为训练数据",
     "pausePreview": "暂停",
-    "loadingPreview": "加载中…"
+    "loadingPreview": "加载中…",
+    "ckptRangeTip": "自动音域测试结果（舒适区）——训练试听会自动把偏高的试听片段移调进该区间再移回"
   },
   "workflow": {
     "title": "工作流编辑器",

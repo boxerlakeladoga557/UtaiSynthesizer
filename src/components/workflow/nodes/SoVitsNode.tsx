@@ -6,7 +6,7 @@ import { useNodeParams } from "./useNodeParams";
 import { ParamSlider, formatRatio } from "./ParamSlider";
 import { VoiceModelPicker, SpeakerSelect, SpeakerBlend, useVoiceModelSelection, GpuExtractRow, VocoderSelect, VOICE_STRINGS } from "./VoiceModelPicker";
 import { SOVITS_DEFAULTS, DIFFUSION_METHODS, type SpkMixEntry } from "../../../lib/workflow/voiceDefaults";
-import { voiceHasDiffusion, voiceHasAutoF0, voiceHasSpkMix } from "../../../store/voice-models";
+import { voiceHasDiffusion, voiceHasAutoF0, voiceHasRangeRecord, voiceHasSpkMix } from "../../../store/voice-models";
 import type { VoiceModelEntry } from "../../../store/voice-models";
 import { t18 } from "../../../lib/models/msst-catalog";
 
@@ -235,8 +235,9 @@ export function SoVitsNode(props: NodeProps) {
             </div>
             )}
 
-            {/* S60-2 音域扩展 — v1 recipe on the cover path (chunk-level tier + TD-PSOLA back).
-                No-op until the model carries a vocal_range record (资源管理器 → 测音域). */}
+            {/* S60-2 音域扩展 — v1 recipe on the cover path. S60c: shown ONLY for a model with a
+                tested vocal_range record (an untested model's toggle is a confusing no-op §user). */}
+            {voiceHasRangeRecord(selected) && (
             <div className="sep-param-row">
               <label title={t18({
                 zh: "超出模型舒适区的乐句先移调到舒适区推理，再在音频域移回（需先在资源管理器测过音域；区间内完全不受影响）",
@@ -248,6 +249,7 @@ export function SoVitsNode(props: NodeProps) {
               <input type="checkbox" checked={rangeExtend}
                 onChange={(e) => updateParams({ range_extend: e.target.checked })} />
             </div>
+            )}
             <GpuExtractRow value={gpuExtract} lang={lang}
               onChange={(v) => updateParams({ gpu_extract: v })} />
           </div>

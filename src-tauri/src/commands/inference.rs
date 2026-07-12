@@ -1233,7 +1233,7 @@ impl Default for VocalRenderOptions {
 
 /// Flat placeholder loudness for vol_embedding (SoVITS 4.1) models — Phase-2 validated (东雪莲 audition,
 /// 用户耳审 OK). A real per-frame 响度泳道 (SegmentContent.paramCurves["loudness"]) is deferred (§10.5).
-const VOCAL_FLAT_VOL: f32 = 0.1;
+pub(crate) const VOCAL_FLAT_VOL: f32 = 0.1;
 /// DoS cap on the note count of one render request.
 const MAX_SCORE_NOTES: usize = 500_000;
 /// DoS cap on the TOTAL 50fps frames of one render request (~200 min @50fps). Rests are UNCAPPED in the

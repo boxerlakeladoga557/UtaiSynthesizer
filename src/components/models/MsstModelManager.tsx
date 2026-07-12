@@ -33,6 +33,7 @@ import {
 } from "../../store/voice-models";
 import { runRangeTest, setComfortRange, midiName, type SpeakerRangeRecord } from "../../lib/vocal/rangeTest";
 import { preview } from "../common/previewPlayer";
+import { ParamSlider } from "../workflow/nodes/ParamSlider";
 import { readFile } from "@tauri-apps/plugin-fs";
 import "./MsstModelManager.css";
 
@@ -1045,18 +1046,14 @@ function VoiceAuditionButton({ m, voiceType, lang }: { m: VoiceModelEntry; voice
 function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: "rvc" | "sovits"; lang: string }) {
   const progress = useVoiceModelStore((s) => s.rangeTesting[m.name]);
   const [editing, setEditing] = useState(false);
-  const [lo, setLo] = useState("0");
-  const [hi, setHi] = useState("0");
+  const [lo, setLo] = useState(0);
+  const [hi, setHi] = useState(0);
   const rec = (m.config as { vocal_range?: { speakers?: Record<string, SpeakerRangeRecord> } }).vocal_range;
   const sp = rec?.speakers?.["0"];
   const commit = async () => {
-    // clamp AT COMMIT, not per keystroke — a keystroke clamp makes most targets untypable
-    // ("4" → clamped to 40 before the "8" of 48 arrives; audit S60)
-    const pLo = parseInt(lo, 10);
-    const pHi = parseInt(hi, 10);
-    if (!sp || Number.isNaN(pLo) || Number.isNaN(pHi)) { setEditing(false); return; }
-    const a = Math.max(sp.usable[0], Math.min(sp.usable[1], Math.min(pLo, pHi)));
-    const b = Math.max(sp.usable[0], Math.min(sp.usable[1], Math.max(pLo, pHi)));
+    if (!sp) { setEditing(false); return; }
+    const a = Math.max(sp.usable[0], Math.min(sp.usable[1], Math.min(lo, hi)));
+    const b = Math.max(sp.usable[0], Math.min(sp.usable[1], Math.max(lo, hi)));
     await setComfortRange(m.name, voiceType, 0, [a, b]);
     setEditing(false);
   };
@@ -1093,21 +1090,18 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
         {t18({ zh: "舒适", en: "comfort", ja: "快適" }, lang)} {midiName(sp.comfort[0])}–{midiName(sp.comfort[1])}
       </span>
       {editing ? (
-        <>
-          <input
-            className="rm-range-input"
-            type="text"
-            value={lo}
-            onChange={(e) => setLo(e.target.value)}
-            title={Number.isNaN(parseInt(lo, 10)) ? "MIDI" : `${midiName(parseInt(lo, 10))} (MIDI ${lo})`}
+        <span className="rm-range-edit">
+          <ParamSlider
+            label={t18({ zh: "下限", en: "Low", ja: "下限" }, lang)}
+            min={sp.usable[0]} max={sp.usable[1]} step={1} value={lo}
+            onChange={(v) => setLo(v)}
+            format={(v) => midiName(v)}
           />
-          <span>–</span>
-          <input
-            className="rm-range-input"
-            type="text"
-            value={hi}
-            onChange={(e) => setHi(e.target.value)}
-            title={Number.isNaN(parseInt(hi, 10)) ? "MIDI" : `${midiName(parseInt(hi, 10))} (MIDI ${hi})`}
+          <ParamSlider
+            label={t18({ zh: "上限", en: "High", ja: "上限" }, lang)}
+            min={sp.usable[0]} max={sp.usable[1]} step={1} value={hi}
+            onChange={(v) => setHi(v)}
+            format={(v) => midiName(v)}
           />
           <button className="rm-range-btn" onClick={() => void commit()}>OK</button>
           <button
@@ -1117,13 +1111,13 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
           >
             {t18({ zh: "还原", en: "Reset", ja: "リセット" }, lang)}
           </button>
-        </>
+        </span>
       ) : (
         <>
           <button
             className="rm-range-btn"
             title={t18({ zh: "在可用区间内微调舒适区（MIDI 音号）", en: "Adjust the comfort zone within usable (MIDI numbers)", ja: "使用可能域の中で快適域を調整（MIDI 番号）" }, lang)}
-            onClick={() => { setLo(String(sp.comfort[0])); setHi(String(sp.comfort[1])); setEditing(true); }}
+            onClick={() => { setLo(sp.comfort[0]); setHi(sp.comfort[1]); setEditing(true); }}
           >
             {t18({ zh: "调整", en: "Adjust", ja: "調整" }, lang)}
           </button>

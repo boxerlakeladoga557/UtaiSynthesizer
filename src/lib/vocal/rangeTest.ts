@@ -215,6 +215,35 @@ export async function runRangeTest(
   }
 }
 
+/** S60c: one training CANDIDATE's range test — the scale renders through render_candidate_scale
+ *  (converts on demand; Rust FlightGuard = single-flight), measurement + classification reuse the
+ *  SAME pure functions as the installed-model test (single source), and the record persists into
+ *  the candidate's audition sidecar (the audition render pre-shifts with it). Speaker 0 only.
+ *  Throws on failure (caller decides whether to toast or skip silently). */
+export async function runCandidateRangeTest(
+  workspace: string,
+  backend: "rvc" | "sovits",
+  ckptPath: string,
+  candidateId: string,
+): Promise<{ usable: [number, number]; comfort: [number, number] } | null> {
+  const { triples, spans } = buildScaleScore();
+  const result = await invoke<{ audio: number[]; sample_rate: number }>("render_candidate_scale", {
+    backend,
+    ckptPath,
+    workspace,
+    candidateId,
+    score: triples,
+  });
+  const dir = (await invoke<string>("ensure_cache_dir", { segmentId: "range_test" })).replace(/\\/g, "/");
+  const wavPath = `${dir}/cand_${Date.now().toString(36)}.wav`;
+  await invoke("save_temp_audio", { samples: result.audio, sampleRate: result.sample_rate, outputPath: wavPath });
+  const f0 = await invoke<number[]>("detect_f0", { audioPath: wavPath });
+  const record = buildSpeakerRecord(classifySemitones(f0, spans));
+  if (!record) return null; // nothing usable — an undertrained checkpoint; audition stays unshifted
+  await invoke("set_candidate_vocal_range", { workspace, ckptPath, record: { speakers: { "0": record } } });
+  return { usable: record.usable, comfort: record.comfort };
+}
+
 /** Persist a user-adjusted comfort range (clamped inside usable; the v1 dual-slider semantics). */
 export async function setComfortRange(
   name: string,

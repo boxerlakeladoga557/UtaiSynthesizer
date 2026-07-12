@@ -186,33 +186,36 @@ pub fn run_pipeline(
     let mut audio_opt: Vec<f32> = Vec::new();
     let mut s_ix = 0usize;
     let mut chunk_idx: u64 = 0;
-    // S60-2 音域扩展: each silence-seek chunk gets the v1 three-tier decision on its OWN fed
-    // pitch — a shifted chunk renders at `shift` st into comfort (coarse re-binned from the
-    // shifted Hz) and its UNtrimmed output is TD-PSOLA'd back before append_trimmed, so the
-    // constant-ratio seams stay inside the trimmed-away pads/silence. shift 0 ⇒ the exact
-    // original vc_chunk call (byte-identical).
+    // S60-2/S60c 音域扩展: ONE tier decision over the WHOLE fed pitch track (v1 whole-render
+    // semantics — a per-chunk shift gave each chunk its own formant coloration and the seams
+    // between colorations were the dominant audible artifact, §user实测). Every chunk renders
+    // at the same shift (coarse re-binned from the shifted Hz) and its UNtrimmed output is
+    // TD-PSOLA'd back before append_trimmed, so the constant-ratio seams stay inside the
+    // trimmed-away pads/silence. shift 0 ⇒ the exact original vc_chunk calls (byte-identical).
+    let range_shift = range
+        .map(|r| super::vocal_range::piece_range_shift(&pitchf, &r))
+        .unwrap_or(0);
+    if range_shift != 0 {
+        tracing::info!("range-extend(cover/rvc): whole signal rendered {range_shift:+} st into comfort");
+    }
     let ranged_chunk = |pitch_sl: &[i64],
                         pitchf_sl: &[f32],
                         chunk: &[f32],
                         chunk_idx: u64|
      -> Result<Vec<f32>> {
-        let shift = range
-            .map(|r| super::vocal_range::piece_range_shift(pitchf_sl, &r))
-            .unwrap_or(0);
-        if shift == 0 {
+        if range_shift == 0 {
             return vc_chunk(m, chunk, pitch_sl, pitchf_sl, sid, spk_mix_dense.as_deref(), options, chunk_idx);
         }
-        let k = 2.0f32.powf(shift as f32 / 12.0);
+        let k = 2.0f32.powf(range_shift as f32 / 12.0);
         let pf: Vec<f32> = pitchf_sl.iter().map(|&v| v * k).collect();
         let pc: Vec<i64> = pf.iter().map(|&v| f0_to_coarse(v)).collect();
-        tracing::info!("range-extend(cover/rvc): chunk {chunk_idx} rendered {shift:+} st into comfort");
         let out = vc_chunk(m, chunk, &pc, &pf, sid, spk_mix_dense.as_deref(), options, chunk_idx)?;
         Ok(super::vocal_range::psola_inverse_hop(
             out,
             &pf,
             m.sample_rate as usize / 100,
             m.sample_rate,
-            shift,
+            range_shift,
         ))
     };
     for &ot in &opt_ts {

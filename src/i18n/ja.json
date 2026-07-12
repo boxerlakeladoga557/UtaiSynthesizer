@@ -339,7 +339,8 @@
     "needName": "先にモデル名を入力してください",
     "dropHint": "ここにドロップして学習データに追加",
     "pausePreview": "一時停止",
-    "loadingPreview": "読み込み中…"
+    "loadingPreview": "読み込み中…",
+    "ckptRangeTip": "自動音域テスト結果（快適域）——試聴では高めのクリップをこの域に移調してから戻します"
   },
   "workflow": {
     "title": "ワークフローエディタ",

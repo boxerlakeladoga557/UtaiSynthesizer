@@ -17,7 +17,7 @@ import { VolumeFader } from "../common/VolumeFader";
 import { useProjectStore } from "../../store/project";
 import { useHistoryStore } from "../../store/history";
 import { useAppStore } from "../../store/app";
-import { useVoiceModelStore, voiceHasDiffusion, type VoiceModelEntry } from "../../store/voice-models";
+import { useVoiceModelStore, voiceHasDiffusion, voiceHasRangeRecord, type VoiceModelEntry } from "../../store/voice-models";
 import { effTransition } from "../../lib/f0eval";
 import { DEFAULT_TRANSITION } from "../../lib/vocalNotes";
 import { VOCAL_LANGUAGES, langById } from "../../lib/vocal/languages";
@@ -217,7 +217,9 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
           />
         </div>
         {/* S60-2 音域扩展: v1 recipe (shift into the singer's tested comfort zone, TD-PSOLA back).
-            A no-op until the model carries a vocal_range record (资源管理器 → 测音域). Default ON. */}
+            S60c: shown ONLY when the current singer carries a tested vocal_range record —
+            an untested model's toggle is a confusing no-op (§user). Default ON. */}
+        {voiceHasRangeRecord(selectedVoice) && (
         <div title={t("vocalEditor.sidebar.rangeExtendTip")}>
           <ToggleRow
             label={t("vocalEditor.sidebar.rangeExtend")}
@@ -225,6 +227,7 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             onChange={(c) => setVocalParams(trackId, { rangeExtend: c })}
           />
         </div>
+        )}
       </div>
 
       {/* ⓪.3 语言 (S58 §3.7) — lives on the SINGER tab (it configures WHAT is sung, not the pitch; §user).

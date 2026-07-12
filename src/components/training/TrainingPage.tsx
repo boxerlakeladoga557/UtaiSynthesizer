@@ -29,6 +29,7 @@ import {
   type VoiceModelEntry,
 } from "../../store/voice-models";
 import { AUDIO_EXT_RE, AUDIO_EXTENSIONS } from "../../lib/constants";
+import { runCandidateRangeTest, midiName } from "../../lib/vocal/rangeTest";
 import { Dropdown } from "../common/Dropdown";
 import { t18 } from "../../lib/models/msst-catalog";
 import { preview } from "../common/previewPlayer";
@@ -1483,6 +1484,10 @@ function RunStep() {
   // diff = listen → pick one → attach (existing attach flow) ----
   type AuditionPhase = "converting" | "rendering" | "ready" | "playing";
   const [auditionState, setAuditionState] = useState<Record<string, AuditionPhase>>({});
+  // S60c: per-checkpoint tested ranges (this run's auto-test results; the record itself
+  // persists in each candidate's audition sidecar — this map only feeds the row label).
+  const [candRanges, setCandRanges] = useState<Record<string, { usable: [number, number]; comfort: [number, number] }>>({});
+  const candRangeRunRef = useRef<string | null>(null);
   const [auditionWavs, setAuditionWavs] = useState<Record<string, string>>({});
   const [selectedCkpts, setSelectedCkpts] = useState<Record<string, boolean>>({});
   const [missingCkpts, setMissingCkpts] = useState<Record<string, boolean>>({});
@@ -1551,6 +1556,41 @@ function RunStep() {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [finished]);
+
+  // ── S60c: post-training auto range test (§user) — every rvc/sovits checkpoint gets the
+  // C2–C8 scale test (~1-2 s each) so ① its audition pre-shifts a low-range singer into
+  // comfort (the bundled clip skews high — an untested low singer sounds "training failed")
+  // and ② the row shows the singer's range. Once per finished run (ref-guarded), sequential
+  // (the Rust audition FlightGuard is single-flight anyway); failures skip silently — the
+  // audition still works without a record.
+  useEffect(() => {
+    if (!finished || snapshot.ckpts.length === 0) return;
+    if (snapshot.backend !== "rvc" && snapshot.backend !== "sovits") return;
+    const runKey = `${snapshot.workspace}|${snapshot.ckpts.map((c) => c.path).join(",")}`;
+    if (candRangeRunRef.current === runKey) return;
+    candRangeRunRef.current = runKey;
+    let alive = true;
+    void (async () => {
+      for (const c of snapshot.ckpts) {
+        if (!alive) return;
+        try {
+          const r = await runCandidateRangeTest(
+            snapshot.workspace,
+            snapshot.backend as "rvc" | "sovits",
+            c.path,
+            c.path,
+          );
+          if (alive && r) setCandRanges((s) => ({ ...s, [c.path]: r }));
+        } catch {
+          /* busy (user auditioning) or a broken ckpt — skip; retest happens on the next run */
+        }
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [finished, snapshot.ckpts, snapshot.backend, snapshot.workspace]);
 
   // archive policies prune files the snapshot still lists (diff periodics,
   // red-team F16) — grey those rows instead of offering dead buttons
@@ -2427,6 +2467,14 @@ function RunStep() {
                     {/* diffusion epochs are sentinel units — steps only */}
                     {isDiff ? <>s{c.step}</> : <>e{c.epoch} · s{c.step}</>}
                     {c.metric != null && <> · {c.metric.toFixed(3)}</>}
+                    {/* S60c: auto-tested comfort zone (note names — the audience reads F#2,
+                        not MIDI numbers §user); doubles as convergence feedback per ckpt */}
+                    {candRanges[c.path] && (
+                      <span className="training-ckpt-range" title={t("training.ckptRangeTip")}>
+                        {" · "}
+                        {midiName(candRanges[c.path]!.comfort[0])}–{midiName(candRanges[c.path]!.comfort[1])}
+                      </span>
+                    )}
                   </span>
                   {gone ? (
                     <span className="training-ckpt-missing">{t("training.ckptMissing")}</span>

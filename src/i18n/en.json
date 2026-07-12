@@ -339,7 +339,8 @@
     "needName": "Enter a model name first",
     "dropHint": "Drop here to add as training data",
     "pausePreview": "Pause",
-    "loadingPreview": "Loading…"
+    "loadingPreview": "Loading…",
+    "ckptRangeTip": "Auto range-test result (comfort zone) — auditions transpose the high-skewed clip into this zone and back"
   },
   "workflow": {
     "title": "Workflow Editor",

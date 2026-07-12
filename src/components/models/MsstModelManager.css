@@ -719,3 +719,15 @@
   font-size: var(--font-size-xs);
   padding: 1px 4px;
 }
+
+/* S60c: comfort editor = dual sliders with note-name readouts (F#2, not raw MIDI) */
+.rm-range-edit {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+.rm-range-edit .sep-param-row {
+  margin: 0;
+  min-width: 150px;
+}

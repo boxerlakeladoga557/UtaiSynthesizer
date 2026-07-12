@@ -151,6 +151,37 @@ pub fn run_pipeline(
     let native_sr = mono.sample_rate;
     let total_in = mono.samples.len();
 
+    // S60c 音域扩展: ONE tier decision for the WHOLE signal (v1 whole-render semantics). A
+    // per-piece shift gave each silence-chunk its own formant coloration and the SEAMS between
+    // colorations were the dominant audible artifact (§user实测) — a uniform shift keeps the
+    // coloration constant across the segment. Costs one extra whole-signal rmvpe pass, paid
+    // only when armed. auto_f0 REPLACES the fed f0 inside decode_features → a shift would
+    // neither be sung nor match the inverse guide → forced 0 (force-neutralize convention).
+    let range_shift: i64 = match &range {
+        Some(r) if m.f0_predictor_session.is_none() => {
+            let wav16k = resample(&mono.samples, native_sr, super::f0::RMVPE_SR);
+            let f0 = super::f0::rmvpe_detect(
+                m.engine,
+                m.rmvpe_session,
+                m.mel_filters,
+                &wav16k,
+                super::f0::SOVITS_RMVPE_THRESHOLD,
+            )?;
+            let k = 2.0f32.powf(options.f0_shift / 12.0);
+            let transposed: Vec<f32> = f0.iter().map(|v| v * k).collect();
+            let s = super::vocal_range::piece_range_shift(&transposed, r);
+            if s != 0 {
+                tracing::info!("range-extend(cover/sovits): whole signal rendered {s:+} st into comfort");
+            }
+            s
+        }
+        Some(_) => {
+            tracing::info!("range-extend(cover/sovits): auto_f0 active — range extension disabled for this render");
+            0
+        }
+        None => 0,
+    };
+
     // resampled (model-sr) length of a native-sr span — slice_inference's
     // `int(ceil(len(data)/audio_sr*target_sample))`.
     let out_len = |len_native: usize| -> usize {
@@ -196,7 +227,7 @@ pub fn run_pipeline(
             if cancel() {
                 return Err(UtaiError::Inference("已取消".into()));
             }
-            let trimmed = infer_segment(m, piece_in, native_sr, seg_idx, options, range, &report, cancel)?;
+            let trimmed = infer_segment(m, piece_in, native_sr, seg_idx, options, range_shift, &report, cancel)?;
             // pad_array(_audio, per_length) — center zero-pad up (never truncates), exactly
             // like the original; a zero-filled degenerate piece becomes zeros(per_length).
             let piece = pad_array_center(trimmed, per_length);
@@ -241,7 +272,9 @@ fn infer_segment(
     native_sr: u32,
     seg_idx: u64,
     options: &SovitsOptions,
-    range: Option<super::vocal_range::SpeakerRange>,
+    // S60c: the WHOLE-SIGNAL range shift (semitones), decided once in run_pipeline — every
+    // piece renders at the same shift so the formant coloration is uniform across seams.
+    range_shift: i64,
     report: &dyn Fn(f32),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<Vec<f32>> {
@@ -284,28 +317,14 @@ fn infer_segment(
     // get_unit_f0: f0 = f0 * 2^(tran/12) AFTER the predictor post-process; uv untouched
     let ratio = 2.0f32.powf(options.f0_shift / 12.0);
     f0.iter_mut().for_each(|v| *v *= ratio);
-    // S60-2 音域扩展 (chunk-level tier): each silence-sliced piece is a natural phrase unit —
-    // the constant-ratio inverse's seams land in the silence between pieces. Bounds from the
-    // TRANSPOSED f0 (what the model would be asked to sing); shift 0 ⇒ untouched path.
-    // Two audit-mandated guards:
-    //   - auto_f0 (m.f0_predictor_session) REPLACES the fed f0 inside decode_features — a shift
-    //     would neither be sung nor match the inverse guide → force tier 0 (mirrors the vocal
-    //     path's force-neutralize convention);
-    //   - the guide must be f0×uv: sovits_f0_postprocess interpolates unvoiced frames NON-ZERO
-    //     (uv carries the mask), so a raw clone would present psola_shift one giant voiced
-    //     island and wet-process fricatives/breaths (the RVC path's pitchf keeps real zeros).
-    let range_shift = if m.f0_predictor_session.is_some() {
-        if range.is_some() {
-            tracing::info!("range-extend(cover/sovits): auto_f0 active — range extension disabled for this render");
-        }
-        0
-    } else {
-        range.map(|r| super::vocal_range::piece_range_shift(&f0, &r)).unwrap_or(0)
-    };
+    // S60-2/S60c 音域扩展: apply the run_pipeline-decided whole-signal shift. The inverse
+    // guide must be f0×uv: sovits_f0_postprocess interpolates unvoiced frames NON-ZERO (uv
+    // carries the mask), so a raw clone would present psola_shift one giant voiced island and
+    // wet-process fricatives/breaths (the RVC path's pitchf keeps real zeros). shift 0 ⇒
+    // byte-identical untouched path.
     let f0_for_inverse = if range_shift != 0 {
         let k = 2.0f32.powf(range_shift as f32 / 12.0);
         f0.iter_mut().for_each(|v| *v *= k);
-        tracing::info!("range-extend(cover/sovits): piece {seg_idx} rendered {range_shift:+} st into comfort");
         Some(f0.iter().zip(uv.iter()).map(|(f, u)| f * u).collect::<Vec<f32>>())
     } else {
         None

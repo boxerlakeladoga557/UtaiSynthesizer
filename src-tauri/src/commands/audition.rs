@@ -125,6 +125,42 @@ fn sweep_candidate_dir(dir: &Path) {
     }
 }
 
+/// Convert a candidate ckpt into its audition dir if not already done (the sidecar json is
+/// the exporter's LAST artifact = the completion marker; 审查修复 S41-RUST-2: a bare onnx
+/// means an interrupted conversion — sweep and redo, never trust it). Shared by the audition
+/// render and the S60c range-scale render (single conversion source).
+fn ensure_candidate_converted(
+    app: &AppState,
+    apph: &tauri::AppHandle,
+    candidate_id: &str,
+    dir: &Path,
+    onnx: &Path,
+    backend: &str,
+    ckpt_path: &str,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("创建试听目录失败: {}", e))?;
+    if dir.join("model.json").is_file() {
+        return Ok(());
+    }
+    if onnx.exists() {
+        sweep_candidate_dir(dir);
+        std::fs::create_dir_all(dir).map_err(|e| format!("创建试听目录失败: {}", e))?;
+    }
+    emit_phase(apph, candidate_id, "converting");
+    let mtype = match backend {
+        "rvc" => ModelType::Rvc,
+        "sovits" => ModelType::SoVits,
+        other => return Err(format!("试听不支持的后端: {}", other)),
+    };
+    // sovits release snapshots auto-detect weights/config.json next to the ckpt;
+    // rvc savee models embed their config
+    crate::models::convert::convert_pth_to_onnx(Path::new(ckpt_path), onnx, &mtype, &app.app_dir)
+        .map_err(|e| {
+            sweep_candidate_dir(dir);
+            e.to_string()
+        })
+}
+
 /// Throttled per-candidate progress for the pipeline section (≥1% steps).
 fn progress_emitter(
     app: tauri::AppHandle,
@@ -182,6 +218,80 @@ fn ckpt_stem(ckpt_path: &str) -> Result<String, String> {
         .map(|s| s.to_string_lossy().into_owned())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "候选存档路径无效".into())
+}
+
+// ─── S60c: whole-clip range extension for auditions ──────────────────────────
+// The bundled clip skews HIGH — a low-range singer (e.g. F#2–A#4) sounds mute/broken in
+// audition and reads as "training failed" (§user实测). When the model/candidate carries a
+// vocal_range record, ONE tier decision runs over the ENTIRE clip (uniform shift = uniform
+// formant character — the clip is deliberately a single chunk, §user), the shift folds into
+// options.f0_shift for the render, and the WHOLE output is TD-PSOLA'd back.
+
+/// Cache-name suffix carrying the range record (a re-test/adjusted comfort must MISS the old
+/// cache). No record keeps the pre-S60c names byte-identical (existing caches stay valid).
+fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange>) -> String {
+    match range {
+        None => String::new(),
+        Some(r) => format!(
+            "_ru{:.0}-{:.0}c{:.0}-{:.0}",
+            r.usable.0, r.usable.1, r.comfort.0, r.comfort.1
+        ),
+    }
+}
+
+/// Compute the whole-clip shift + the (shifted, zero-preserving) rmvpe guide for the inverse.
+/// None = no record / already in range → render untouched.
+fn audition_range_prep(
+    app: &AppState,
+    rmvpe_sid: &str,
+    mel: &ndarray::Array2<f32>,
+    src: &crate::audio::AudioBuffer,
+    range: Option<crate::inference::vocal_range::SpeakerRange>,
+) -> Result<Option<(i64, Vec<f32>)>, String> {
+    let Some(r) = range else { return Ok(None) };
+    let mono = crate::audio::resample::to_mono(src);
+    let wav16k = crate::inference::features::resample(
+        &mono.samples,
+        mono.sample_rate,
+        crate::inference::f0::RMVPE_SR,
+    );
+    let f0 = crate::inference::f0::rmvpe_detect(
+        &app.inference.engine,
+        rmvpe_sid,
+        mel,
+        &wav16k,
+        crate::inference::f0::SOVITS_RMVPE_THRESHOLD,
+    )
+    .map_err(|e| e.to_string())?;
+    let shift = crate::inference::vocal_range::piece_range_shift(&f0, &r);
+    if shift == 0 {
+        return Ok(None);
+    }
+    tracing::info!("audition range-extend: clip rendered {shift:+} st into comfort");
+    let k = 2.0f32.powf(shift as f32 / 12.0);
+    // raw rmvpe zeros preserved → unvoiced passes through the inverse dry
+    let guide: Vec<f32> = f0.iter().map(|v| v * k).collect();
+    Ok(Some((shift, guide)))
+}
+
+/// Apply the inverse of `audition_range_prep`'s shift to a finished render.
+fn audition_range_invert(
+    result: crate::inference::SynthesisResult,
+    prep: &Option<(i64, Vec<f32>)>,
+) -> crate::inference::SynthesisResult {
+    match prep {
+        Some((shift, guide)) if result.sample_rate % 100 == 0 => crate::inference::SynthesisResult {
+            audio: crate::inference::vocal_range::psola_inverse_hop(
+                result.audio,
+                guide,
+                (result.sample_rate / 100) as usize,
+                result.sample_rate,
+                *shift,
+            ),
+            sample_rate: result.sample_rate,
+        },
+        _ => result,
+    }
 }
 
 fn audition_source(state: &AppState) -> Result<PathBuf, String> {
@@ -275,14 +385,22 @@ pub async fn render_audition_voice(
     let dir = audition_dir(&workspace, &stem);
     // ①c: cache the rendered clip PER speaker (the onnx is shared across speakers — only the fed
     // speaker differs). A single-speaker candidate (speaker_id None) keeps "audition.wav" =
-    // byte-identical caching to pre-①c.
-    let out = dir.join(match speaker_id {
-        Some(s) => format!("audition_spk{}.wav", s),
-        None => "audition.wav".to_string(),
-    });
-    if out.is_file() {
-        drop(guard);
-        return Ok(out.to_string_lossy().into_owned());
+    // byte-identical caching to pre-①c. S60c: the name also carries the candidate's vocal_range
+    // record (whole-clip pre-shift is a render input) — computable only once the sidecar exists,
+    // so the early probe is conditional; the authoritative name is re-derived in the closure.
+    let cache_name = move |range: &Option<crate::inference::vocal_range::SpeakerRange>| match speaker_id {
+        Some(s) => format!("audition_spk{}{}.wav", s, audition_cache_tag(range)),
+        None => format!("audition{}.wav", audition_cache_tag(range)),
+    };
+    if dir.join("model.json").is_file() {
+        if let Ok((cfg, _)) = read_candidate_config(&dir.join("model.json")) {
+            let range = crate::inference::vocal_range::speaker_range(&cfg, speaker_id.unwrap_or(0));
+            let out = dir.join(cache_name(&range));
+            if out.is_file() {
+                drop(guard);
+                return Ok(out.to_string_lossy().into_owned());
+            }
+        }
     }
     let src = audition_source(&app)?;
 
@@ -291,37 +409,16 @@ pub async fn render_audition_voice(
         let _guard = guard; // released when this render finishes (any path)
         let cid = candidate_id.clone();
         with_terminal_events(&apph.clone(), &cid, || {
-        std::fs::create_dir_all(&dir).map_err(|e| format!("创建试听目录失败: {}", e))?;
         let onnx = dir.join("model.onnx");
-        // the sidecar json is the exporter's LAST artifact = the completion
-        // marker (审查修复 S41-RUST-2: a bare onnx means an interrupted
-        // conversion — sweep and redo, never trust it)
-        if !dir.join("model.json").is_file() {
-            if onnx.exists() {
-                sweep_candidate_dir(&dir);
-                std::fs::create_dir_all(&dir)
-                    .map_err(|e| format!("创建试听目录失败: {}", e))?;
-            }
-            emit_phase(&apph, &candidate_id, "converting");
-            let mtype = match backend.as_str() {
-                "rvc" => ModelType::Rvc,
-                "sovits" => ModelType::SoVits,
-                other => return Err(format!("试听不支持的后端: {}", other)),
-            };
-            // sovits release snapshots auto-detect weights/config.json next to
-            // the ckpt; rvc savee models embed their config
-            crate::models::convert::convert_pth_to_onnx(
-                Path::new(&ckpt_path),
-                &onnx,
-                &mtype,
-                &app.app_dir,
-            )
-            .map_err(|e| {
-                sweep_candidate_dir(&dir);
-                e.to_string()
-            })?;
-        }
+        ensure_candidate_converted(&app, &apph, &candidate_id, &dir, &onnx, &backend, &ckpt_path)?;
         let (config, sample_rate) = read_candidate_config(&dir.join("model.json"))?;
+        // S60c: the candidate's tested range (written by the post-training auto-test into this
+        // sidecar) drives the whole-clip pre-shift; the cache name carries it.
+        let range = crate::inference::vocal_range::speaker_range(&config, speaker_id.unwrap_or(0));
+        let out = dir.join(cache_name(&range));
+        if out.is_file() {
+            return Ok(out.to_string_lossy().into_owned());
+        }
 
         emit_phase(&apph, &candidate_id, "rendering");
         // arm the cancel epoch before the load phase (S36 discipline)
@@ -344,11 +441,14 @@ pub async fn render_audition_voice(
             .inference
             .load_npy(&aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?)
             .map_err(|e| e.to_string())?;
+        // S60c: whole-clip range pre-shift (single chunk = uniform formant character)
+        let range_prep = audition_range_prep(&app, &rmvpe_sid, mel.as_ref(), &audio_buf, range)?;
+        let range_f0_shift = range_prep.as_ref().map(|(s, _)| *s as f32).unwrap_or(0.0);
         let progress = progress_emitter(apph.clone(), app.clone(), run_epoch, candidate_id.clone());
         let cancel = || app.inference.voice_cancelled(run_epoch);
 
-        // fixed audition recipe: transpose 0, rmvpe, no retrieval/cluster, no
-        // quality path, CPU extractors — the candidate model itself, bare
+        // fixed audition recipe: transpose 0(+S60c range shift), rmvpe, no retrieval/cluster,
+        // no quality path, CPU extractors — the candidate model itself, bare
         let result = match backend.as_str() {
             "rvc" => {
                 let dim = config.features_dim as usize;
@@ -390,6 +490,7 @@ pub async fn render_audition_voice(
                     index_ratio: 0.0,
                     gpu_extract: false,
                     speaker_id,
+                    f0_shift: range_f0_shift,
                     ..Default::default()
                 };
                 rvc::run_pipeline(&model, &audio_buf, &options, None, &progress, &cancel)
@@ -447,12 +548,14 @@ pub async fn render_audition_voice(
                     cluster_ratio: 0.0,
                     gpu_extract: false,
                     speaker_id,
+                    f0_shift: range_f0_shift,
                     ..Default::default()
                 };
                 sovits::run_pipeline(&model, &audio_buf, &options, None, &progress, &cancel)
                     .map_err(|e| e.to_string())?
             }
         };
+        let result = audition_range_invert(result, &range_prep);
         write_wav_atomic(&out, &result.audio, result.sample_rate)?;
         // free the candidate's VRAM + Windows file locks (the dir must stay
         // deletable by 清空结果 / the next training run)
@@ -865,7 +968,15 @@ pub async fn render_model_audition(
         .parent()
         .ok_or_else(|| "AUDITION_MODEL_MISSING".to_string())?
         .to_path_buf();
-    let out = dir.join(format!("{}.audition_spk{}.wav", stem, spk));
+    // S60c: the range record is a render input here (whole-clip pre-shift) — the cache name
+    // carries it so a re-test / adjusted comfort misses the stale wav.
+    let range = crate::inference::vocal_range::speaker_range(&entry.config, spk);
+    let out = dir.join(format!(
+        "{}.audition_spk{}{}.wav",
+        stem,
+        spk,
+        audition_cache_tag(&range)
+    ));
     if out.is_file() {
         drop(guard);
         return Ok(out.to_string_lossy().into_owned());
@@ -919,6 +1030,9 @@ pub async fn render_model_audition(
                 None
             };
             let audio_buf = crate::audio::load_audio(&src).map_err(|e| e.to_string())?;
+            // S60c: whole-clip range pre-shift (single chunk = uniform formant character)
+            let range_prep = audition_range_prep(&app, &rmvpe_sid, mel.as_ref(), &audio_buf, range)?;
+            let range_f0_shift = range_prep.as_ref().map(|(s, _)| *s as f32).unwrap_or(0.0);
             let progress = progress_emitter(apph.clone(), app.clone(), run_epoch, candidate_id.clone());
             let cancel = || app.inference.voice_cancelled(run_epoch);
             let nch = noise_channels(&entry.config);
@@ -930,6 +1044,7 @@ pub async fn render_model_audition(
                         index_ratio: 0.0,
                         speaker_id: Some(spk),
                         gpu_extract: false,
+                        f0_shift: range_f0_shift,
                         ..Default::default()
                     };
                     let model = rvc::RvcModel {
@@ -957,6 +1072,7 @@ pub async fn render_model_audition(
                         cluster_ratio: 0.0,
                         speaker_id: Some(spk),
                         gpu_extract: false,
+                        f0_shift: range_f0_shift,
                         ..Default::default()
                     };
                     let model = sovits::SovitsModel {
@@ -986,10 +1102,199 @@ pub async fn render_model_audition(
                         .map_err(|e| e.to_string())?
                 }
             };
+            let result = audition_range_invert(result, &range_prep);
             write_wav_atomic(&out, &result.audio, result.sample_rate)?;
             Ok(out.to_string_lossy().into_owned())
         })
     })
     .await
     .map_err(|e| format!("AUDITION_FAILED: join: {e}"))?
+}
+
+// ─── S60c: candidate range test (post-training auto-test, §user) ─────────────
+
+/// Render an ARBITRARY score (the range-test scale) through a training CANDIDATE — converts
+/// on demand (shared conversion source) and drives the SAME score render the vocal track uses
+/// (score2svc). The frontend orchestrates the measurement (detect_f0 + the TS classification,
+/// its single source) and persists the record via `set_candidate_vocal_range`; the audition
+/// render then reads it for the whole-clip pre-shift. Speaker 0 only (the audition default).
+#[tauri::command]
+pub async fn render_candidate_scale(
+    app_handle: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    backend: String,
+    ckpt_path: String,
+    workspace: String,
+    candidate_id: String,
+    score: Vec<crate::commands::inference::ScoreNote>,
+) -> Result<crate::inference::SynthesisResult, String> {
+    let app = state.inner().clone();
+    let guard = FlightGuard::acquire(AUDITION_BUSY_MSG)?;
+    ensure_trainable_idle(&app)?;
+    ensure_no_voice_render()?;
+    if score.is_empty() {
+        return Err("RANGE_EMPTY_SCORE".to_string());
+    }
+    let stem = ckpt_stem(&ckpt_path)?;
+    let dir = audition_dir(&workspace, &stem);
+
+    let apph = app_handle.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<crate::inference::SynthesisResult, String> {
+        let _guard = guard;
+        let onnx = dir.join("model.onnx");
+        ensure_candidate_converted(&app, &apph, &candidate_id, &dir, &onnx, &backend, &ckpt_path)?;
+        let (config, sample_rate) = read_candidate_config(&dir.join("model.json"))?;
+
+        emit_phase(&apph, &candidate_id, "rendering");
+        let run_epoch = app.inference.begin_voice_run();
+        app.inference.engine.release_gpu_sessions_except(&[onnx.clone()]);
+        let sid = app
+            .inference
+            .engine
+            .load_model_with(&onnx, false)
+            .map_err(|e| e.to_string())?;
+
+        let dim = match backend.as_str() {
+            "rvc" => config.features_dim as usize,
+            _ => config.resolved_features_dim()?,
+        };
+        if dim == 0 {
+            return Err("候选配置缺少 features_dim".to_string());
+        }
+        let s2cv_sid = app
+            .inference
+            .ensure_aux_loaded_on(&crate::commands::inference::score2cv_for_dim(&app, dim)?, true)
+            .map_err(|e| e.to_string())?;
+        let cv_sid = app
+            .inference
+            .ensure_aux_loaded_on(&contentvec_for_dim(&app, dim)?, false)
+            .map_err(|e| e.to_string())?;
+        let rmvpe_sid = app
+            .inference
+            .ensure_aux_loaded_on(&aux_path(&app, AUX_RMVPE, "音高检测模型")?, false)
+            .map_err(|e| e.to_string())?;
+        let mel = app
+            .inference
+            .load_npy(&aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?)
+            .map_err(|e| e.to_string())?;
+
+        let has_input = |name: &str| {
+            config
+                .inputs
+                .as_ref()
+                .and_then(|v| v.as_array())
+                .map(|l| l.iter().any(|v| v.as_str() == Some(name)))
+        };
+        let spk_mix = if has_input("spk_mix") == Some(true) && config.n_speakers > 0 {
+            Some(config.n_speakers as usize)
+        } else {
+            None
+        };
+        let progress = progress_emitter(apph.clone(), app.clone(), run_epoch, candidate_id.clone());
+        let cancel = || app.inference.voice_cancelled(run_epoch);
+        use crate::inference::g2p;
+        let score_ref: Vec<g2p::ScoreEvt> = score
+            .iter()
+            .map(|n| g2p::ScoreEvt {
+                lyric: n.lyric.as_str(),
+                note_num: n.note_num,
+                frames: n.frames,
+                lang: n.lang.and_then(g2p::Lang::from_id).unwrap_or(g2p::Lang::Ja),
+                phoneme_input: n.phoneme_input.as_deref(),
+            })
+            .collect();
+
+        let result = match backend.as_str() {
+            "rvc" => {
+                let options = RvcOptions { index_ratio: 0.0, gpu_extract: false, ..Default::default() };
+                let model = crate::inference::rvc::RvcModel {
+                    engine: &app.inference.engine,
+                    voice_session: &sid,
+                    contentvec_session: &cv_sid,
+                    rmvpe_session: &rmvpe_sid,
+                    mel_filters: mel.as_ref(),
+                    index: None,
+                    sample_rate,
+                    features_dim: dim,
+                    spk_mix,
+                    noise_channels: noise_channels(&config),
+                    min_frames: min_frames(&config, 12),
+                };
+                crate::inference::score2svc::render_score_rvc(
+                    &model, &s2cv_sid, &score_ref, dim, 49, &g2p::GlobalDicts, &options,
+                    0, 0, None, None, None, &cancel, &progress,
+                )
+                .map_err(|e| e.to_string())?
+            }
+            _ => {
+                let hop_size = config.hop_size.unwrap_or(512) as usize;
+                if hop_size == 0 {
+                    return Err("候选配置的 hop_size 为 0".to_string());
+                }
+                let vol_embedding =
+                    has_input("vol").unwrap_or_else(|| config.vol_embedding.unwrap_or(false));
+                let options = SovitsOptions { cluster_ratio: 0.0, gpu_extract: false, ..Default::default() };
+                let model = crate::inference::sovits::SovitsModel {
+                    engine: &app.inference.engine,
+                    voice_session: &sid,
+                    contentvec_session: &cv_sid,
+                    rmvpe_session: &rmvpe_sid,
+                    mel_filters: mel.as_ref(),
+                    cluster: None,
+                    diffusion: None,
+                    vocoder: None,
+                    f0_predictor_session: None,
+                    sample_rate,
+                    hop_size,
+                    features_dim: dim,
+                    vol_embedding,
+                    spk_mix,
+                    unit_interpolate_mode: config
+                        .unit_interpolate_mode
+                        .clone()
+                        .unwrap_or_else(|| "left".to_string()),
+                    noise_channels: noise_channels(&config),
+                    min_frames: min_frames(&config, 6),
+                };
+                crate::inference::score2svc::render_score_sovits(
+                    &model, &s2cv_sid, &score_ref, dim, 49, &g2p::GlobalDicts, &options,
+                    crate::commands::inference::VOCAL_FLAT_VOL, 0, 0, None, None, None,
+                    &cancel, &progress,
+                )
+                .map_err(|e| e.to_string())?
+            }
+        };
+        app.inference.engine.unload_paths_with_prefix(&dir);
+        Ok(result)
+    })
+    .await
+    .map_err(|e| format!("AUDITION_FAILED: join: {e}"))?
+}
+
+/// Persist a candidate's tested vocal range into its AUDITION sidecar (model.json) — the
+/// audition render reads it back for the whole-clip pre-shift. Strict read (a present-but-
+/// corrupt sidecar must abort, never be rewritten from empty — the set_config_extra_key rule).
+#[tauri::command]
+pub async fn set_candidate_vocal_range(
+    workspace: String,
+    ckpt_path: String,
+    record: serde_json::Value,
+) -> Result<(), String> {
+    if !record.is_object() {
+        return Err("RANGE_BAD_RECORD".to_string());
+    }
+    let stem = ckpt_stem(&ckpt_path)?;
+    let json_path = audition_dir(&workspace, &stem).join("model.json");
+    let text = std::fs::read_to_string(&json_path)
+        .map_err(|e| format!("RANGE_CANDIDATE_MISSING: {e}"))?;
+    let mut map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
+        .map_err(|e| format!("RANGE_CANDIDATE_MISSING: unparseable sidecar: {e}"))?;
+    map.insert("vocal_range".to_string(), record);
+    std::fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&serde_json::Value::Object(map))
+            .map_err(|e| format!("RANGE_CANDIDATE_MISSING: serialize: {e}"))?,
+    )
+    .map_err(|e| format!("RANGE_CANDIDATE_MISSING: write: {e}"))?;
+    Ok(())
 }

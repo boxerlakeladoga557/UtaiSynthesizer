@@ -6,7 +6,7 @@ import { useNodeParams } from "./useNodeParams";
 import { ParamSlider, formatRatio } from "./ParamSlider";
 import { VoiceModelPicker, SpeakerSelect, SpeakerBlend, useVoiceModelSelection, GpuExtractRow, VOICE_STRINGS } from "./VoiceModelPicker";
 import { RVC_DEFAULTS, type SpkMixEntry } from "../../../lib/workflow/voiceDefaults";
-import { voiceHasSpkMix, type VoiceModelEntry } from "../../../store/voice-models";
+import { voiceHasRangeRecord, voiceHasSpkMix, type VoiceModelEntry } from "../../../store/voice-models";
 import { t18 } from "../../../lib/models/msst-catalog";
 
 export function RvcNode(props: NodeProps) {
@@ -102,8 +102,9 @@ export function RvcNode(props: NodeProps) {
                 onChange={(e) => updateParams({ l2_normalize: e.target.checked })} />
             </div>
             )}
-            {/* S60-2 音域扩展 — v1 recipe on the cover path (chunk-level tier + TD-PSOLA back).
-                No-op until the model carries a vocal_range record (资源管理器 → 测音域). */}
+            {/* S60-2 音域扩展 — v1 recipe on the cover path. S60c: shown ONLY for a model with a
+                tested vocal_range record (an untested model's toggle is a confusing no-op §user). */}
+            {voiceHasRangeRecord(selected) && (
             <div className="sep-param-row">
               <label title={t18({
                 zh: "超出模型舒适区的乐句先移调到舒适区推理，再在音频域移回（需先在资源管理器测过音域；区间内完全不受影响）",
@@ -115,6 +116,7 @@ export function RvcNode(props: NodeProps) {
               <input type="checkbox" checked={rangeExtend}
                 onChange={(e) => updateParams({ range_extend: e.target.checked })} />
             </div>
+            )}
             <GpuExtractRow value={gpuExtract} lang={lang}
               onChange={(v) => updateParams({ gpu_extract: v })} />
           </div>
