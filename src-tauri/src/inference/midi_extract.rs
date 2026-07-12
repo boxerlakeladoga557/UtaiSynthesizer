@@ -268,7 +268,7 @@ fn load_sessions(engine: &OnnxEngine, models_dir: &Path, force_cpu: bool) -> Res
     // the GPU-class session cache pressure is transient. `force_cpu` = the run-time fallback
     // path (a GPU stack can pass session BUILD yet fail at the first conv — e.g. a cudnn
     // frontend engine DLL that won't resolve); extract_notes retries once on CPU.
-    let mut load = |name: &str| {
+    let load = |name: &str| {
         let path = dir.join(name);
         if force_cpu {
             engine.load_model_on(&path, false, super::engine::DeviceConfig::Cpu)
