@@ -302,3 +302,26 @@
   border-color: #ef4444;
   color: #ef4444;
 }
+
+/* S61 storage usage & cleanup rows: the label/name column stretches (ellipsized), the size
+ * readout + action button hug the right — same angular chrome as the runtime-pack rows. */
+.settings-storage .settings-row {
+  justify-content: flex-start;
+  gap: 8px;
+}
+.settings-storage .settings-row > :first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+  max-width: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.settings-storage .settings-value {
+  max-width: none;
+  flex-shrink: 0;
+}
+.settings-storage .settings-mini-btn {
+  flex-shrink: 0;
+}

@@ -286,7 +286,7 @@ pub struct WorkspaceInfo {
 /// caches are fine, the diff pipeline re-runs the shared preprocess chain and
 /// fills whatever is missing; what matters is that dataset/ holds a real
 /// prior import, not that it finished).
-fn has_dataset_pool(ws: &Path) -> bool {
+pub fn has_dataset_pool(ws: &Path) -> bool {
     ws.join("dataset.fingerprint").is_file()
         && std::fs::read_dir(ws.join("dataset"))
             .map(|mut d| d.next().is_some())

@@ -330,6 +330,11 @@ pub async fn migrate_data_dir(state: State<'_, Arc<AppState>>, new_dir: String) 
     if new.as_os_str().is_empty() {
         return Err("Empty target directory".into());
     }
+    // S61: a live training run writes checkpoints/features mid-copy — the migrated tree would be
+    // torn (and the workspace copy below is exactly what a running trainer mutates).
+    if state.training.is_active() {
+        return Err("TRAINING_ACTIVE".into());
+    }
     let data_root = effective_data_root(&state).to_path_buf();
     let target = new.clone();
     // The copy reaches tens of GB — run it off the event loop so the UI stays responsive.
@@ -368,6 +373,12 @@ pub async fn migrate_data_dir(state: State<'_, Arc<AppState>>, new_dir: String) 
                     .map_err(|e| format!("Copy runtimes/{}: {e}", name.to_string_lossy()))?;
             }
         }
+        // S61 (recon gap): training WORKSPACES live under <data_root>/training and resolve off the
+        // SAME data dir (commands/training.rs data_root) — not copying them silently stranded every
+        // checkpoint + dataset on the old drive while 续训/共享池 resolved against the NEW (empty)
+        // tree after restart. GBs, but losing training progress is worse than a longer copy.
+        copy_dir_all(&data_root.join("training"), &target.join("training"))
+            .map_err(|e| format!("Copy training: {e}"))?;
         Ok(())
     })
     .await

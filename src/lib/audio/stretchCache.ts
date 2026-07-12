@@ -26,6 +26,13 @@ export function canonStretch(r: number): number {
 const resolved = new Map<string, string>(); // `${path}::${r}` → artifact path
 const pending = new Map<string, Promise<string>>();
 
+/** S61 cleanup support: every stretched-artifact path this session has resolved. The Settings
+ *  render-cache sweep must NOT delete these — the memo above would keep returning the (deleted)
+ *  path and stretched clips would fail to decode until an app restart. */
+export function stretchedArtifactPaths(): string[] {
+  return [...resolved.values()];
+}
+
 /** Apply a stretch factor to a segment: ARTIFACTS FIRST, THEN COMMIT — the source + every ready
  *  stem is stretched before the store write lands, so playback right after Apply never blocks on
  *  a cold stretch. Throws the Rust STRETCH_* CODE on failure (caller toasts); a stale segment

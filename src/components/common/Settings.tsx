@@ -5,7 +5,13 @@ import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../../store/app";
 import { useMsstModelStore } from "../../store/msst-models";
+import { useProjectStore } from "../../store/project";
+import { useAudioStore } from "../../store/audio";
+import { useWorkflowStore } from "../../store/workflow";
+import { useTrainingStore } from "../../store/training";
+import { useVoiceModelStore } from "../../store/voice-models";
 import { applyMirror } from "../../lib/models/msst-catalog";
+import { stretchedArtifactPaths } from "../../lib/audio/stretchCache";
 import { useDraggable } from "../../lib/useDraggable";
 import "./Settings.css";
 
@@ -90,6 +96,56 @@ interface ProbeResult {
 const PROBE_ASSET = "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-cpu-v1.tar.zst";
 
 const fmtGB = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.round(b / 1e6)} MB`);
+/** Sub-MB friendly size (the report has KB-scale rows like logs/dictionaries). */
+const fmtSize = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(0, Math.round(b / 1e3))} KB`);
+
+/** Mirror of Rust `commands::storage::{StorageReport, WorkspaceUsage}` (S61). */
+interface WorkspaceUsage {
+  slug: string;
+  name: string;
+  family: string;
+  bytes: number;
+  has_pool: boolean;
+}
+interface StorageReport {
+  data_dir: string;
+  cache_bytes: number;
+  models_bytes: number;
+  msst_bytes: number;
+  runtimes_bytes: number;
+  dictionaries_bytes: number;
+  logs_bytes: number;
+  audition_bytes: number;
+  training_bytes: number;
+  workspaces: WorkspaceUsage[];
+}
+
+/** Everything the OPEN project still references inside the cache tree — passed to
+ *  cleanup_render_cache so the sweep can't break the current session: clip sources
+ *  (audio_cache copies), deposited lane audio (run dirs), decode playback paths, and the
+ *  runtime node-output cache (single-node re-runs read these paths). */
+function collectProtectedPaths(): string[] {
+  const prot = new Set<string>();
+  for (const t of useProjectStore.getState().tracks) {
+    for (const s of t.segments) {
+      if (s.content.type === "audioClip") prot.add(s.content.sourcePath);
+      for (const o of s.processedOutputs ?? []) prot.add(o.audioPath);
+    }
+  }
+  for (const [p, info] of Object.entries(useAudioStore.getState().audioFiles)) {
+    prot.add(p);
+    if (info.playbackPath) prot.add(info.playbackPath);
+  }
+  for (const perSeg of Object.values(useWorkflowStore.getState().nodeOutputs)) {
+    for (const paths of Object.values(perSeg)) {
+      for (const pp of paths) if (pp) prot.add(pp);
+    }
+  }
+  // Stretched artifacts the session has already resolved: the stretchCache memo would keep
+  // serving a deleted path (no existence re-check) → stretched clips dead until restart.
+  for (const p of stretchedArtifactPaths()) prot.add(p);
+  return [...prot];
+}
 
 export function Settings({ onClose }: { onClose: () => void }) {
   const { i18n } = useTranslation();
@@ -273,11 +329,116 @@ export function Settings({ onClose }: { onClose: () => void }) {
       setDataDir(dir);
       setRelocateMsg("migrated");
     } catch (e) {
-      setRelocateMsg(`error: ${e}`);
+      setRelocateMsg(String(e).includes("TRAINING_ACTIVE") ? "error: training" : `error: ${e}`);
     } finally {
       setRelocating(false);
     }
   }, []);
+
+  // ── S61 storage usage + cleanup ──
+  const [storage, setStorage] = useState<StorageReport | null>(null);
+  const [storageScanning, setStorageScanning] = useState(false);
+  const [cleanBusy, setCleanBusy] = useState<string | null>(null); // "cache"|"audition"|"logs"|<slug>
+  const [cleanMsg, setCleanMsg] = useState<string | null>(null);
+  // Live gates: never sweep the render cache while anything might be mid-write into it.
+  const isPlaying = useAudioStore((s) => s.isPlaying);
+  const vocalRenderActive = useAppStore((s) => s.vocalRenderActive);
+  const anyWorkflowRunning = useWorkflowStore((s) => Object.values(s.executions).some((e) => e.status === "running"));
+  const trainingBusy = useTrainingStore((s) => s.snapshot.state === "running" || s.snapshot.state === "starting");
+  const midiExtracting = useAppStore((s) => Object.keys(s.midiExtracting).length > 0);
+  const rangeTesting = useVoiceModelStore((s) => Object.keys(s.rangeTesting).length > 0);
+  const cacheCleanBlocked = isPlaying || vocalRenderActive || anyWorkflowRunning || midiExtracting || rangeTesting;
+
+  const refreshStorage = useCallback(async () => {
+    setStorageScanning(true);
+    try {
+      setStorage(await invoke<StorageReport>("get_storage_report"));
+    } catch (e) {
+      setCleanMsg(String(e));
+    } finally {
+      setStorageScanning(false);
+    }
+  }, []);
+  useEffect(() => { void refreshStorage(); }, [refreshStorage]);
+
+  const cleanupErrText = (e: unknown): string => {
+    const msg = String(e);
+    if (msg.includes("TRAINING_ACTIVE")) return L("stErrTraining");
+    if (msg.includes("CLEANUP_BUSY")) return L("stErrBusy");
+    if (msg.includes("WORKSPACE_MISSING")) return L("stErrWsMissing");
+    return msg;
+  };
+
+  const runCleanup = useCallback(async (key: string, fn: () => Promise<number>, confirm?: { title: string; body: string }) => {
+    if (confirm) {
+      const choice = await showConfirm({
+        title: confirm.title,
+        body: confirm.body,
+        buttons: [
+          { id: "cancel", label: L("rtCancelBtn") },
+          { id: "clean", label: L("stCleanBtn"), kind: "danger" },
+        ],
+      });
+      if (choice !== "clean") return;
+    }
+    setCleanBusy(key);
+    setCleanMsg(null);
+    try {
+      const freed = await fn();
+      setCleanMsg(`${L("stFreed")} ${fmtSize(freed)}`);
+      await refreshStorage();
+    } catch (e) {
+      setCleanMsg(cleanupErrText(e));
+    } finally {
+      setCleanBusy(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshStorage, showConfirm, lang]);
+
+  const handleCleanCache = useCallback(() => {
+    void runCleanup(
+      "cache",
+      () => invoke<number>("cleanup_render_cache", { protected: collectProtectedPaths() }),
+      { title: L("stCacheTitle"), body: L("stCacheBody") },
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runCleanup, lang]);
+
+  const handleCleanAudition = useCallback(() => {
+    void runCleanup("audition", () => invoke<number>("cleanup_audition_caches"), {
+      title: L("stAuditionTitle"),
+      body: L("stAuditionBody"),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runCleanup, lang]);
+
+  const handleCleanLogs = useCallback(() => {
+    void runCleanup("logs", () => invoke<number>("cleanup_logs"));
+  }, [runCleanup]);
+
+  const handleDeleteWorkspace = useCallback((ws: WorkspaceUsage) => {
+    void runCleanup(
+      ws.slug,
+      async () => {
+        const freed = await invoke<number>("delete_training_workspace", { slug: ws.slug });
+        // Keep the training page coherent: the diff card's cached workspace facts (免导入直训 /
+        // 续训 hints) must reflect the deletion immediately — re-probe the CURRENT name.
+        const ts = useTrainingStore.getState();
+        const curName = ts.config.modelName.trim();
+        if (curName) {
+          invoke("get_training_workspace_info", { name: curName })
+            .then((info) => ts.setDiffWsInfo(info as never))
+            .catch(() => {});
+        }
+        return freed;
+      },
+      {
+        title: L("stWsTitle"),
+        body: `${ws.name}${ws.family ? ` · ${ws.family}` : ""} · ${fmtSize(ws.bytes)}\n${L("stWsBody")}${ws.has_pool ? `\n${L("stWsPoolNote")}` : ""}`,
+      },
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runCleanup, lang]);
 
   useEffect(() => {
     const unlisten = listen<CudaProgress>("cuda-download-progress", (e) => {
@@ -349,6 +510,38 @@ export function Settings({ onClose }: { onClose: () => void }) {
       relocating: { zh: "迁移中…", en: "Migrating…", ja: "移行中…" },
       relocated: { zh: "已迁移，重启后生效（旧数据保留，确认无误后可手动删除）", en: "Migrated — restart to apply (old data kept; delete it manually once confirmed)", ja: "移行完了 — 再起動で有効（旧データは保持）" },
       dataDirNote: { zh: "默认在程序目录旁，避免占用 C 盘。模型/缓存会很大，可换到其他盘。", en: "Defaults next to the program (off C:). Models/cache grow large — point this at another drive.", ja: "既定はプログラム横（Cドライブ外）。" },
+      stTitle: { zh: "存储占用与清理", en: "Storage Usage & Cleanup", ja: "ストレージ使用量とクリーンアップ" },
+      stScanning: { zh: "统计中…", en: "Scanning…", ja: "集計中…" },
+      stRefresh: { zh: "重新统计", en: "Rescan", ja: "再集計" },
+      stClean: { zh: "清理", en: "Clean", ja: "クリーン" },
+      stCleanBtn: { zh: "清理", en: "Clean", ja: "クリーン" },
+      stCleaning: { zh: "清理中…", en: "Cleaning…", ja: "クリーン中…" },
+      stFreed: { zh: "已释放", en: "Freed", ja: "解放済み" },
+      stCache: { zh: "渲染/解码缓存", en: "Render/decode caches", ja: "レンダー/デコードキャッシュ" },
+      stCacheTitle: { zh: "清理渲染/解码缓存", en: "Clean render/decode caches", ja: "レンダーキャッシュをクリーン" },
+      stCacheBody: { zh: "删除可再生的缓存（解码副本、变速产物、旧渲染输出）。当前打开工程引用的文件会保留；已保存的 .usp 工程自带渲染副本，不受影响。未保存工程的旧渲染需要重新渲染。", en: "Deletes regenerable caches (decode copies, stretch products, old render outputs). Files referenced by the open project are kept; saved .usp projects carry their own render copies. Unsaved projects' old renders will need re-rendering.", ja: "再生成可能なキャッシュ（デコードコピー、テンポ産物、古いレンダー出力）を削除します。開いているプロジェクトが参照するファイルは保持されます。保存済み .usp はレンダーコピーを内蔵しているため影響ありません。" },
+      stCacheBlocked: { zh: "播放/渲染进行中，暂不可清理", en: "Unavailable while playing/rendering", ja: "再生/レンダリング中は使用不可" },
+      stAudition: { zh: "试听缓存", en: "Audition caches", ja: "試聴キャッシュ" },
+      stAuditionTitle: { zh: "清理试听缓存", en: "Clean audition caches", ja: "試聴キャッシュをクリーン" },
+      stAuditionBody: { zh: "删除模型试听音频与训练候选试听目录（重新试听会自动重建）。", en: "Deletes model audition wavs + training candidate audition dirs (re-auditioning rebuilds them).", ja: "モデル試聴音声とトレーニング候補の試聴フォルダを削除します（再試聴で再生成されます）。" },
+      stLogs: { zh: "日志", en: "Logs", ja: "ログ" },
+      stTraining: { zh: "训练工作区", en: "Training workspaces", ja: "トレーニングワークスペース" },
+      stWsDelete: { zh: "删除", en: "Delete", ja: "削除" },
+      stWsTitle: { zh: "删除训练工作区", en: "Delete training workspace", ja: "ワークスペースを削除" },
+      stWsBody: { zh: "将删除该模型的数据集副本、预处理特征与全部训练 checkpoint——不可恢复，续训将不再可用（已导入到资源管理器的成品模型不受影响）。", en: "Deletes this model's dataset copies, preprocessed features and ALL training checkpoints — irreversible; resume-training becomes unavailable (models already imported into the resource manager are unaffected).", ja: "このモデルのデータセットコピー・前処理特徴・全チェックポイントを削除します。元に戻せず、続きからのトレーニングは不可になります（リソースマネージャに取り込んだモデルは影響ありません）。" },
+      stWsPoolNote: { zh: "注意：该工作区带有可复用数据池——删除后，浅扩散训练将需要重新导入数据。", en: "Note: this workspace holds a reusable dataset pool — after deletion, shallow-diffusion training will require importing data again.", ja: "注意：このワークスペースには再利用可能なデータプールがあります。削除後、浅い拡散トレーニングはデータの再インポートが必要になります。" },
+      stWsPool: { zh: "共享池", en: "pool", ja: "プール" },
+      stWsNone: { zh: "（无训练工作区）", en: "(no workspaces)", ja: "（ワークスペースなし）" },
+      stModels: { zh: "模型资源", en: "Model assets", ja: "モデルアセット" },
+      stModelsNote: { zh: "在「资源管理器」与 MSST 模型管理中管理", en: "Managed in the resource manager & MSST manager", ja: "リソースマネージャと MSST 管理で管理" },
+      stMsst: { zh: "其中分离模型", en: "incl. separation models", ja: "うち分離モデル" },
+      stRuntimes: { zh: "训练环境包", en: "Training runtime packs", ja: "トレーニングランタイム" },
+      stRuntimesNote: { zh: "在下方「训练环境」面板管理", en: "Managed in the Training Runtime panel below", ja: "下の「トレーニング環境」パネルで管理" },
+      stDicts: { zh: "发音词典（必需）", en: "G2P dictionaries (required)", ja: "発音辞書（必須）" },
+      stTotal: { zh: "合计", en: "Total", ja: "合計" },
+      stErrTraining: { zh: "训练进行中，无法清理", en: "Training is running — cleanup unavailable", ja: "トレーニング中はクリーンアップできません" },
+      stErrBusy: { zh: "渲染/试听进行中，稍后再试", en: "Rendering/audition in flight — try again later", ja: "レンダリング/試聴中です。後でもう一度お試しください" },
+      stErrWsMissing: { zh: "工作区不存在（可能已被删除）", en: "Workspace not found (already deleted?)", ja: "ワークスペースが見つかりません" },
       rtTitle: { zh: "训练环境（内嵌 Python 运行时）", en: "Training Runtime (embedded Python)", ja: "トレーニング環境（内蔵 Python）" },
       rtRoot: { zh: "运行时目录", en: "Runtime folder", ja: "ランタイムフォルダ" },
       rtAsciiWarn: { zh: "数据目录路径含非英文字符——内嵌 Python/torch 在此类路径下会加载失败。请先在「存储位置」迁移到纯英文路径（如 D:\\UtaiData）。", en: "Data folder path contains non-ASCII characters — the embedded Python/torch will fail to load there. Migrate the data folder to an ASCII-only path first.", ja: "データフォルダに非 ASCII 文字が含まれています。内蔵 Python/torch が読み込めないため、英数字のみのパスへ移行してください。" },
@@ -486,8 +679,102 @@ export function Settings({ onClose }: { onClose: () => void }) {
             </button>
           </div>
           {relocateMsg === "migrated" && <p className="settings-note">{L("relocated")}</p>}
-          {relocateMsg?.startsWith("error") && <p className="settings-note" style={{ color: "#f87171" }}>{relocateMsg}</p>}
+          {relocateMsg === "error: training" && <p className="settings-note" style={{ color: "#f87171" }}>{L("stErrTraining")}</p>}
+          {relocateMsg?.startsWith("error:") && relocateMsg !== "error: training" && <p className="settings-note" style={{ color: "#f87171" }}>{relocateMsg}</p>}
           <p className="settings-note">{L("dataDirNote")}</p>
+        </section>
+
+        {/* ── S61 存储占用与清理 — everything file/data-related lives together with the data-dir config ── */}
+        <section className="settings-section" style={{ marginTop: 16 }}>
+          <h3 className="settings-section-title">{L("stTitle")}</h3>
+          {!storage && <p className="settings-note">{storageScanning ? L("stScanning") : "…"}</p>}
+          {storage && (
+            <div className="settings-hw-info settings-storage">
+              <div className="settings-row">
+                <span className="settings-label">{L("stCache")}</span>
+                <span className="settings-value">{fmtSize(storage.cache_bytes)}</span>
+                <button
+                  className="settings-mini-btn"
+                  disabled={cleanBusy !== null || cacheCleanBlocked}
+                  title={cacheCleanBlocked ? L("stCacheBlocked") : undefined}
+                  onClick={handleCleanCache}
+                >
+                  {cleanBusy === "cache" ? L("stCleaning") : L("stClean")}
+                </button>
+              </div>
+              <div className="settings-row">
+                <span className="settings-label">{L("stAudition")}</span>
+                <span className="settings-value">{fmtSize(storage.audition_bytes)}</span>
+                <button
+                  className="settings-mini-btn"
+                  disabled={cleanBusy !== null || trainingBusy}
+                  onClick={handleCleanAudition}
+                >
+                  {cleanBusy === "audition" ? L("stCleaning") : L("stClean")}
+                </button>
+              </div>
+              <div className="settings-row">
+                <span className="settings-label">{L("stLogs")}</span>
+                <span className="settings-value">{fmtSize(storage.logs_bytes)}</span>
+                <button className="settings-mini-btn" disabled={cleanBusy !== null} onClick={handleCleanLogs}>
+                  {cleanBusy === "logs" ? L("stCleaning") : L("stClean")}
+                </button>
+              </div>
+              <div className="settings-row">
+                <span className="settings-label">{L("stTraining")}</span>
+                <span className="settings-value">{fmtSize(storage.training_bytes)}</span>
+              </div>
+              {storage.workspaces.length === 0 && (
+                <p className="settings-note" style={{ margin: "2px 0 0" }}>{L("stWsNone")}</p>
+              )}
+              {storage.workspaces.map((ws) => (
+                <div className="settings-row settings-ws-row" key={ws.slug}>
+                  <span className="settings-value settings-ws-name" title={`${ws.name} (${ws.slug})`}>
+                    {ws.name}
+                    {ws.family ? ` · ${ws.family}` : ""}
+                    {ws.has_pool ? ` · ${L("stWsPool")}` : ""}
+                  </span>
+                  <span className="settings-value">{fmtSize(ws.bytes)}</span>
+                  <button
+                    className="settings-mini-btn danger"
+                    disabled={cleanBusy !== null || trainingBusy}
+                    onClick={() => handleDeleteWorkspace(ws)}
+                  >
+                    {cleanBusy === ws.slug ? L("stCleaning") : L("stWsDelete")}
+                  </button>
+                </div>
+              ))}
+              <div className="settings-row">
+                <span className="settings-label">{L("stModels")}</span>
+                <span className="settings-value">
+                  {fmtSize(storage.models_bytes)}
+                  {storage.msst_bytes > 0 ? `（${L("stMsst")} ${fmtSize(storage.msst_bytes)}）` : ""}
+                </span>
+              </div>
+              <p className="settings-note" style={{ margin: "0 0 4px" }}>{L("stModelsNote")}</p>
+              <div className="settings-row">
+                <span className="settings-label">{L("stRuntimes")}</span>
+                <span className="settings-value">{fmtSize(storage.runtimes_bytes)}</span>
+              </div>
+              <p className="settings-note" style={{ margin: "0 0 4px" }}>{L("stRuntimesNote")}</p>
+              <div className="settings-row">
+                <span className="settings-label">{L("stDicts")}</span>
+                <span className="settings-value">{fmtSize(storage.dictionaries_bytes)}</span>
+              </div>
+              <div className="settings-row" style={{ borderTop: "1px solid var(--border-subtle)", paddingTop: 4, marginTop: 2 }}>
+                <span className="settings-label">{L("stTotal")}</span>
+                <span className="settings-value">
+                  {fmtSize(storage.cache_bytes + storage.models_bytes + storage.runtimes_bytes + storage.dictionaries_bytes + storage.training_bytes + storage.logs_bytes)}
+                </span>
+              </div>
+            </div>
+          )}
+          <div className="settings-field" style={{ marginTop: 6 }}>
+            <button className="settings-mini-btn" disabled={storageScanning || cleanBusy !== null} onClick={() => void refreshStorage()}>
+              {storageScanning ? L("stScanning") : L("stRefresh")}
+            </button>
+            {cleanMsg && <span className="settings-value" style={{ fontSize: 11 }}>{cleanMsg}</span>}
+          </div>
         </section>
 
         <section className="settings-section" style={{ marginTop: 16 }}>

@@ -10,5 +10,6 @@ pub mod project;
 pub mod pyenv;
 pub mod separation;
 pub mod settings;
+pub mod storage;
 pub mod training;
 pub mod window;
