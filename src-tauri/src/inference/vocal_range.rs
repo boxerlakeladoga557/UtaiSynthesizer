@@ -30,14 +30,14 @@ pub struct SpeakerRange {
     pub comfort: (f32, f32),
 }
 
-/// Parse the sidecar `vocal_range` record for one speaker id (falls back to speaker "0"
-/// when the exact id has no record — single-speaker models always test as 0).
+/// Parse the sidecar `vocal_range` record for one speaker id. EXACT id only — an untested
+/// speaker of a multi-speaker model must read as "no record" (no shift; the resource manager
+/// offers per-speaker 补做), NOT silently borrow speaker 0's range and transpose by the wrong
+/// singer's zone (audit S60). Single-speaker models resolve to id 0 exactly anyway.
 pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRange> {
     let rec = config.extra.get("vocal_range")?;
     let speakers = rec.get("speakers")?;
-    let sp = speakers
-        .get(speaker_id.to_string())
-        .or_else(|| speakers.get("0"))?;
+    let sp = speakers.get(speaker_id.to_string())?;
     let pair = |key: &str| -> Option<(f32, f32)> {
         let v = sp.get(key)?.as_array()?;
         let lo = v.first()?.as_f64()? as f32;
@@ -192,8 +192,8 @@ mod tests {
         config.extra = json;
         let r = speaker_range(&config, 0).unwrap();
         assert_eq!(r.comfort, (52.0, 79.0));
-        // unknown speaker falls back to speaker 0's record
-        assert_eq!(speaker_range(&config, 3), Some(r));
+        // an UNTESTED speaker must read as no-record (no silent speaker-0 borrow — audit S60)
+        assert_eq!(speaker_range(&config, 3), None);
     }
 
 }

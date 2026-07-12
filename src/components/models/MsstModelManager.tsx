@@ -326,6 +326,13 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
 
   const handleImport = useCallback(async () => {
     if (!modelPath || !modelName) return;
+    // S60 audit: a running range test stamps THIS name's sidecar at its TAIL (after the render
+    // guard released) — a REPLACE import racing that window would get the OLD model's record
+    // stamped onto the NEW files. Block while the test runs.
+    if (useVoiceModelStore.getState().rangeTesting[modelName] !== undefined) {
+      setErr(t18({ zh: "该模型正在音域测试中，请稍后再导入", en: "This model's range test is running — import later", ja: "このモデルは音域テスト中です。後で取り込んでください" }, lang));
+      return;
+    }
     setImporting(true);
     setErr("");
     try {
@@ -349,10 +356,11 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
       }
       onDone();
     } catch (e) {
-      setErr(String(e));
+      const msg = String(e);
+      setErr(auditionBusyMessage(msg, lang) ?? msg);
     }
     setImporting(false);
-  }, [modelPath, modelName, voiceType, indexPath, diffusionPath, diffusionConfigPath, avatarPath, vocoderConfigPath, onDone]);
+  }, [modelPath, modelName, voiceType, indexPath, diffusionPath, diffusionConfigPath, avatarPath, vocoderConfigPath, onDone, lang]);
 
   const isRvc = voiceType === "rvc";
   const Z = (key: string) => {
@@ -683,17 +691,41 @@ function VoiceModelsTab({ lang }: { lang: string }) {
 
   useEffect(() => { void fetchModels(); }, [fetchModels]);
 
+  // S60-4: tab unmount = the audition UI is gone — stop OUR playback (ownership proven
+  // against preview.path; a foreign consumer's playback is untouched) and clear the state.
+  useEffect(() => () => {
+    const a = useVoiceModelStore.getState().auditionState;
+    if (a) {
+      if (a.phase === "playing" && preview.path === a.path) {
+        preview.onEnd = null;
+        preview.stop();
+      }
+      useVoiceModelStore.getState().setAuditionState(null);
+    }
+  }, []);
+
   const handleDelete = useCallback(async (name: string) => {
+    // S60 audit: a running range test writes this model's sidecar at its tail (and an
+    // audition writes a wav beside it — Rust also guards that one); block the delete.
+    const vm = useVoiceModelStore.getState();
+    if (vm.rangeTesting[name] !== undefined || vm.auditionState?.name === name) {
+      useAppStore.getState().showToast(
+        t18({ zh: "该模型正在测试/试听中，稍后再删除", en: "This model is being tested/auditioned — delete later", ja: "このモデルはテスト/試聴中です。後で削除してください" }, lang),
+        "info",
+      );
+      setDeleteConfirm(null);
+      return;
+    }
     // type-scoped: same-name entries across types are standard (rvc+sovits pair
     // + a vocoder named after the singer) — an untyped delete hits the first
     // scan match, i.e. potentially the WRONG model's files (S40 红队 A5)
     await deleteModel(name, voiceType); // errors land in voiceError
     setDeleteConfirm(null);
-  }, [deleteModel, voiceType]);
+  }, [deleteModel, voiceType, lang]);
 
   return (
     <div className="rm-voice-tab">
-      {voiceError && <div className="msst-error" onClick={clearError}>{voiceError}</div>}
+      {voiceError && <div className="msst-error" onClick={clearError}>{auditionBusyMessage(voiceError, lang) ?? voiceError}</div>}
       <div className="msst-filter">
         <button className={voiceType === "rvc" ? "active" : ""} onClick={() => setVoiceType("rvc")}>RVC</button>
         <button className={voiceType === "sovits" ? "active" : ""} onClick={() => setVoiceType("sovits")}>SoVITS</button>
@@ -907,65 +939,81 @@ function VoiceModelsTab({ lang }: { lang: string }) {
 // through the shared preview singleton (contract: stop + assign onEnd on takeover, stop +
 // null onEnd on unmount — previewPlayer.ts header). ───
 
+/** Localize the shared render/training busy guards (pre-existing S41 Chinese guard strings +
+ *  the S60 MODEL_BUSY_AUDITION code) — en/ja users must not see raw backend Chinese (audit). */
+function auditionBusyMessage(msg: string, lang: string): string | null {
+  const busy =
+    msg.includes("MODEL_BUSY_AUDITION") ||
+    msg.includes("试听渲染") ||
+    msg.includes("训练进行中") ||
+    msg.includes("翻唱渲染");
+  if (!busy) return null;
+  return t18({
+    zh: "有渲染/训练/试听任务占用，请稍后再试",
+    en: "A render/training/audition task is busy — try again later",
+    ja: "レンダリング/トレーニング/試聴タスクが実行中です。後でもう一度お試しください",
+  }, lang);
+}
+
 function VoiceAuditionButton({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: "rvc" | "sovits"; lang: string }) {
-  const [phase, setPhase] = useState<"idle" | "rendering" | "playing">("idle");
+  // shared audition state (audit S60): the preview player is a singleton — per-row local
+  // state desyncs on takeover; ownership of a stop() is proven against preview.path.
+  const audition = useVoiceModelStore((s) => s.auditionState);
   const [spk, setSpk] = useState(0);
   const speakers = voiceSpeakerOptions(m);
   const showToast = useAppStore((s) => s.showToast);
-  const aliveRef = useRef(true);
-
-  useEffect(() => {
-    aliveRef.current = true;
-    return () => {
-      aliveRef.current = false;
-      // stop on unmount: the button is gone, a still-playing preview would be unstoppable
-      if (preview.onEnd) {
-        preview.onEnd = null;
-        preview.stop();
-      }
-    };
-  }, []);
+  const phase = audition?.name === m.name ? audition.phase : "idle";
 
   const start = useCallback(async () => {
-    if (phase === "playing") {
-      preview.onEnd = null;
-      preview.stop();
-      setPhase("idle");
-      return;
+    const st = useVoiceModelStore.getState();
+    const cur = st.auditionState;
+    if (cur?.name === m.name) {
+      if (cur.phase === "playing") {
+        if (preview.path === cur.path) {
+          // we still own the player — a foreign consumer (training page) may have taken over
+          preview.onEnd = null;
+          preview.stop();
+        }
+        st.setAuditionState(null);
+      }
+      return; // rendering → ignore (Rust FlightGuard is the real gate anyway)
     }
-    if (phase === "rendering") return;
-    setPhase("rendering");
+    if (cur) return; // another row is busy
+    st.setAuditionState({ name: m.name, phase: "rendering" });
     try {
       const path = await invoke<string>("render_model_audition", {
         name: m.name,
         modelType: voiceType,
         speakerId: speakers.length > 1 ? spk : null,
       });
-      if (!aliveRef.current) return;
+      // the manager may have closed / the state may have been torn down mid-render
+      if (useVoiceModelStore.getState().auditionState?.name !== m.name) return;
       const bytes = await readFile(path);
       const buf = await preview.decode(new Uint8Array(bytes));
-      if (!aliveRef.current) return;
-      preview.stop();
+      if (useVoiceModelStore.getState().auditionState?.name !== m.name) return;
+      preview.stop(); // explicit user intent — supersede whatever was playing
       preview.onEnd = () => {
         preview.onEnd = null;
-        if (aliveRef.current) setPhase("idle");
+        const a = useVoiceModelStore.getState().auditionState;
+        if (a?.name === m.name) useVoiceModelStore.getState().setAuditionState(null);
       };
       await preview.play(path, buf);
-      setPhase("playing");
+      useVoiceModelStore.getState().setAuditionState({ name: m.name, phase: "playing", path });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      if (aliveRef.current) {
-        showToast(`${t18({ zh: "试听失败", en: "Audition failed", ja: "試聴に失敗しました" }, lang)}: ${msg}`, "error");
-        setPhase("idle");
+      const busy = auditionBusyMessage(msg, lang);
+      showToast(busy ?? `${t18({ zh: "试听失败", en: "Audition failed", ja: "試聴に失敗しました" }, lang)}: ${msg}`, busy ? "info" : "error");
+      if (useVoiceModelStore.getState().auditionState?.name === m.name) {
+        useVoiceModelStore.getState().setAuditionState(null);
       }
     }
-  }, [phase, m.name, voiceType, spk, speakers.length, lang, showToast]);
+  }, [m.name, voiceType, spk, speakers.length, lang, showToast]);
 
   return (
     <span className="rm-audition">
       {speakers.length > 1 && phase === "idle" && (
         <select
-          className="rm-audition-spk"
+          className="sep-model-select rm-audition-spk"
           value={spk}
           title={t18({ zh: "试听歌手", en: "Audition speaker", ja: "試聴する話者" }, lang)}
           onChange={(e) => setSpk(Number(e.target.value))}
@@ -997,10 +1045,21 @@ function VoiceAuditionButton({ m, voiceType, lang }: { m: VoiceModelEntry; voice
 function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: "rvc" | "sovits"; lang: string }) {
   const progress = useVoiceModelStore((s) => s.rangeTesting[m.name]);
   const [editing, setEditing] = useState(false);
-  const [lo, setLo] = useState(0);
-  const [hi, setHi] = useState(0);
+  const [lo, setLo] = useState("0");
+  const [hi, setHi] = useState("0");
   const rec = (m.config as { vocal_range?: { speakers?: Record<string, SpeakerRangeRecord> } }).vocal_range;
   const sp = rec?.speakers?.["0"];
+  const commit = async () => {
+    // clamp AT COMMIT, not per keystroke — a keystroke clamp makes most targets untypable
+    // ("4" → clamped to 40 before the "8" of 48 arrives; audit S60)
+    const pLo = parseInt(lo, 10);
+    const pHi = parseInt(hi, 10);
+    if (!sp || Number.isNaN(pLo) || Number.isNaN(pHi)) { setEditing(false); return; }
+    const a = Math.max(sp.usable[0], Math.min(sp.usable[1], Math.min(pLo, pHi)));
+    const b = Math.max(sp.usable[0], Math.min(sp.usable[1], Math.max(pLo, pHi)));
+    await setComfortRange(m.name, voiceType, 0, [a, b]);
+    setEditing(false);
+  };
 
   if (progress !== undefined) {
     return (
@@ -1020,10 +1079,6 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
       </span>
     );
   }
-  const commit = async () => {
-    await setComfortRange(m.name, voiceType, 0, [lo, hi]);
-    setEditing(false);
-  };
   return (
     <span className="rm-range-row">
       <span
@@ -1043,16 +1098,16 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
             className="rm-range-input"
             type="text"
             value={lo}
-            onChange={(e) => setLo(Math.max(sp.usable[0], Math.min(sp.usable[1], parseInt(e.target.value, 10) || sp.usable[0])))}
-            title={`${midiName(lo)} (MIDI ${lo})`}
+            onChange={(e) => setLo(e.target.value)}
+            title={Number.isNaN(parseInt(lo, 10)) ? "MIDI" : `${midiName(parseInt(lo, 10))} (MIDI ${lo})`}
           />
           <span>–</span>
           <input
             className="rm-range-input"
             type="text"
             value={hi}
-            onChange={(e) => setHi(Math.max(sp.usable[0], Math.min(sp.usable[1], parseInt(e.target.value, 10) || sp.usable[1])))}
-            title={`${midiName(hi)} (MIDI ${hi})`}
+            onChange={(e) => setHi(e.target.value)}
+            title={Number.isNaN(parseInt(hi, 10)) ? "MIDI" : `${midiName(parseInt(hi, 10))} (MIDI ${hi})`}
           />
           <button className="rm-range-btn" onClick={() => void commit()}>OK</button>
           <button
@@ -1068,7 +1123,7 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
           <button
             className="rm-range-btn"
             title={t18({ zh: "在可用区间内微调舒适区（MIDI 音号）", en: "Adjust the comfort zone within usable (MIDI numbers)", ja: "使用可能域の中で快適域を調整（MIDI 番号）" }, lang)}
-            onClick={() => { setLo(sp.comfort[0]); setHi(sp.comfort[1]); setEditing(true); }}
+            onClick={() => { setLo(String(sp.comfort[0])); setHi(String(sp.comfort[1])); setEditing(true); }}
           >
             {t18({ zh: "调整", en: "Adjust", ja: "調整" }, lang)}
           </button>

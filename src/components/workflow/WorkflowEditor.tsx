@@ -379,6 +379,10 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
       const id = `${type}-${crypto.randomUUID().slice(0, 8)}`;
       const defaultParams: Record<string, unknown> = { ...(extraParams ?? {}) };
       if (type === "audioOutput") defaultParams.laneLabel = DEFAULT_OUTPUT_GROUP;
+      // S60-2: NEW voice nodes opt into range extension EXPLICITLY (the persisted key rides the
+      // graph into .usp). DEFAULTS/serde both carry false so an OLD graph's absent key stays OFF
+      // — never silently change a pre-S60 node's render (audit S60 MAJOR).
+      if (type === "rvc" || type === "sovits") defaultParams.range_extend = true;
       const newNode: Node = {
         id,
         type,
@@ -405,6 +409,10 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
       const id = `${type}-${crypto.randomUUID().slice(0, 8)}`;
       const defaultParams: Record<string, unknown> = { ...(extraParams ?? {}) };
       if (type === "audioOutput") defaultParams.laneLabel = DEFAULT_OUTPUT_GROUP;
+      // S60-2: NEW voice nodes opt into range extension EXPLICITLY (the persisted key rides the
+      // graph into .usp). DEFAULTS/serde both carry false so an OLD graph's absent key stays OFF
+      // — never silently change a pre-S60 node's render (audit S60 MAJOR).
+      if (type === "rvc" || type === "sovits") defaultParams.range_extend = true;
       const newNode: Node = {
         id,
         type,

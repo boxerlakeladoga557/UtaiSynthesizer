@@ -287,12 +287,26 @@ fn infer_segment(
     // S60-2 音域扩展 (chunk-level tier): each silence-sliced piece is a natural phrase unit —
     // the constant-ratio inverse's seams land in the silence between pieces. Bounds from the
     // TRANSPOSED f0 (what the model would be asked to sing); shift 0 ⇒ untouched path.
-    let range_shift = range.map(|r| super::vocal_range::piece_range_shift(&f0, &r)).unwrap_or(0);
+    // Two audit-mandated guards:
+    //   - auto_f0 (m.f0_predictor_session) REPLACES the fed f0 inside decode_features — a shift
+    //     would neither be sung nor match the inverse guide → force tier 0 (mirrors the vocal
+    //     path's force-neutralize convention);
+    //   - the guide must be f0×uv: sovits_f0_postprocess interpolates unvoiced frames NON-ZERO
+    //     (uv carries the mask), so a raw clone would present psola_shift one giant voiced
+    //     island and wet-process fricatives/breaths (the RVC path's pitchf keeps real zeros).
+    let range_shift = if m.f0_predictor_session.is_some() {
+        if range.is_some() {
+            tracing::info!("range-extend(cover/sovits): auto_f0 active — range extension disabled for this render");
+        }
+        0
+    } else {
+        range.map(|r| super::vocal_range::piece_range_shift(&f0, &r)).unwrap_or(0)
+    };
     let f0_for_inverse = if range_shift != 0 {
         let k = 2.0f32.powf(range_shift as f32 / 12.0);
         f0.iter_mut().for_each(|v| *v *= k);
         tracing::info!("range-extend(cover/sovits): piece {seg_idx} rendered {range_shift:+} st into comfort");
-        Some(f0.clone())
+        Some(f0.iter().zip(uv.iter()).map(|(f, u)| f * u).collect::<Vec<f32>>())
     } else {
         None
     };
@@ -338,9 +352,10 @@ fn infer_segment(
         m, c, f0, uv, vol, &wav_m, seg_idx, n_frames, has_diff, p_vits, options, report, cancel,
     )?;
 
-    // S60-2: shift the decoded audio back by -range_shift (TD-PSOLA guided by the exact fed
-    // f0 — one frame per hop_size output samples). Runs on the still-padded signal so the
-    // trim below is untouched; the pad regions are unvoiced (f0=0) and pass through dry.
+    // S60-2: shift the decoded audio back by -range_shift (TD-PSOLA guided by fed-f0 × uv —
+    // one frame per hop_size output samples; unvoiced frames are true zeros so fricatives/
+    // breaths pass through dry). Runs on the still-padded signal so the trim below is
+    // untouched; the pad regions carry uv=0 (edge-filled f0 is masked out) → dry, then trimmed.
     if let Some(f0s) = &f0_for_inverse {
         out = super::vocal_range::psola_inverse_hop(out, f0s, m.hop_size, m.sample_rate, range_shift);
     }

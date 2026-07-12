@@ -65,6 +65,12 @@ interface VoiceModelStore {
    *  the resource-manager progress row + the double-trigger guard (rangeTest.ts). */
   rangeTesting: Record<string, number>;
   setRangeTesting: (name: string, progress: number | null) => void;
+  /** S60-4 试听 state — ONE shared record (the preview player is a singleton, so at most one
+   *  row can be rendering/playing; audit S60: per-row local state desyncs on takeover/unmount).
+   *  `path` = the wav given to preview.play — ownership proof before any stop() (never kill a
+   *  foreign consumer's playback, e.g. the training page's). */
+  auditionState: { name: string; phase: "rendering" | "playing"; path?: string } | null;
+  setAuditionState: (s: { name: string; phase: "rendering" | "playing"; path?: string } | null) => void;
 
   /** Refresh ALL lists (backend scan() runs inside list_models, so this picks up disk changes). */
   fetchModels: () => Promise<void>;
@@ -87,6 +93,8 @@ export const useVoiceModelStore = create<VoiceModelStore>((set, get) => ({
       else next[name] = progress;
       return { rangeTesting: next };
     }),
+  auditionState: null,
+  setAuditionState: (s) => set({ auditionState: s }),
 
   fetchModels: async () => {
     try {

@@ -155,21 +155,25 @@ export async function loadAudioBuffer(filePath: string): Promise<AudioBuffer> {
 function prewarmScheduleSources(
   tracks: Track[],
   audioFiles: Record<string, AudioTrackData>,
-  gen: number,
+  playheadTick: number,
+  supersededBy: number,
 ): Promise<unknown> {
   const jobs: Promise<void>[] = [];
   const warm = (path: string, r: number) => {
     jobs.push(
       (async () => {
         const p = r !== 1 ? await ensureStretched(path, r) : path;
-        if (gen !== playGeneration) return;
+        if (playGeneration !== supersededBy) return;
         if (!loadedBuffers.get(p)) await loadAudioBuffer(p);
       })().catch(() => {}),
     );
   };
   for (const track of tracks) {
     for (const seg of track.segments) {
-      if (seg.loading) continue;
+      // mirror the loop's own skip: a segment fully behind the playhead never schedules,
+      // so warming it would decode dead weight (audit S60 — a play from the outro must not
+      // pay for the whole song's stems)
+      if (seg.loading || seg.startTick + seg.durationTicks <= playheadTick) continue;
       const r = segStretch(seg);
       if (segmentPlaysLanes(track, seg)) {
         for (const out of seg.processedOutputs ?? []) {
@@ -191,15 +195,19 @@ export async function playAllTracks(
   tempo: number,
   onAllEnded: () => void,
 ): Promise<"started" | "empty" | "superseded"> {
+  // Parallel cache warm-up BEFORE stopPlayback(): during a mid-playback reschedule the OLD
+  // schedule keeps sounding while cold sources decode (warming after the stop would silence
+  // everything for the whole warm-up and snap the playhead back by that much — audit S60
+  // MAJOR). The initial play has nothing sounding, so ordering doesn't matter there.
+  // Competition: any newer playAllTracks (or a manual stop) bumps playGeneration — compare
+  // against the ENTRY snapshot (stopPlayback below bumps too, so the snapshot is only valid
+  // for the pre-stop window).
+  const genAtStart = playGeneration;
+  await prewarmScheduleSources(tracks, audioFiles, playheadTick, genAtStart);
+  if (playGeneration !== genAtStart) return "superseded"; // a newer call raced past us
+
   stopPlayback();
   const gen = ++playGeneration;
-
-  // Parallel cache warm-up BEFORE the AudioContext timing anchor is taken: N stems decode
-  // concurrently instead of serially inside the loop (the "press Play → frozen for seconds"
-  // first-play cliff), AND `now` is captured after the heavy lifting so the late-compensation
-  // path sees near-zero lateness.
-  await prewarmScheduleSources(tracks, audioFiles, gen);
-  if (gen !== playGeneration) return "superseded";
 
   const ctx = getContext();
   const now = ctx.currentTime;

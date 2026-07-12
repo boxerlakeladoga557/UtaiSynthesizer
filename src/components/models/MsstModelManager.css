@@ -681,7 +681,7 @@
   margin-top: 2px;
 }
 .rm-range-testing {
-  color: var(--accent);
+  color: var(--accent-primary);
 }
 .rm-range-missing {
   color: var(--text-muted);
@@ -716,6 +716,6 @@
 }
 .rm-audition-spk {
   max-width: 90px;
-  height: 20px;
   font-size: var(--font-size-xs);
+  padding: 1px 4px;
 }

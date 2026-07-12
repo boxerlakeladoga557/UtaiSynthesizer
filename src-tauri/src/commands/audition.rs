@@ -991,5 +991,5 @@ pub async fn render_model_audition(
         })
     })
     .await
-    .map_err(|e| format!("试听渲染任务失败: {}", e))?
+    .map_err(|e| format!("AUDITION_FAILED: join: {e}"))?
 }

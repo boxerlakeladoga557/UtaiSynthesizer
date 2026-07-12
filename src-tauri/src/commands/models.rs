@@ -57,6 +57,11 @@ pub async fn import_model(
     let mt = parse_voice_type(&model_type)
         .ok_or_else(|| format!("Unsupported model type: {}", model_type))?;
 
+    // S60-4 audit: block REPLACE while an audition render is in flight (see delete_model — the
+    // stale audition wav would land beside the NEW model's files at completion).
+    if crate::commands::audition::AUDITION_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("MODEL_BUSY_AUDITION".to_string());
+    }
     // A same-name re-import REPLACES the model on disk — drop any live inference session first,
     // or it would keep serving the stale ONNX (and leak the old RvcIndex RAM).
     state.inference.unload_voice(&name);
@@ -157,6 +162,13 @@ pub async fn delete_model(
     // first-match delete of a vocoder named after its singer would remove the
     // SINGER MODEL's files (scan order rvc→sovits→…→nsf_hifigan).
     let mt = model_type.as_deref().and_then(parse_voice_type);
+    // S60-4 audit: an in-flight audition writes `<stem>.audition_spk{N}.wav` NEXT TO the model
+    // at completion — deleting (or REPLACE-importing, below) mid-render would let that stale
+    // wav land beside the new files and impersonate the new model forever. Same guard class as
+    // start_training/reset_training_display (S41-INT-4 check-then-act).
+    if crate::commands::audition::AUDITION_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("MODEL_BUSY_AUDITION".to_string());
+    }
     // Unload BEFORE removing files: a loaded session would keep serving the deleted model (and
     // on Windows can hold the .onnx file open, blocking removal).
     state.inference.unload_voice(&name);

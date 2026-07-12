@@ -280,7 +280,24 @@ export async function renderVocalSegment(req: {
  *  derives its 50fps grid + f0 from the tempo, so a BPM change alters the bake even with identical notes.
  *  Reuses the history helpers (single source — never fork a sig). */
 export function vocalRenderSig(track: Track, seg: Segment, tempo: number): string {
-  return `${contentSig(seg.content)}|vp:${vocalParamsSig(track.vocalParams)}|vm:${track.voiceModel ?? ""}|bpm:${tempo}`;
+  return `${contentSig(seg.content)}|vp:${vocalParamsSig(track.vocalParams)}|vm:${track.voiceModel ?? ""}|bpm:${tempo}|rr:${rangeRecordSig(track)}`;
+}
+
+/** S60-2 audit: the model's vocal_range record IS a render input (it decides the tier shift),
+ *  so a re-test / comfort adjustment must dirty the bakes that used it — else Play keeps
+ *  serving audio rendered under the OLD zone. Only the usable/comfort bounds matter (the raw
+ *  per-semitone scan doesn't feed the render); gated off when the track opted out. */
+function rangeRecordSig(track: Track): string {
+  const vp = track.vocalParams ?? DEFAULT_VOCAL_PARAMS;
+  if (vp.rangeExtend === false || !track.voiceModel) return "";
+  const entry = useVoiceModelStore.getState().models[vp.backend]?.find((m) => m.name === track.voiceModel);
+  const rec = (entry?.config as { vocal_range?: { speakers?: Record<string, { usable?: unknown; comfort?: unknown }> } } | undefined)
+    ?.vocal_range;
+  if (!rec?.speakers) return "";
+  return Object.entries(rec.speakers)
+    .map(([id, sp]) => `${id}=${JSON.stringify(sp?.usable)}~${JSON.stringify(sp?.comfort)}`)
+    .sort()
+    .join(",");
 }
 
 /** Split a segment (audioClip OR notes) at `tick`, carrying + windowing a CLEAN vocal bake so the split needs

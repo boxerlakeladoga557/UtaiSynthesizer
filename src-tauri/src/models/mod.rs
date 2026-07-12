@@ -754,10 +754,22 @@ impl ModelRegistry {
             .find(|e| e.name == name && &e.model_type == model_type)
             .ok_or_else(|| crate::UtaiError::Model(format!("Model '{}' not found", name)))?;
         let json_path = entry.path.with_extension("json");
-        let mut map: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&json_path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
+        // A PRESENT-but-unreadable/corrupt sidecar must ABORT, not silently degrade to an empty
+        // map — that would rewrite the whole file as {key:…} and destroy inputs/sample_rate/
+        // speakers (audit S60: "preserve unknown keys" must never become "wipe the file").
+        // Only a genuinely absent file may start empty.
+        let mut map: serde_json::Map<String, serde_json::Value> = if json_path.exists() {
+            let text = std::fs::read_to_string(&json_path)
+                .map_err(|e| crate::UtaiError::Model(format!("sidecar read {}: {e}", json_path.display())))?;
+            serde_json::from_str(&text).map_err(|e| {
+                crate::UtaiError::Model(format!(
+                    "sidecar {} unparseable — refusing to rewrite it: {e}",
+                    json_path.display()
+                ))
+            })?
+        } else {
+            Default::default()
+        };
         map.insert(key.to_string(), value.clone());
         std::fs::write(
             &json_path,

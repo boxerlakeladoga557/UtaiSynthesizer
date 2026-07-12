@@ -47,7 +47,10 @@ export interface RvcOptions {
   spk_mix: SpkMixEntry[];
   /** S60-2 音域扩展 (cover): out-of-comfort chunks render translated into the model's tested
    * comfort zone and are TD-PSOLA'd back. No-op without a sidecar vocal_range record; in-range
-   * chunks are byte-identical either way. New nodes default ON; absent key (old graphs) = off. */
+   * chunks are byte-identical either way. DEFAULTS carry false (= the Rust serde default, so an
+   * old graph's absent key stays OFF — audit S60: buildVoiceOptions fills absent keys from
+   * DEFAULTS, so a `true` here would silently flip every pre-S60 node ON). NEW nodes get an
+   * explicit `range_extend: true` written into their params at creation (WorkflowEditor). */
   range_extend: boolean;
   /** KNN index feature blend, 0..1. */
   index_ratio: number;
@@ -124,7 +127,7 @@ export const RVC_DEFAULTS: RvcOptions = {
   f0_shift: 0,
   speaker_id: null,
   spk_mix: [],
-  range_extend: true,
+  range_extend: false,
   index_ratio: 0.75,
   protect: 0.33,
   noise_scale: 0.66666,
@@ -140,7 +143,7 @@ export const SOVITS_DEFAULTS: SovitsOptions = {
   f0_shift: 0,
   speaker_id: null,
   spk_mix: [],
-  range_extend: true,
+  range_extend: false,
   noise_scale: 0.4,
   cluster_ratio: 0,
   loudness_envelope: 1.0,
