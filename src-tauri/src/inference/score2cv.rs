@@ -581,7 +581,7 @@ mod tests {
             (768usize, "score2cv_768.onnx", cvref::REF_768),
             (256usize, "score2cv_256.onnx", cvref::REF_256),
         ] {
-            let path: PathBuf = root.join("../data/models/aux").join(model);
+            let path: PathBuf = root.join("../data/models").join(crate::models::AUX_DIR_NAME).join(model);
             assert!(path.exists(), "model missing: {}", path.display());
             let sid = engine.load_model_with(&path, false).unwrap();
             assert_eq!(chunks.len(), refs.len(), "chunk count vs reference");

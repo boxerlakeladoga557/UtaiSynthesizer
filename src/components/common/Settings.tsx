@@ -524,7 +524,10 @@ export function Settings({ onClose }: { onClose: () => void }) {
       setCudaProgress(e.payload);
       if (e.payload.stage === "done") {
         setCudaDownloading(false);
-        setCudaReady(true);
+        // Re-query the REAL readiness instead of optimistically flipping true — is_cuda_runtime_ready
+        // also verifies cudart/cuDNN resolvability, and an optimistic true that reverts on the next
+        // restart reads as "CUDA disappeared" (S64b beta report).
+        invoke<boolean>("is_cuda_runtime_ready").then(setCudaReady).catch(() => {});
         setCudaJustInstalled(true);
       }
     });
@@ -638,7 +641,8 @@ export function Settings({ onClose }: { onClose: () => void }) {
     try {
       await invoke("download_cuda_runtime");
     } catch (e) {
-      setCudaError(String(e));
+      // CUDA_TOOLKIT_REQUIRED etc. → localized via the shared mapper (raw fallback for oddballs).
+      setCudaError(backendErrorMessage(e) ?? String(e));
       setCudaDownloading(false);
     }
   }, []);

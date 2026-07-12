@@ -808,9 +808,9 @@ function VoiceModelsTab({ lang }: { lang: string }) {
                   <span
                     className="rm-voice-item-warn"
                     title={t18({
-                      zh: `缺少文件：${defaultVoc.missing.join("、")}——请将其放入 data/models/aux/，否则浅扩散/增强器无法运行`,
-                      en: `Missing: ${defaultVoc.missing.join(", ")} — place them in data/models/aux/ or shallow diffusion / the enhancer cannot run`,
-                      ja: `欠落ファイル：${defaultVoc.missing.join("、")} — data/models/aux/ に配置してください。ないと浅い拡散/エンハンサーは動きません`,
+                      zh: `缺少文件：${defaultVoc.missing.join("、")}——请到 设置→模型资产 下载推理核心包（或手动放入 data/models/auxiliary/），否则浅扩散/增强器无法运行`,
+                      en: `Missing: ${defaultVoc.missing.join(", ")} — download the core inference pack in Settings → Model Assets (or place them in data/models/auxiliary/), or shallow diffusion / the enhancer cannot run`,
+                      ja: `欠落ファイル：${defaultVoc.missing.join("、")} — 設定→モデルアセット で推論コアパックをダウンロード（または data/models/auxiliary/ に配置）してください。ないと浅い拡散/エンハンサーは動きません`,
                     }, lang)}
                   >
                     {t18({ zh: "缺失", en: "Missing", ja: "欠落" }, lang)}

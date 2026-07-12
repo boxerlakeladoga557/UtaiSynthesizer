@@ -745,6 +745,7 @@
     "TRAINING_UNKNOWN_ERROR": "Unknown training error",
     "ASSET_DL_BUSY": "A model-asset download is already running — wait for it to finish",
     "ASSET_DL_FAILED": "Model asset download failed",
+    "CUDA_TOOLKIT_REQUIRED": "CUDA requires the NVIDIA CUDA Toolkit 12.x installed first (provides cudart/cublas). Use the default DirectML (works on any GPU), or install the Toolkit and retry",
     "UPDATE_CHECK_FAILED": "Update check failed (network or update source unreachable)",
     "UPDATE_DOWNLOAD_FAILED": "Update download failed",
     "UPDATE_INSTALL_FAILED": "Failed to launch the update installer",

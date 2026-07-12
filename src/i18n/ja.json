@@ -745,6 +745,7 @@
     "TRAINING_UNKNOWN_ERROR": "不明なトレーニングエラーです",
     "ASSET_DL_BUSY": "モデルアセットのダウンロードが既に実行中です。完了をお待ちください",
     "ASSET_DL_FAILED": "モデルアセットのダウンロードに失敗しました",
+    "CUDA_TOOLKIT_REQUIRED": "CUDA を使うには NVIDIA CUDA Toolkit 12.x のインストールが必要です（cudart/cublas を提供）。未インストールの場合は既定の DirectML（どの GPU でも動作）を使うか、Toolkit をインストールして再試行してください",
     "UPDATE_CHECK_FAILED": "更新の確認に失敗しました（ネットワークまたは更新元に到達できません）",
     "UPDATE_DOWNLOAD_FAILED": "更新パッケージのダウンロードに失敗しました",
     "UPDATE_INSTALL_FAILED": "更新インストーラーの起動に失敗しました",

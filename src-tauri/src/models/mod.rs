@@ -59,6 +59,15 @@ pub enum ModelFormat {
     Pth,
 }
 
+/// Shared-model directory name under models_dir (ContentVec / RMVPE / NSF-HiFiGAN / ScoreToCV /
+/// GAME). S64b: this was `aux` — **a reserved Windows device name** (CON/PRN/AUX/NUL/COM*/LPT*).
+/// Most Windows installs refuse to create such a directory (os error 267 "目录名称无效") or to open
+/// it (error 1200 "指定的设备名无效"); only very new Win11 builds (like the dev machine) relax the
+/// rule, which is why this NEVER failed in development but broke every beta tester. Startup migrates
+/// an existing old `aux` dir by rename (lib.rs setup). NEVER name any shipped file/dir after a
+/// DOS device again.
+pub const AUX_DIR_NAME: &str = "auxiliary";
+
 /// Models-dir subdirectory for a model type. Single source of truth — also the `--type` string
 /// passed to converter/convert.py and the `type` field written into sidecar json.
 pub(crate) fn type_subdir(model_type: &ModelType) -> &'static str {
@@ -174,9 +183,15 @@ impl ModelRegistry {
         }
     }
 
-    /// Root models directory (aux voice models — ContentVec/RMVPE — live in <models_dir>/aux).
+    /// Root models directory (shared aux models — ContentVec/RMVPE/… — live in
+    /// `<models_dir>/auxiliary`, see [`AUX_DIR_NAME`]).
     pub fn models_dir(&self) -> &Path {
         &self.models_dir
+    }
+
+    /// THE shared-model directory (S64b): every consumer resolves through here (or AUX_DIR_NAME).
+    pub fn aux_dir(&self) -> PathBuf {
+        self.models_dir.join(AUX_DIR_NAME)
     }
 
     /// Lazy self-scan: any read on a fresh session populates the registry from disk first.

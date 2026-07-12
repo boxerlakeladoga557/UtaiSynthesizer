@@ -710,7 +710,7 @@ impl TrainingManager {
         }
 
         // ---- resolve + verify every asset up front (loud, specific errors) ----
-        let aux_dir = data_dir.join("models").join("aux");
+        let aux_dir = data_dir.join("models").join(crate::models::AUX_DIR_NAME);
         let sovits_train_dir = data_dir.join("models").join("training").join("sovits");
         // one-ContentVec-space principle: the training extractor must be the same
         // aux graph inference uses — rvc v1 / sovits(_diff) 4.0 = 256l9,

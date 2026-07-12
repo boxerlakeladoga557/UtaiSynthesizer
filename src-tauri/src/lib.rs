@@ -593,6 +593,38 @@ pub fn run() {
             let models_dir = data_dir.join("models");
             let _ = std::fs::create_dir_all(&cache_dir);
             let _ = std::fs::create_dir_all(&models_dir);
+            // S64b migration: the shared-model dir used to be `models/aux` — a reserved Windows
+            // device name most systems can't even create (beta testers: os error 267/1200); only
+            // relaxed Win11 builds (the dev machine) ever had one. Rename it where it exists.
+            {
+                let old_aux = models_dir.join("aux");
+                let new_aux = models_dir.join(models::AUX_DIR_NAME);
+                if old_aux.is_dir() && !new_aux.exists() {
+                    match std::fs::rename(&old_aux, &new_aux) {
+                        Ok(()) => tracing::info!("migrated models/aux -> models/{}", models::AUX_DIR_NAME),
+                        Err(e) => tracing::warn!("models/aux migration failed: {e}"),
+                    }
+                }
+            }
+            // S64b cleanup: pre-0.1.2 CUDA downloads copied the four CUDA ORT DLLs next to the exe
+            // (a dev-only convenience that leaked into release, polluting the install root AND
+            // risking shadowing). The set is only ever OURS when providers_cuda sits there too.
+            #[cfg(not(debug_assertions))]
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(exe_dir) = exe.parent() {
+                    if exe_dir.join("onnxruntime_providers_cuda.dll").exists() {
+                        for n in [
+                            "onnxruntime.dll",
+                            "onnxruntime_providers_cuda.dll",
+                            "onnxruntime_providers_shared.dll",
+                            "onnxruntime_providers_tensorrt.dll",
+                        ] {
+                            let _ = std::fs::remove_file(exe_dir.join(n));
+                        }
+                        tracing::info!("removed stray CUDA ORT DLLs from the install root (S64b)");
+                    }
+                }
+            }
             // Embedded Python runtime packs live under <data_root>/runtimes (S42) —
             // rooted on the SAME resolved data dir (incl. the legacy AppData fallback)
             // so a user data-dir migration moves the packs' home along with models/cache.

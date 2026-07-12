@@ -61,7 +61,7 @@ fn init_ort() {
 }
 
 fn aux_dir() -> PathBuf {
-    app_root().join("data").join("models").join("aux")
+    app_root().join("data").join("models").join(utai_lib::models::AUX_DIR_NAME)
 }
 
 /// ContentVec variant routing (mirrors commands\inference.rs): 768 → vec768l12, 256 → vec256l9.

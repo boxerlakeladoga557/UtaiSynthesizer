@@ -41,6 +41,7 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   // pre-existing training.needData key). Keep alphabetical; busy flags mark interlock rejections. ──
   ASSET_DL_BUSY: { key: "backend.ASSET_DL_BUSY", busy: true },
   ASSET_DL_FAILED: { key: "backend.ASSET_DL_FAILED" },
+  CUDA_TOOLKIT_REQUIRED: { key: "backend.CUDA_TOOLKIT_REQUIRED" },
   AUDIO_EMPTY_INPUT: { key: "backend.AUDIO_EMPTY_INPUT" },
   AUDIO_TOO_SHORT_HIGHPASS: { key: "backend.AUDIO_TOO_SHORT_HIGHPASS" },
   AUDITION_BACKEND_UNSUPPORTED: { key: "backend.AUDITION_BACKEND_UNSUPPORTED" },

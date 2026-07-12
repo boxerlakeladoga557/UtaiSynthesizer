@@ -863,7 +863,7 @@ mod tests {
         // f0 glue (midi/note_hz/f0_rs/uv_rs/t_tgt) is dim-independent — re-checked on each dim pass
         // (cheap); cv_rs is the dim-specific reference.
         for (dim, model) in [(768usize, "score2cv_768.onnx"), (256usize, "score2cv_256.onnx")] {
-            let path: PathBuf = root.join("../data/models/aux").join(model);
+            let path: PathBuf = root.join("../data/models").join(crate::models::AUX_DIR_NAME).join(model);
             assert!(path.exists(), "model missing: {}", path.display());
             let sid = engine.load_model_with(&path, false).unwrap();
 
@@ -942,7 +942,7 @@ mod tests {
         let engine = OnnxEngine::new();
         engine.set_device(DeviceConfig::Cpu); // deterministic-ish + no GPU setup in a test
 
-        let aux = root.join("../data/models/aux");
+        let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
         let sov = root.join("../data/models/sovits");
         let rvcd = root.join("../data/models/rvc");
         let out = PathBuf::from(
@@ -1078,7 +1078,7 @@ mod tests {
         let engine = OnnxEngine::new();
         engine.set_device(DeviceConfig::Cpu); // deterministic + matches the parity gate
 
-        let aux = root.join("../data/models/aux");
+        let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
         let sov = root.join("../data/models/sovits");
         let rvcd = root.join("../data/models/rvc");
 

@@ -25,7 +25,7 @@ fn app_root() -> PathBuf {
 }
 
 fn aux_dir() -> PathBuf {
-    app_root().join("data").join("models").join("aux")
+    app_root().join("data").join("models").join(utai_lib::models::AUX_DIR_NAME)
 }
 
 fn ab_dir() -> PathBuf {

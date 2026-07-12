@@ -3,7 +3,7 @@
 //! (original repo D:\MyDev\so-vits-svc\so-vits-svc). The vocoder ONNX itself is the aux
 //! `nsf_hifigan.onnx` exported by converter/export_nsf_hifigan.py (mel [1,128,T] ln-mel +
 //! f0 [1,T] Hz → audio [1,1,T*512]); its sidecar json + slaney filterbank .npy live next
-//! to it in models/aux/.
+//! to it in models/auxiliary/.
 //!
 //! S36 REWRITE: the previous content of this file was opus4.6-era dead scaffolding — a
 //! placeholder "mel" (frame energy × linear ramp) and a VocoderMode effects API that no
@@ -27,7 +27,7 @@ use super::features::{np_interp, resample};
 use super::mel::nsf_mel;
 use crate::{Result, UtaiError};
 
-/// Runtime facts of the aux vocoder (from models/aux/nsf_hifigan.json). All fields are
+/// Runtime facts of the aux vocoder (from models/auxiliary/nsf_hifigan.json). All fields are
 /// validated against the voice model's geometry by the command layer before use.
 #[derive(Debug, Clone)]
 pub struct VocoderConfig {

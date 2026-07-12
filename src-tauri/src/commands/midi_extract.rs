@@ -267,7 +267,7 @@ pub async fn download_game_package(
     }
     let _dl_guard = DlGuard;
     let _task = state.begin_task("game-download");
-    let aux_dir = state.models.models_dir().join("aux");
+    let aux_dir = state.models.aux_dir();
     tokio::fs::create_dir_all(&aux_dir)
         .await
         .map_err(|e| format!("GAME_DL_FAILED: mkdir: {e}"))?;

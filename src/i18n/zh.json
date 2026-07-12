@@ -745,6 +745,7 @@
     "TRAINING_UNKNOWN_ERROR": "未知训练错误",
     "ASSET_DL_BUSY": "已有模型资产在下载中，请等它完成",
     "ASSET_DL_FAILED": "模型资产下载失败",
+    "CUDA_TOOLKIT_REQUIRED": "使用 CUDA 需要先安装 NVIDIA CUDA Toolkit 12.x（提供 cudart/cublas）。未安装时请使用默认的 DirectML（任何显卡可用），或安装 Toolkit 后重试",
     "UPDATE_CHECK_FAILED": "检查更新失败（网络或更新源不可达）",
     "UPDATE_DOWNLOAD_FAILED": "更新包下载失败",
     "UPDATE_INSTALL_FAILED": "更新安装启动失败",

@@ -40,20 +40,20 @@ struct AssetPack {
 // ─── catalog (sizes + sha256 computed from the dev-machine originals at upload time, S64) ───
 
 const AUX_FILES: &[AssetFile] = &[
-    AssetFile { rel: "aux/contentvec_256l9.onnx", size: 293_312_060, sha256: "d1ce3a3ce3d39c3e12f7c618ebeee631e089fe6606eb2cb414f2b9af74b95314" },
-    AssetFile { rel: "aux/contentvec_768l12.onnx", size: 377_602_470, sha256: "3a7db9b31ec297378bcfa8ec78c00968bee84ba0491efdca52aa7044150d92c5" },
-    AssetFile { rel: "aux/rmvpe_e2e.onnx", size: 361_704_910, sha256: "2c2a08416dcd9790c8837e9fabe9fcab54b3657c76029d3cd709d17bdbaf6200" },
-    AssetFile { rel: "aux/rmvpe_mel_filters.npy", size: 262_784, sha256: "cb277cc6da0f8d217cbfedc3513ad234de9e69919764259f4e7699f75518e1eb" },
-    AssetFile { rel: "aux/nsf_hifigan.onnx", size: 56_829_864, sha256: "5597601d628e54fea8382e64a781f67f0379a6d37c8fccf22c72004dac1d7a20" },
-    AssetFile { rel: "aux/nsf_hifigan.json", size: 207, sha256: "0f8cdcb28624e4e1a30acb0abecab8e2e98d7a79c49c4c602164b2b6ce6007a3" },
-    AssetFile { rel: "aux/nsf_hifigan_mel.npy", size: 524_928, sha256: "a5b709d52d0ad9182fddaf3c9136f89620d11c92beafad433e9c813f42da0e6c" },
-    AssetFile { rel: "aux/score2cv_256.onnx", size: 180_361_506, sha256: "8464168c6400e389ad448b676436e4664ea7732177af000b86830f08f981a31e" },
-    AssetFile { rel: "aux/score2cv_256.json", size: 407, sha256: "c23afe19801d9bc544b88401ccd54e740e8edcd993a146b59d8f61ef5014c2f3" },
-    AssetFile { rel: "aux/score2cv_768.onnx", size: 181_416_226, sha256: "35d081de21595e0f95dd36b67f22763ffc5b24dfe34520c8e3f03a73c57756bc" },
-    AssetFile { rel: "aux/score2cv_768.json", size: 413, sha256: "cc4490132ade28d1bb88a8721deefc52d136d26baad77cabf1f854f0b8698dd3" },
+    AssetFile { rel: "auxiliary/contentvec_256l9.onnx", size: 293_312_060, sha256: "d1ce3a3ce3d39c3e12f7c618ebeee631e089fe6606eb2cb414f2b9af74b95314" },
+    AssetFile { rel: "auxiliary/contentvec_768l12.onnx", size: 377_602_470, sha256: "3a7db9b31ec297378bcfa8ec78c00968bee84ba0491efdca52aa7044150d92c5" },
+    AssetFile { rel: "auxiliary/rmvpe_e2e.onnx", size: 361_704_910, sha256: "2c2a08416dcd9790c8837e9fabe9fcab54b3657c76029d3cd709d17bdbaf6200" },
+    AssetFile { rel: "auxiliary/rmvpe_mel_filters.npy", size: 262_784, sha256: "cb277cc6da0f8d217cbfedc3513ad234de9e69919764259f4e7699f75518e1eb" },
+    AssetFile { rel: "auxiliary/nsf_hifigan.onnx", size: 56_829_864, sha256: "5597601d628e54fea8382e64a781f67f0379a6d37c8fccf22c72004dac1d7a20" },
+    AssetFile { rel: "auxiliary/nsf_hifigan.json", size: 207, sha256: "0f8cdcb28624e4e1a30acb0abecab8e2e98d7a79c49c4c602164b2b6ce6007a3" },
+    AssetFile { rel: "auxiliary/nsf_hifigan_mel.npy", size: 524_928, sha256: "a5b709d52d0ad9182fddaf3c9136f89620d11c92beafad433e9c813f42da0e6c" },
+    AssetFile { rel: "auxiliary/score2cv_256.onnx", size: 180_361_506, sha256: "8464168c6400e389ad448b676436e4664ea7732177af000b86830f08f981a31e" },
+    AssetFile { rel: "auxiliary/score2cv_256.json", size: 407, sha256: "c23afe19801d9bc544b88401ccd54e740e8edcd993a146b59d8f61ef5014c2f3" },
+    AssetFile { rel: "auxiliary/score2cv_768.onnx", size: 181_416_226, sha256: "35d081de21595e0f95dd36b67f22763ffc5b24dfe34520c8e3f03a73c57756bc" },
+    AssetFile { rel: "auxiliary/score2cv_768.json", size: 413, sha256: "cc4490132ade28d1bb88a8721deefc52d136d26baad77cabf1f854f0b8698dd3" },
     // NSF-HiFiGAN weights are CC BY-NC-SA — the attribution NOTICE travels with the onnx derivative.
-    AssetFile { rel: "aux/NOTICE.txt", size: 3_104, sha256: "a393b44505ccb6d1da63c2c73ccbbdaeb9b877a5227bf41b1b1e4a8429a51dd6" },
-    AssetFile { rel: "aux/NOTICE.zh-CN.txt", size: 3_046, sha256: "ea5511e12932a33481c212c1c19f6225af90ff6dc6f3e34a41050f028823ebb5" },
+    AssetFile { rel: "auxiliary/NOTICE.txt", size: 3_104, sha256: "a393b44505ccb6d1da63c2c73ccbbdaeb9b877a5227bf41b1b1e4a8429a51dd6" },
+    AssetFile { rel: "auxiliary/NOTICE.zh-CN.txt", size: 3_046, sha256: "ea5511e12932a33481c212c1c19f6225af90ff6dc6f3e34a41050f028823ebb5" },
 ];
 
 const RVC_TRAIN_FILES: &[AssetFile] = &[
@@ -71,7 +71,7 @@ const RVC_TRAIN_FILES: &[AssetFile] = &[
     AssetFile { rel: "training/rvc/pretrained_v2/f0D48k.pth", size: 142_875_703, sha256: "2269b73c7a4cf34da09aea99274dabf99b2ddb8a42cbfb065fb3c0aa9a2fc748" },
     // RVC training f0 extractor (the aux/ RVC-blood rmvpe.pt — a DIFFERENT architecture from the
     // sovits-blood training/sovits/rmvpe.pt below; never interchangeable, see pending_cleanups S37).
-    AssetFile { rel: "aux/rmvpe.pt", size: 181_184_272, sha256: "6d62215f4306e3ca278246188607209f09af3dc77ed4232efdd069798c4ec193" },
+    AssetFile { rel: "auxiliary/rmvpe.pt", size: 181_184_272, sha256: "6d62215f4306e3ca278246188607209f09af3dc77ed4232efdd069798c4ec193" },
 ];
 
 const SOVITS_TRAIN_FILES: &[AssetFile] = &[

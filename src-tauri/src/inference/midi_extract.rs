@@ -1,7 +1,7 @@
 //! GAME (openvpi) — singing-voice audio → MIDI note extraction (S60-1).
 //!
 //! Runs the OFFICIAL 1.0.3 ONNX deployment pipeline (5 graphs + config.json under
-//! models/aux/game/): encoder → D3PM segmenter loop → bd2dur → estimator, then the
+//! models/auxiliary/game/): encoder → D3PM segmenter loop → bd2dur → estimator, then the
 //! official cross-chunk note assembly. References, in authority order:
 //!   - GAME ONNX.md (tensor contract) — verified against the real graphs;
 //!   - OpenUtau Game.cs (the openvpi-blessed ONNX consumer: t = i/K ascending,
@@ -51,7 +51,7 @@ fn default_true() -> bool {
 }
 
 pub fn game_dir(models_dir: &Path) -> PathBuf {
-    models_dir.join("aux").join("game")
+    models_dir.join(crate::models::AUX_DIR_NAME).join("game")
 }
 
 pub fn game_installed(models_dir: &Path) -> bool {

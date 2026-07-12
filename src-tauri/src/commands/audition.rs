@@ -647,7 +647,7 @@ pub async fn render_audition_vocoder(
             None => (
                 aux_path(&app, AUX_NSF_HIFIGAN, "NSF-HiFiGAN vocoder")?,
                 aux_path(&app, AUX_NSF_HIFIGAN_JSON, "NSF-HiFiGAN vocoder config")?,
-                app.models.models_dir().join("aux"),
+                app.models.aux_dir(),
             ),
         };
         let sidecar: serde_json::Value = crate::commands::inference::read_json(&voc_json, "vocoder config")?;

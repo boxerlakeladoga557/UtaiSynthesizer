@@ -75,7 +75,7 @@ fn progress_emitter(
     }
 }
 
-// ─── aux model resolution (models_dir/aux/...) ───────────────────────────────
+// ─── aux model resolution (models_dir/auxiliary/..., models::AUX_DIR_NAME) ───
 
 // pub(crate): the S41 audition commands (commands/audition.rs) resolve the
 // same aux fleet without going through the registry
@@ -94,11 +94,11 @@ pub(crate) const AUX_NSF_HIFIGAN_MEL: &str = "nsf_hifigan_mel.npy";
 pub(crate) const AUX_SCORE2CV_768: &str = "score2cv_768.onnx";
 pub(crate) const AUX_SCORE2CV_256: &str = "score2cv_256.onnx";
 
-/// models_dir/aux/<filename>, with a stable CODE naming the missing file + the
+/// models_dir/auxiliary/<filename>, with a stable CODE naming the missing file + the
 /// exact directory it must be placed in (the frontend maps the code to localized text;
 /// `label` is a short English token interpolated into the detail payload).
 pub(crate) fn aux_path(state: &AppState, filename: &str, label: &str) -> Result<PathBuf, String> {
-    let dir = state.models.models_dir().join("aux");
+    let dir = state.models.aux_dir();
     let path = dir.join(filename);
     if !path.exists() {
         return Err(format!(
@@ -313,7 +313,7 @@ pub struct DefaultVocoderInfo {
 
 #[tauri::command]
 pub fn get_default_vocoder_info(state: State<'_, Arc<AppState>>) -> DefaultVocoderInfo {
-    let aux = state.models.models_dir().join("aux");
+    let aux = state.models.aux_dir();
     let json_path = aux.join(AUX_NSF_HIFIGAN_JSON);
     let sidecar: Option<VocoderSidecar> = std::fs::read_to_string(&json_path)
         .ok()
@@ -417,7 +417,7 @@ pub(crate) fn resolve_sovits_quality(
             None => (
                 aux_path(app, AUX_NSF_HIFIGAN, "NSF-HiFiGAN vocoder")?,
                 aux_path(app, AUX_NSF_HIFIGAN_JSON, "NSF-HiFiGAN vocoder config")?,
-                app.models.models_dir().join("aux"),
+                app.models.aux_dir(),
                 "NSF-HiFiGAN vocoder".to_string(),
             ),
             Some(name) => {

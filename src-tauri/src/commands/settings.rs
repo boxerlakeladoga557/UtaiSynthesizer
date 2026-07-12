@@ -546,6 +546,13 @@ pub async fn download_cuda_runtime(
     app_handle: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
+    // S64b gate: the CUDA EP additionally needs cudart/cublas from an installed CUDA Toolkit 12.x —
+    // we never distribute those. Without the gate, the download "succeeds", the frontend shows
+    // ready, and the next restart's real is_cuda_runtime_ready() reports not-ready again (beta
+    // testers: "CUDA 重启就丢"). Refuse up front with an actionable CODE instead.
+    if !dll_on_path("cudart64_12.dll") {
+        return Err("CUDA_TOOLKIT_REQUIRED".to_string());
+    }
     let _task = state.begin_task("cuda_download"); // listed in the close-flow's in-progress warning
     let app_dir = state.app_dir.clone();
     let handle = app_handle.clone();
@@ -623,8 +630,11 @@ async fn do_download_cuda_runtime(
         let _ = std::fs::remove_file(&cudnn_whl);
     }
 
-    // ── Stage 3: Also copy to exe dir for dev mode ──
+    // ── Stage 3 (DEV BUILDS ONLY): copy next to the debug exe. In release this polluted the
+    // install root with the four CUDA DLLs (S64b beta report) — the installed app loads from
+    // runtime/ort/cuda directly and needs no exe-side copies. lib.rs setup sweeps old strays. ──
     emit("copy", 0.95, "Finalizing...");
+    #[cfg(debug_assertions)]
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
             let target_debug = exe_dir;
