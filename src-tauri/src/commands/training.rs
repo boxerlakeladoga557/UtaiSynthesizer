@@ -27,9 +27,8 @@ pub async fn start_training(
     // file locks; a mere load() check would leave a check-then-act window for
     // an audition to slip in mid-start. The frontend disables the button too;
     // this guard is the authoritative gate.
-    let _audition_lock = crate::commands::audition::FlightGuard::acquire(
-        "试听渲染进行中，请等待完成后再开始训练",
-    )?;
+    let _audition_lock =
+        crate::commands::audition::FlightGuard::acquire(crate::commands::audition::BUSY_RETRY_MSG)?;
     let data_dir = data_root(&state);
     let audition_dir =
         crate::training::workspace_path(&data_dir, &request.model_name).join("audition");
@@ -81,9 +80,8 @@ pub async fn get_training_status(
 #[tauri::command]
 pub async fn reset_training_display(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     // held for the whole clear (S41-INT-4 — same rationale as start_training)
-    let _audition_lock = crate::commands::audition::FlightGuard::acquire(
-        "试听渲染进行中，请等待完成后再清空结果",
-    )?;
+    let _audition_lock =
+        crate::commands::audition::FlightGuard::acquire(crate::commands::audition::BUSY_RETRY_MSG)?;
     let workspace = state.training.status().workspace;
     if !workspace.is_empty() {
         let audition_dir = std::path::Path::new(&workspace).join("audition");

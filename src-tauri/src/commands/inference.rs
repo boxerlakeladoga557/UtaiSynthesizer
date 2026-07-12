@@ -23,7 +23,8 @@ struct VoiceRunGuard;
 impl VoiceRunGuard {
     fn acquire() -> Result<Self, String> {
         if crate::commands::audition::AUDITION_IN_FLIGHT.load(Ordering::SeqCst) {
-            return Err("试听渲染进行中，请等待完成后再渲染".into());
+            // Generic on purpose: the flag's holder may be an audition OR a storage cleanup (S61).
+            return Err(crate::commands::audition::BUSY_RETRY_MSG.into());
         }
         VOICE_RENDER_ACTIVE.fetch_add(1, Ordering::SeqCst);
         Ok(VoiceRunGuard)

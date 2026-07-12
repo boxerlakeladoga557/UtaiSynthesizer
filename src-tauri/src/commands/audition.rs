@@ -206,7 +206,13 @@ fn ensure_no_voice_render() -> Result<(), String> {
     Ok(())
 }
 
-const AUDITION_BUSY_MSG: &str = "已有试听渲染进行中，请等待完成";
+/// THE generic busy-retry message for every FlightGuard/interlock rejection (user S61: the flag's
+/// holder can be an audition, a voice render, OR a storage cleanup — naming a specific reason was
+/// factually wrong half the time, and threading the real holder through the guard isn't worth it.
+/// One shared string also makes the release i18n pass a single mapping). 存量中文=release 清账批。
+pub const BUSY_RETRY_MSG: &str = "当前状态忙，请稍后重试";
+
+const AUDITION_BUSY_MSG: &str = BUSY_RETRY_MSG;
 
 fn audition_dir(workspace: &str, stem: &str) -> PathBuf {
     Path::new(workspace).join("audition").join(stem)
