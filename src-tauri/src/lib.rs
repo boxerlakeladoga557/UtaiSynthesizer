@@ -86,6 +86,13 @@ impl AppState {
         }
     }
 
+    /// True while at least one task with this id is registered — for PRE-FLIGHT interlocks (S64c:
+    /// begin_task is a refcount for the close-flow listing, NOT a mutex; single-flight commands
+    /// must check this before registering).
+    pub fn task_active(&self, id: &str) -> bool {
+        self.active_tasks.lock().contains_key(id)
+    }
+
     /// Register a long-running task so the close-flow's in-progress warning can list it. Returns a guard
     /// that unregisters on drop (panic-safe). Use a stable id with a matching `close.task_<id>` locale key.
     pub fn begin_task(&self, id: &str) -> TaskGuard {
@@ -161,7 +168,10 @@ pub fn init_ort_runtime(app_dir: &std::path::Path) {
     let prefer_cuda = match read_device_preference(app_dir).as_deref() {
         Some("cuda") => true,
         Some("directml") | Some("cpu") => false,
-        _ => cuda_dll.exists() && crate::commands::settings::is_cuda_available(),
+        // Auto needs the provider's FULL dependency set resolvable, not just cudart (S64c audit: a
+        // PARTIAL wheel install would otherwise pick the CUDA build — which has no DirectML provider —
+        // and silently drop a DirectML-capable NVIDIA box to CPU every session).
+        _ => cuda_dll.exists() && crate::commands::settings::cuda_provider_deps_resolvable(app_dir),
     };
 
     let mut search_paths: Vec<std::path::PathBuf> = Vec::new();
@@ -173,7 +183,25 @@ pub fn init_ort_runtime(app_dir: &std::path::Path) {
             // VERIFIED with the version-matched 1.24.x build: preload + init_from + CUDA session all succeed.
             let cuda_bin = std::env::var("CUDA_PATH").ok().map(|p| std::path::PathBuf::from(p).join("bin"));
             let cudnn_dir = app_dir.join("runtime").join("cuda");
-            let _ = ort::ep::cuda::preload_dylibs(cuda_bin.as_deref(), Some(&cudnn_dir));
+            // SEPARATE preload calls (S64c audit): preload_dylibs aborts on its FIRST failed load and
+            // runs the CUDA loop before the cuDNN loop — one combined call with a wrong-major Toolkit
+            // on CUDA_PATH (e.g. 13) would silently skip pinning OUR runtime/cuda copies. Ours load
+            // FIRST (first-load-by-basename wins); each lane independent; failures logged, not swallowed.
+            if let Err(e) = ort::ep::cuda::preload_dylibs(None, Some(&cudnn_dir)) {
+                tracing::warn!("cuDNN preload (runtime/cuda) incomplete: {e}");
+            }
+            // CUDA core libs from OUR dir — only where the self-contained download placed them
+            // (a pre-S64c runtime/cuda holds only cuDNN; attempting would just warn-spam dev boxes).
+            if cudnn_dir.join("cudart64_12.dll").exists() {
+                if let Err(e) = ort::ep::cuda::preload_dylibs(Some(&cudnn_dir), None) {
+                    tracing::warn!("CUDA preload (runtime/cuda) incomplete: {e}");
+                }
+            }
+            if let Some(bin) = cuda_bin.as_deref() {
+                if let Err(e) = ort::ep::cuda::preload_dylibs(Some(bin), None) {
+                    tracing::warn!("CUDA preload (CUDA_PATH) incomplete: {e}");
+                }
+            }
             search_paths.push(cuda_dll);
             tracing::info!("CUDA available — preloaded CUDA dylibs + loading CUDA ORT build");
         } else {

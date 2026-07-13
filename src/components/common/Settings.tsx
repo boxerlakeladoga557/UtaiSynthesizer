@@ -38,6 +38,9 @@ interface CudaProgress {
   stage: string;
   progress: number;
   message: string;
+  /** S64c structured i18n: stable code + proper-noun label; message stays the raw-English fallback. */
+  code?: string | null;
+  label?: string | null;
 }
 
 /** Mirror of Rust `pyenv::PackStatus` (meta flattened) — list_runtime_packs entry. */
@@ -282,6 +285,12 @@ export function Settings({ onClose }: { onClose: () => void }) {
     invoke<HardwareInfo>("get_hardware_info").then(setHw).catch(() => {});
     invoke<string>("get_device_preference").then(setDevice).catch(() => {});
     invoke<boolean>("is_cuda_runtime_ready").then(setCudaReady).catch(() => {});
+    // Re-latch onto an in-flight CUDA download after a panel remount (S64c audit: `cudaDownloading`
+    // is component-local; the backend refcount is the truth, and the busy interlock rejects a
+    // second start anyway — this keeps the button/progress honest).
+    invoke<string[]>("running_tasks")
+      .then((ts) => { if (ts.includes("cuda_download")) setCudaDownloading(true); })
+      .catch(() => {});
     invoke<string>("get_data_dir").then(setDataDir).catch(() => {});
     invoke<{ configured: string; effective: string; fell_back: boolean } | null>("get_data_dir_issue")
       .then(setDataDirIssue)
@@ -525,10 +534,15 @@ export function Settings({ onClose }: { onClose: () => void }) {
       if (e.payload.stage === "done") {
         setCudaDownloading(false);
         // Re-query the REAL readiness instead of optimistically flipping true — is_cuda_runtime_ready
-        // also verifies cudart/cuDNN resolvability, and an optimistic true that reverts on the next
-        // restart reads as "CUDA disappeared" (S64b beta report).
+        // also verifies the full provider dependency set, and an optimistic true that reverts on the
+        // next restart reads as "CUDA disappeared" (S64b beta report). The hardware badge re-queries
+        // too: the in-session setup_cuda_dll_paths re-run can flip cuda_available without a restart.
         invoke<boolean>("is_cuda_runtime_ready").then(setCudaReady).catch(() => {});
+        invoke<HardwareInfo>("get_hardware_info").then(setHw).catch(() => {});
         setCudaJustInstalled(true);
+      } else {
+        // Any non-terminal event re-latches a remounted panel onto the running download.
+        setCudaDownloading(true);
       }
     });
     return () => { unlisten.then((f) => f()); };
@@ -634,6 +648,21 @@ export function Settings({ onClose }: { onClose: () => void }) {
     setSaving(false);
   }, []);
 
+  // S64c structured progress → localized line (code + proper-noun label; raw message = fallback,
+  // the pyenv pgDownloading/pgExtracting pattern).
+  const cudaProgressText = (p: CudaProgress): string => {
+    const map: Record<string, string> = {
+      CUDA_DL_DOWNLOADING: L("cudaPgDownloading"),
+      CUDA_DL_EXTRACTING: L("cudaPgExtracting"),
+      CUDA_DL_SKIP: L("cudaPgSkip"),
+      CUDA_DL_FINALIZING: L("cudaPgFinalizing"),
+      CUDA_DL_DONE: L("cudaPgDone"),
+    };
+    const base = p.code ? map[p.code] : undefined;
+    if (!base) return p.message;
+    return p.label ? `${base} · ${p.label}` : base;
+  };
+
   const handleCudaDownload = useCallback(async () => {
     setCudaDownloading(true);
     setCudaError(null);
@@ -641,7 +670,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
     try {
       await invoke("download_cuda_runtime");
     } catch (e) {
-      // CUDA_TOOLKIT_REQUIRED etc. → localized via the shared mapper (raw fallback for oddballs).
+      // CUDA_GPU_REQUIRED etc. → localized via the shared mapper (raw fallback for oddballs).
       setCudaError(backendErrorMessage(e) ?? String(e));
       setCudaDownloading(false);
     }
@@ -685,8 +714,13 @@ export function Settings({ onClose }: { onClose: () => void }) {
       cudaNotInstalled: { zh: "未安装", en: "Not Installed", ja: "未インストール" },
       cudaDownload: { zh: "下载 CUDA 运行时", en: "Download CUDA Runtime", ja: "CUDAランタイムをダウンロード" },
       cudaDownloading: { zh: "下载中...", en: "Downloading...", ja: "ダウンロード中..." },
-      cudaNote: { zh: "需要 CUDA 12 Toolkit。下载 ORT CUDA DLLs (~200MB) + cuDNN (~400MB)。", en: "Requires CUDA 12 Toolkit. Downloads ORT CUDA DLLs (~200MB) + cuDNN (~400MB).", ja: "CUDA 12 Toolkit が必要です。ORT CUDA DLLs + cuDNN をダウンロードします。" },
+      cudaNote: { zh: "无需安装 CUDA Toolkit——自动下载全部运行库（ORT CUDA + cudart/cuBLAS/cuFFT/cuDNN，共约 1.6GB）。需要 NVIDIA 显卡和较新的驱动。", en: "No CUDA Toolkit needed — downloads the full runtime (ORT CUDA + cudart/cuBLAS/cuFFT/cuDNN, ~1.6GB total). Requires an NVIDIA GPU with a recent driver.", ja: "CUDA Toolkit のインストールは不要 — ランタイム一式（ORT CUDA + cudart/cuBLAS/cuFFT/cuDNN、合計約 1.6GB）を自動ダウンロードします。NVIDIA GPU と新しめのドライバーが必要です。" },
       cudaRestart: { zh: "下载完成，重启应用后生效。", en: "Download complete. Restart to activate.", ja: "ダウンロード完了。再起動で有効になります。" },
+      cudaPgDownloading: { zh: "下载中", en: "Downloading", ja: "ダウンロード中" },
+      cudaPgExtracting: { zh: "解压中", en: "Extracting", ja: "展開中" },
+      cudaPgSkip: { zh: "已存在，跳过", en: "Already present — skipped", ja: "既に存在するためスキップ" },
+      cudaPgFinalizing: { zh: "收尾中…", en: "Finalizing…", ja: "仕上げ中…" },
+      cudaPgDone: { zh: "CUDA 运行时就绪，重启应用后生效", en: "CUDA runtime ready — restart to activate", ja: "CUDA ランタイム準備完了 — 再起動で有効になります" },
       storage: { zh: "存储位置", en: "Storage", ja: "保存場所" },
       stDirRecreated: { zh: "警告：配置的数据目录 {configured} 此前不存在，已重新创建（内容为空）。若数据在别处，请检查该盘/目录。", en: "Warning: the configured data folder {configured} was missing and has been recreated (empty). If your data lives elsewhere, check that drive/folder.", ja: "警告：設定されたデータフォルダ {configured} が存在しなかったため、再作成しました（空です）。データが別の場所にある場合は、そのドライブ/フォルダを確認してください。" },
       stDirFellBack: { zh: "警告：配置的数据目录 {configured} 不可用（盘符不存在？），本次改用程序旁的默认目录。恢复该盘后重启即可回到原目录。", en: "Warning: the configured data folder {configured} is unavailable (drive missing?). Using the default folder next to the program for this session; restore the drive and restart to return to it.", ja: "警告：設定されたデータフォルダ {configured} が利用できません（ドライブ未接続？）。今回はプログラム横の既定フォルダを使用します。ドライブを戻して再起動すると元に戻ります。" },
@@ -1183,7 +1217,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
                   style={{ width: `${Math.round(cudaProgress.progress * 100)}%` }}
                 />
               </div>
-              <span className="settings-progress-text">{cudaProgress.message}</span>
+              <span className="settings-progress-text">{cudaProgressText(cudaProgress)}</span>
             </div>
           )}
 

@@ -63,7 +63,9 @@ pub fn get_hardware_info(state: State<'_, Arc<AppState>>) -> Result<HardwareInfo
     };
     Ok(HardwareInfo {
         gpu_name,
-        cuda_available: is_cuda_available(),
+        // Vendor-guarded (S64c audit): the self-downloaded runtime/cuda DLLs satisfy the PATH probe
+        // even on a box whose NVIDIA card is gone (migrated data dir) — the badge must track the GPU.
+        cuda_available: gpus.iter().any(|g| g.vendor == "nvidia") && is_cuda_available(),
         directml_available: cfg!(windows),
         current_device: current_str,
         recommended_variant: recommend_variant(&gpus).to_string(),
@@ -456,10 +458,23 @@ pub fn is_cuda_runtime_ready(state: State<'_, Arc<AppState>>) -> Result<bool, St
     if major < 12 {
         return Ok(false); // CUDA 11 build (or unreadable) — treat as not ready
     }
-    let cudnn_dir = state.app_dir.join("runtime").join("cuda");
-    let cudnn_ok = dll_on_path_or_dir("cudnn64_9.dll", &cudnn_dir);
-    let cudart_ok = dll_on_path("cudart64_12.dll");
-    Ok(cudnn_ok && cudart_ok)
+    Ok(cuda_provider_deps_resolvable(&state.app_dir))
+}
+
+/// THE provider-dependency check (S64c): the FULL import set scanned from the 1.24.4
+/// providers_cuda.dll, each resolvable from OUR runtime/cuda (self-contained download), PATH, or
+/// CUDA_PATH (Toolkit users). Shared by is_cuda_runtime_ready AND lib.rs' Auto build pick — a
+/// PARTIAL install must never flip Auto onto the CUDA build (it has no DirectML provider).
+pub(crate) fn cuda_provider_deps_resolvable(app_dir: &std::path::Path) -> bool {
+    const DEPS: [&str; 5] = [
+        "cudart64_12.dll",
+        "cublas64_12.dll",
+        "cublasLt64_12.dll",
+        "cufft64_11.dll",
+        "cudnn64_9.dll",
+    ];
+    let cuda_dir = app_dir.join("runtime").join("cuda");
+    DEPS.iter().all(|d| dll_on_path_or_dir(d, &cuda_dir))
 }
 
 /// Scan a providers_cuda.dll for its imported `cudart64_NNN.dll` string to learn the CUDA MAJOR it was
@@ -546,12 +561,20 @@ pub async fn download_cuda_runtime(
     app_handle: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    // S64b gate: the CUDA EP additionally needs cudart/cublas from an installed CUDA Toolkit 12.x —
-    // we never distribute those. Without the gate, the download "succeeds", the frontend shows
-    // ready, and the next restart's real is_cuda_runtime_ready() reports not-ready again (beta
-    // testers: "CUDA 重启就丢"). Refuse up front with an actionable CODE instead.
-    if !dll_on_path("cudart64_12.dll") {
-        return Err("CUDA_TOOLKIT_REQUIRED".to_string());
+    // S64c: the download is now fully self-contained (cudart/cublas/cufft/cudnn all fetched from
+    // NVIDIA's official PyPI redistributables — no CUDA Toolkit needed, which beta testers proved
+    // nobody has). The one hard requirement left is an NVIDIA GPU + its driver. FAIL-OPEN on an
+    // EMPTY probe (WMI/PowerShell failure = undetermined, the variant_supported convention) —
+    // refuse only on a POSITIVE non-NVIDIA determination.
+    let gpus = query_gpu_adapters();
+    if !gpus.is_empty() && !gpus.iter().any(|g| g.vendor == "nvidia") {
+        return Err("CUDA_GPU_REQUIRED".to_string());
+    }
+    // Single-flight (S64c audit): begin_task is a refcount for the close-flow listing, not a mutex —
+    // a remounted Settings panel re-enables the button mid-download, and a second click would run
+    // two concurrent downloaders over the same files.
+    if state.task_active("cuda_download") {
+        return Err("CUDA_DOWNLOAD_BUSY".to_string());
     }
     let _task = state.begin_task("cuda_download"); // listed in the close-flow's in-progress warning
     let app_dir = state.app_dir.clone();
@@ -580,9 +603,11 @@ async fn do_download_cuda_runtime(
     handle: &tauri::AppHandle,
 ) -> crate::Result<()> {
 
-    let emit = |stage: &str, progress: f32, msg: &str| {
+    // code+label ride along for i18n (frontend maps code → localized line, label = proper noun;
+    // message stays as the raw-English fallback — the S62 pyenv structured-progress pattern).
+    let emit = |stage: &str, progress: f32, code: &str, label: &str, msg: &str| {
         let _ = handle.emit("cuda-download-progress", serde_json::json!({
-            "stage": stage, "progress": progress, "message": msg,
+            "stage": stage, "progress": progress, "code": code, "label": label, "message": msg,
         }));
     };
 
@@ -591,49 +616,108 @@ async fn do_download_cuda_runtime(
         .build()
         .map_err(|e| crate::UtaiError::Audio(format!("HTTP client: {}", e)))?;
 
-    // ── Stage 1: Download CUDA ORT DLLs from NuGet ──
-    emit("ort", 0.0, "Downloading CUDA ORT runtime...");
-    let ort_cuda_dir = app_dir.join("runtime").join("ort").join("cuda");
-    // Wipe any previous (possibly wrong-CUDA) DLLs first so a re-download REPLACES them cleanly.
-    let _ = std::fs::remove_dir_all(&ort_cuda_dir);
-    std::fs::create_dir_all(&ort_cuda_dir)?;
-
+    // ── Stage 1: CUDA ORT DLLs from NuGet ──
     // 1.24.4 MUST match the ORT API version the `ort` crate (2.0-rc.12) targets — API 24 — AND the
     // bundled DirectML build (1.24.4). A mismatched CUDA build (e.g. 1.20.1 = API 20) makes ort's
     // init_from of the CUDA build DEADLOCK (ort calls API-24 ABI against an API-20 DLL). 1.24.4's
-    // providers_cuda imports cudart64_12 / cublas64_12 / cudnn64_9 (correct CUDA-12 + cuDNN-9).
+    // providers_cuda imports cudart64_12 / cublas64_12+Lt / cufft64_11 / cudnn64_9.
     // AVOID 1.21.x (mis-built against CUDA 11). Gpu.Windows has the actual DLLs.
+    emit("ort", 0.0, "CUDA_DL_DOWNLOADING", "CUDA ORT", "Downloading CUDA ORT runtime...");
+    let ort_cuda_dir = app_dir.join("runtime").join("ort").join("cuda");
     let ort_url = "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.Gpu.Windows/1.24.4";
     let ort_nupkg = app_dir.join("runtime").join("ort_gpu.nupkg.zip");
 
-    download_file(&client, ort_url, &ort_nupkg, |p| emit("ort", p * 0.4, "Downloading CUDA ORT...")).await?;
-    emit("ort", 0.4, "Extracting CUDA ORT DLLs...");
-
+    // Download FIRST, wipe after (S64c audit): the old wipe-then-download order destroyed a good
+    // install before the replacement bytes were secured — a failed retry left NOTHING.
+    download_file(&client, ort_url, &ort_nupkg, |p| {
+        emit("ort", p * 0.2, "CUDA_DL_DOWNLOADING", "CUDA ORT", "Downloading CUDA ORT...")
+    })
+    .await?;
+    emit("ort", 0.2, "CUDA_DL_EXTRACTING", "CUDA ORT", "Extracting CUDA ORT DLLs...");
+    // Wipe any previous (possibly wrong-CUDA) DLLs so the extraction REPLACES them cleanly; an
+    // extraction failure here self-heals (no skip guard — the next attempt wipes and re-extracts).
+    let _ = std::fs::remove_dir_all(&ort_cuda_dir);
+    std::fs::create_dir_all(&ort_cuda_dir)?;
     crate::util::extract_zip_dlls(&ort_nupkg, &ort_cuda_dir, |n| n.starts_with("runtimes/win-x64/native"))?;
     let _ = std::fs::remove_file(&ort_nupkg);
 
-    // ── Stage 2: cuDNN — SKIP if already present. The user may already have it (runtime/cuda is kept
-    //    across re-downloads), and re-fetching from PyPI can fail on a flaky/blocked network (e.g. CN)
-    //    even though Stage 1 + the existing cuDNN are all that's needed. Don't fail the whole install. ──
+    // ── Stage 2 (S64c): the provider's FULL import set from NVIDIA's official PyPI redistributables —
+    //    cudart64_12 / cublas64_12+Lt / cufft64_11 / cudnn64_9 (the exact list scanned from the 1.24.4
+    //    providers_cuda.dll). No CUDA Toolkit install needed; runtime/cuda sits FIRST in
+    //    setup_cuda_dll_paths' search dirs, so our copies also win over a wrong-major Toolkit (e.g. 13).
+    //    Each lane SKIPS when its DLL is already present (runtime/cuda is kept across re-downloads;
+    //    a flaky/blocked network must not fail an otherwise-complete install). ──
     let cuda_dir = app_dir.join("runtime").join("cuda");
     std::fs::create_dir_all(&cuda_dir)?;
-    if cuda_dir.join("cudnn64_9.dll").exists() {
-        emit("cudnn", 0.85, "cuDNN already present — skipping");
-        tracing::info!("CUDA download: cuDNN already present, skipping re-download");
-    } else {
-        emit("cudnn", 0.5, "Downloading cuDNN...");
-        let cudnn_url = "https://files.pythonhosted.org/packages/f2/a4/045f8d0ce6b99726d88e76bbb8ee147123f55e80111d89262762d8149abb/nvidia_cudnn_cu12-9.22.0.52-py3-none-win_amd64.whl";
-        let cudnn_whl = app_dir.join("runtime").join("cudnn.whl.zip");
-        download_file(&client, cudnn_url, &cudnn_whl, |p| emit("cudnn", 0.5 + p * 0.35, "Downloading cuDNN...")).await?;
-        emit("cudnn", 0.85, "Extracting cuDNN DLLs...");
-        crate::util::extract_zip_dlls(&cudnn_whl, &cuda_dir, |n| n.contains("nvidia/cudnn/bin"))?;
-        let _ = std::fs::remove_file(&cudnn_whl);
+    struct Wheel {
+        guard: &'static str,  // presence of this DLL skips the lane
+        url: &'static str,    // pinned pythonhosted wheel (versions chosen for the cu12 family)
+        filter: &'static str, // wheel-internal bin dir holding the DLLs
+        label: &'static str,
+        p0: f32,
+        p1: f32,
     }
+    const WHEELS: [Wheel; 4] = [
+        Wheel { guard: "cudart64_12.dll", url: "https://files.pythonhosted.org/packages/59/df/e7c3a360be4f7b93cee39271b792669baeb3846c58a4df6dfcf187a7ffab/nvidia_cuda_runtime_cu12-12.9.79-py3-none-win_amd64.whl", filter: "nvidia/cuda_runtime/bin", label: "CUDA runtime", p0: 0.25, p1: 0.28 },
+        Wheel { guard: "cublas64_12.dll", url: "https://files.pythonhosted.org/packages/20/e2/fc9a0e985249d873150276d5afb02e39a66817fedbf1a385724393e505ed/nvidia_cublas_cu12-12.9.2.10-py3-none-win_amd64.whl", filter: "nvidia/cublas/bin", label: "cuBLAS", p0: 0.28, p1: 0.55 },
+        Wheel { guard: "cufft64_11.dll", url: "https://files.pythonhosted.org/packages/20/ee/29955203338515b940bd4f60ffdbc073428f25ef9bfbce44c9a066aedc5c/nvidia_cufft_cu12-11.4.1.4-py3-none-win_amd64.whl", filter: "nvidia/cufft/bin", label: "cuFFT", p0: 0.55, p1: 0.65 },
+        Wheel { guard: "cudnn64_9.dll", url: "https://files.pythonhosted.org/packages/f2/a4/045f8d0ce6b99726d88e76bbb8ee147123f55e80111d89262762d8149abb/nvidia_cudnn_cu12-9.22.0.52-py3-none-win_amd64.whl", filter: "nvidia/cudnn/bin", label: "cuDNN", p0: 0.65, p1: 0.93 },
+    ];
+    for w in &WHEELS {
+        if cuda_dir.join(w.guard).exists() {
+            emit("cuda", w.p1, "CUDA_DL_SKIP", w.label, &format!("{} already present — skipping", w.label));
+            tracing::info!("CUDA download: {} already present, skipping", w.label);
+            continue;
+        }
+        emit("cuda", w.p0, "CUDA_DL_DOWNLOADING", w.label, &format!("Downloading {}...", w.label));
+        let tmp = app_dir.join("runtime").join(format!("{}.whl.zip", w.guard));
+        if let Err(e) = download_file(&client, w.url, &tmp, |p| {
+            emit("cuda", w.p0 + p * (w.p1 - w.p0) * 0.9, "CUDA_DL_DOWNLOADING", w.label, &format!("Downloading {}...", w.label))
+        })
+        .await
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        emit("cuda", w.p0 + (w.p1 - w.p0) * 0.9, "CUDA_DL_EXTRACTING", w.label, &format!("Extracting {}...", w.label));
+        // ATOMIC placement (S64c audit MAJOR): extract into a per-lane staging dir, then rename each
+        // DLL into runtime/cuda with the GUARD LAST — guard presence ⇒ lane complete. The naive
+        // in-place extraction could die between a wheel's DLLs (cublas64 lands, cublasLt doesn't) and
+        // the guard skip would then wedge the lane FOREVER (ready-check false, every retry "done");
+        // worse, a torn cuDNN (guard fine, engine sub-DLLs missing) read as READY and only exploded
+        // at the first Conv after restart (the S60c failure class).
+        let stage_dir = app_dir.join("runtime").join(format!("{}.extract", w.guard));
+        let _ = std::fs::remove_dir_all(&stage_dir);
+        std::fs::create_dir_all(&stage_dir)?;
+        let placed = (|| -> crate::Result<()> {
+            crate::util::extract_zip_dlls(&tmp, &stage_dir, |n| n.contains(w.filter))?;
+            let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(&stage_dir)?
+                .flatten()
+                .map(|e| e.file_name())
+                .collect();
+            // Guard renames LAST — its presence must imply every sibling already moved.
+            names.sort_by_key(|n| n.eq_ignore_ascii_case(w.guard));
+            for name in names {
+                let dest = cuda_dir.join(&name);
+                let _ = std::fs::remove_file(&dest); // Windows rename refuses to overwrite
+                std::fs::rename(stage_dir.join(&name), &dest)?;
+            }
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&stage_dir);
+        placed?;
+    }
+
+    // Make the fresh runtime resolvable IN-SESSION (S64c audit): runtime/cuda may not have existed
+    // at startup, so it never got onto PATH — is_cuda_available's probe would stay false until a
+    // restart while the runtime row says Installed. Re-running setup is idempotent.
+    crate::setup_cuda_dll_paths(app_dir);
 
     // ── Stage 3 (DEV BUILDS ONLY): copy next to the debug exe. In release this polluted the
     // install root with the four CUDA DLLs (S64b beta report) — the installed app loads from
     // runtime/ort/cuda directly and needs no exe-side copies. lib.rs setup sweeps old strays. ──
-    emit("copy", 0.95, "Finalizing...");
+    emit("copy", 0.95, "CUDA_DL_FINALIZING", "", "Finalizing...");
     #[cfg(debug_assertions)]
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
@@ -648,12 +732,27 @@ async fn do_download_cuda_runtime(
         }
     }
 
-    emit("done", 1.0, "CUDA runtime ready. Restart to activate.");
+    emit("done", 1.0, "CUDA_DL_DONE", "", "CUDA runtime ready. Restart to activate.");
     tracing::info!("CUDA runtime download complete: ORT={}, cuDNN={}", ort_cuda_dir.display(), cuda_dir.display());
     Ok(())
 }
 
 async fn download_file(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &std::path::Path,
+    progress_cb: impl Fn(f32),
+) -> crate::Result<()> {
+    let r = download_file_inner(client, url, dest, progress_cb).await;
+    if r.is_err() {
+        // No resume support here (legacy helper) — a partial file is pure dead weight, and callers'
+        // retry semantics assume a clean slate (S64c audit: failed wheel tmps stranded 100s of MB).
+        let _ = std::fs::remove_file(dest);
+    }
+    r
+}
+
+async fn download_file_inner(
     client: &reqwest::Client,
     url: &str,
     dest: &std::path::Path,
@@ -691,6 +790,11 @@ pub(crate) fn is_cuda_available() -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        // S64c self-contained runtime: cudart lives in runtime/cuda, which setup_cuda_dll_paths put
+        // on PATH before any caller runs — a plain PATH scan covers it (and any real Toolkit).
+        if dll_on_path("cudart64_12.dll") {
+            return true;
+        }
         // Check CUDA toolkit's standard install location first (fast)
         if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
             let bin = std::path::Path::new(&cuda_path).join("bin");
